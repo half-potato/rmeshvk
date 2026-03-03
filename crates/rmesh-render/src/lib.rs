@@ -48,11 +48,15 @@ impl SceneBuffers {
     /// Upload scene data to GPU buffers.
     pub fn upload(device: &wgpu::Device, _queue: &wgpu::Queue, scene: &SceneData) -> Self {
         let storage_copy = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        // Trainable parameter buffers need COPY_DST (for upload) and COPY_SRC (for readback).
+        let trainable = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
 
         let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vertices"),
             contents: bytemuck::cast_slice(&scene.vertices),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: trainable,
         });
 
         let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -64,19 +68,19 @@ impl SceneBuffers {
         let sh_coeffs = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sh_coeffs"),
             contents: bytemuck::cast_slice(&scene.sh_coeffs),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: trainable,
         });
 
         let densities = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("densities"),
             contents: bytemuck::cast_slice(&scene.densities),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: trainable,
         });
 
         let color_grads = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("color_grads"),
             contents: bytemuck::cast_slice(&scene.color_grads),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: trainable,
         });
 
         let circumdata = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -422,6 +426,161 @@ impl RenderTargets {
             height,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tex-to-Buffer Pipeline
+// ---------------------------------------------------------------------------
+
+/// Pipeline that converts the Rgba16Float render target to an f32 storage buffer.
+///
+/// The forward render pass outputs to a texture, but the loss and backward shaders
+/// need a flat `array<f32>` storage buffer. This compute pipeline bridges the gap.
+pub struct TexToBufferPipeline {
+    pipeline: wgpu::ComputePipeline,
+    _bind_group_layout: wgpu::BindGroupLayout,
+    _params_buffer: wgpu::Buffer,
+    /// The output storage buffer: [W x H x 4] f32
+    pub rendered_image: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+}
+
+impl TexToBufferPipeline {
+    /// Create the pipeline and allocate the rendered_image buffer.
+    pub fn new(
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        color_view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tex_to_buffer.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::TEX_TO_BUFFER_WGSL.into()),
+        });
+
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("tex_to_buffer_bind_group_layout"),
+                entries: &[
+                    // @binding(0) texture
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // @binding(1) output buffer (read_write)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // @binding(2) params (read)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("tex_to_buffer_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("tex_to_buffer_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let rendered_image = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rendered_image"),
+            size: (width as u64) * (height as u64) * 4 * 4, // RGBA f32
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let params_data: [u32; 2] = [width, height];
+        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tex_to_buffer_params"),
+            contents: bytemuck::cast_slice(&params_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tex_to_buffer_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: rendered_image.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        Self {
+            pipeline,
+            _bind_group_layout: bind_group_layout,
+            _params_buffer: params_buffer,
+            rendered_image,
+            bind_group,
+            width,
+            height,
+        }
+    }
+}
+
+/// Record the tex-to-buffer conversion dispatch.
+///
+/// Should be called after the render pass finishes, within the same command encoder.
+pub fn record_tex_to_buffer(
+    encoder: &mut wgpu::CommandEncoder,
+    ttb: &TexToBufferPipeline,
+) {
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("tex_to_buffer"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&ttb.pipeline);
+    pass.set_bind_group(0, &ttb.bind_group, &[]);
+    pass.dispatch_workgroups(
+        (ttb.width + 15) / 16,
+        (ttb.height + 15) / 16,
+        1,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -823,6 +982,6 @@ pub fn make_uniforms(
         tet_count,
         sh_degree,
         step,
-        _pad1: [0; 3],
+        _pad1: [0; 7],
     }
 }

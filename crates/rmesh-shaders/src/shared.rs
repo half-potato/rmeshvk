@@ -34,7 +34,9 @@ pub struct Uniforms {
     pub sh_degree: u32,
     /// Current training step
     pub step: u32,
-    pub _pad1: [u32; 3],
+    /// Padding: 3 u32s to reach vec3<u32> alignment (offset 176), then 3 u32s
+    /// for the vec3 itself, then 1 u32 for struct-end alignment to 192 bytes.
+    pub _pad1: [u32; 7],
 }
 
 impl Uniforms {

@@ -8,3 +8,4 @@ pub const RADIX_SORT_WGSL: &str = include_str!("wgsl/radix_sort.wgsl");
 pub const LOSS_COMPUTE_WGSL: &str = include_str!("wgsl/loss_compute.wgsl");
 pub const BACKWARD_COMPUTE_WGSL: &str = include_str!("wgsl/backward_compute.wgsl");
 pub const ADAM_COMPUTE_WGSL: &str = include_str!("wgsl/adam_compute.wgsl");
+pub const TEX_TO_BUFFER_WGSL: &str = include_str!("wgsl/tex_to_buffer.wgsl");

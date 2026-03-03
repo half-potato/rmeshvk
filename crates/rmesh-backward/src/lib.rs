@@ -67,12 +67,12 @@ pub struct BackwardPipelines {
 // Buffer creation helpers
 // ---------------------------------------------------------------------------
 
-/// Create a zero-initialized storage buffer with COPY_DST (for clearing).
+/// Create a zero-initialized storage buffer with COPY_DST (for clearing) and COPY_SRC (for readback).
 fn create_storage_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     })
 }
@@ -403,12 +403,15 @@ pub fn create_loss_bind_group(
 /// Returns `(group0, group1)` where:
 ///   - group0: 11 read-only bindings (scene + loss data)
 ///   - group1: 4 read-write gradient output bindings
+///
+/// `rendered_image` is the [W x H x 4] f32 buffer from the tex-to-buffer pass.
 pub fn create_backward_bind_groups(
     device: &wgpu::Device,
     pipelines: &BackwardPipelines,
     scene_buffers: &SceneBuffers,
     loss_buffers: &LossBuffers,
     grad_buffers: &GradientBuffers,
+    rendered_image: &wgpu::Buffer,
 ) -> (wgpu::BindGroup, wgpu::BindGroup) {
     let bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("backward_bind_group_0"),
@@ -424,7 +427,7 @@ pub fn create_backward_bind_groups(
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: scene_buffers.colors.as_entire_binding(),
+                resource: rendered_image.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 3,

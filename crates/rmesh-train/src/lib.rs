@@ -16,8 +16,8 @@ use rmesh_backward::{
 };
 use rmesh_data::SceneData;
 use rmesh_render::{
-    create_compute_bind_group, create_render_bind_group, ForwardPipelines, RenderTargets,
-    SceneBuffers, SortState, Uniforms,
+    create_compute_bind_group, create_render_bind_group, record_tex_to_buffer,
+    ForwardPipelines, RenderTargets, SceneBuffers, SortState, TexToBufferPipeline, Uniforms,
 };
 use rmesh_shaders::shared::{AdamUniforms, LossUniforms};
 
@@ -115,18 +115,19 @@ pub fn train(
     // Loss buffers
     let loss_buffers = LossBuffers::new(device, config.render_width, config.render_height);
 
-    // Rendered image buffer (storage) — forward pass renders to texture, we copy here for loss/backward
-    let rendered_image = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("rendered_image"),
-        size: (config.render_width as u64) * (config.render_height as u64) * 4 * 4, // RGBA f32
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    // Tex-to-buffer pipeline: converts Rgba16Float render target to f32 storage buffer
+    let ttb = TexToBufferPipeline::new(
+        device,
+        queue,
+        &targets.color_view,
+        config.render_width,
+        config.render_height,
+    );
 
     // Create bind groups for backward pass
-    let loss_bg = create_loss_bind_group(device, &bwd_pipelines, &loss_buffers, &rendered_image);
+    let loss_bg = create_loss_bind_group(device, &bwd_pipelines, &loss_buffers, &ttb.rendered_image);
     let (bwd_bg0, bwd_bg1) =
-        create_backward_bind_groups(device, &bwd_pipelines, &buffers, &loss_buffers, &grads);
+        create_backward_bind_groups(device, &bwd_pipelines, &buffers, &loss_buffers, &grads, &ttb.rendered_image);
 
     // Adam bind groups — one per parameter group
     // Each group: (uniforms_buf, params, grads, m, v)
@@ -230,7 +231,7 @@ pub fn train(
                 tet_count: scene.tet_count,
                 sh_degree: scene.sh_degree,
                 step,
-                _pad1: [0; 3],
+                _pad1: [0; 7],
             };
 
             // Upload uniforms
@@ -284,8 +285,8 @@ pub fn train(
                 scene.tet_count,
                 queue,
             );
-            // TODO: copy color texture to rendered_image buffer for loss computation
-            // encoder.copy_texture_to_buffer(...) — requires f16→f32 conversion pass
+            // Convert f16 render target texture to f32 storage buffer for loss/backward
+            record_tex_to_buffer(&mut encoder, &ttb);
             queue.submit(std::iter::once(encoder.finish()));
 
             // Loss pass

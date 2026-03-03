@@ -270,7 +270,7 @@ impl App {
             tet_count: gpu.tet_count,
             sh_degree: self.scene_data.sh_degree,
             step: 0,
-            _pad1: [0; 3],
+            _pad1: [0; 7],
         };
 
         gpu.queue
