@@ -105,10 +105,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let ndc_min_y = min(min(n0.y, n1.y), min(n2.y, n3.y));
         let ndc_max_y = max(max(n0.y, n1.y), max(n2.y, n3.y));
 
-        // NDC to pixel: pix_x = (ndc_x+1)*0.5*W, pix_y = (1-ndc_y)*0.5*H (wgpu y-flip)
+        // NDC to pixel: wgpu has Y-UP in NDC (+1 at top, -1 at bottom)
+        // pix_x = (ndc_x + 1) * 0.5 * W
+        // pix_y = (1 - ndc_y) * 0.5 * H  (flip Y: ndc_y=+1 → pix_y=0)
         let pix_left = (ndc_min_x + 1.0) * 0.5 * W;
         let pix_right = (ndc_max_x + 1.0) * 0.5 * W;
-        // y-flip: ndc_max_y → pix_top (smaller y), ndc_min_y → pix_bottom (larger y)
         let pix_top = (1.0 - ndc_max_y) * 0.5 * H;
         let pix_bottom = (1.0 - ndc_min_y) * 0.5 * H;
 

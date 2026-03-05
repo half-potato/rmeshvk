@@ -841,7 +841,7 @@ impl TilePipelines {
                 ],
             });
 
-        // Group 1: 6 bindings (4 rw + 2 read)
+        // Group 1: 7 bindings (5 rw + 2 read)
         let backward_tiled_bg_layout_1 =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("backward_tiled_bgl_1"),
@@ -852,6 +852,7 @@ impl TilePipelines {
                     storage_entry(3, false), // d_color_grads
                     storage_entry(4, true),  // tile_ranges
                     storage_entry(5, true),  // tile_uniforms
+                    storage_entry(6, false), // debug_image
                 ],
             });
 
@@ -959,6 +960,7 @@ pub fn create_backward_tiled_bind_groups(
     tile_sort_values: &wgpu::Buffer,
     tile_ranges: &wgpu::Buffer,
     tile_uniforms: &wgpu::Buffer,
+    debug_image: &wgpu::Buffer,
 ) -> (wgpu::BindGroup, wgpu::BindGroup) {
     let bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("backward_tiled_bg_0"),
@@ -988,6 +990,7 @@ pub fn create_backward_tiled_bind_groups(
             wgpu::BindGroupEntry { binding: 3, resource: grad_buffers.d_color_grads.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: tile_ranges.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: tile_uniforms.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: debug_image.as_entire_binding() },
         ],
     });
 
@@ -1365,15 +1368,14 @@ pub fn record_radix_sort(
 
 /// Record the full tiled backward pass.
 ///
-/// Stages: tile_gen → radix_sort → tile_ranges → backward_tiled
-///
-/// Note: tile_fill is no longer needed since radix sort doesn't require sentinel padding.
+/// Stages: tile_fill → tile_gen → radix_sort → tile_ranges → backward_tiled
 pub fn record_tiled_backward(
     encoder: &mut wgpu::CommandEncoder,
     device: &wgpu::Device,
     tile_pipelines: &TilePipelines,
     radix_pipelines: &RadixSortPipelines,
     radix_state: &RadixSortState,
+    tile_fill_bg: &wgpu::BindGroup,
     tile_gen_bg: &wgpu::BindGroup,
     tile_ranges_bg: &wgpu::BindGroup,
     bwd_tiled_bg0: &wgpu::BindGroup,
@@ -1383,6 +1385,19 @@ pub fn record_tiled_backward(
     tile_ranges_bg_b: &wgpu::BindGroup,
     bwd_tiled_bg0_b: &wgpu::BindGroup,
 ) {
+    // 0. Fill sort buffers with sentinels (0xFFFFFFFF keys)
+    // Required so the radix sort (which processes max_pairs entries) doesn't
+    // mix stale/random data with the valid tile-tet pairs from tile_gen.
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tile_fill"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&tile_pipelines.fill_pipeline);
+        pass.set_bind_group(0, tile_fill_bg, &[]);
+        pass.dispatch_workgroups((tile_buffers.max_pairs_pow2 + 255) / 256, 1, 1);
+    }
+
     // 1. Generate tile-tet pairs
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

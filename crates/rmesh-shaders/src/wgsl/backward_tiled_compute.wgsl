@@ -66,6 +66,7 @@ struct TileUniforms {
 @group(1) @binding(3) var<storage, read_write> d_color_grads: array<atomic<u32>>;
 @group(1) @binding(4) var<storage, read> tile_ranges: array<u32>;
 @group(1) @binding(5) var<storage, read> tile_uniforms: TileUniforms;
+@group(1) @binding(6) var<storage, read_write> debug_image: array<f32>;
 
 const TINY_VAL: f32 = 1e-20;
 const BATCH_SIZE: u32 = 32u;
@@ -302,7 +303,11 @@ fn main(
             dl_d_image[pixel_idx * 4u + 1u],
             dl_d_image[pixel_idx * 4u + 2u],
         );
-        d_log_t_final = dl_d_image[pixel_idx * 4u + 3u];
+        // image_alpha = 1 - T_final (opacity). So T_final = 1 - alpha_final.
+        // d_log_t_final = dL/d_log_t = dL/d_alpha * d_alpha/d_T * dT/d_log_t
+        //               = dl_d_alpha * (-1) * T_final
+        let alpha_final_val = rendered_image[pixel_idx * 4u + 3u];
+        d_log_t_final = -dl_d_image[pixel_idx * 4u + 3u] * (1.0 - alpha_final_val);
         color_final = vec3<f32>(
             rendered_image[pixel_idx * 4u],
             rendered_image[pixel_idx * 4u + 1u],
@@ -315,6 +320,8 @@ fn main(
     var log_t: f32 = 0.0;
 
     // Compute ray from pixel coordinates via inverse VP
+    // wgpu maps ndc_y to screen as: pixel_y = (1 - ndc_y) * 0.5 * H
+    // So: ndc_y = 1 - (2 * (pixel_y + 0.5) / H)
     let ndc_x = (2.0 * (f32(px) + 0.5) / f32(w)) - 1.0;
     let ndc_y = 1.0 - (2.0 * (f32(py) + 0.5) / f32(h));
 
@@ -639,4 +646,13 @@ fn main(
         workgroupBarrier();
         cursor = batch_begin;
     } // end batch loop
+
+    // === Debug: write composited image from forward replay ===
+    if (valid_pixel) {
+        let T_final = exp(log_t);
+        debug_image[pixel_idx * 4u] = color_accum.x;
+        debug_image[pixel_idx * 4u + 1u] = color_accum.y;
+        debug_image[pixel_idx * 4u + 2u] = color_accum.z;
+        debug_image[pixel_idx * 4u + 3u] = 1.0 - T_final; // opacity
+    }
 }

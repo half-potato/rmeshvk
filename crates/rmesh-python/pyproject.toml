@@ -8,6 +8,9 @@ version = "0.1.0"
 requires-python = ">=3.8"
 description = "wgpu-based tetrahedral volume renderer with forward/backward passes"
 
+[dependency-groups]
+dev = ["maturin>=1.0,<2.0"]
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "python"

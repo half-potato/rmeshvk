@@ -120,7 +120,7 @@ struct RMeshRenderer {
     tile_buffers: TileBuffers,
     radix_pipelines: RadixSortPipelines,
     radix_state: RadixSortState,
-    _tile_fill_bg: wgpu::BindGroup,
+    tile_fill_bg: wgpu::BindGroup,
     tile_gen_bg: wgpu::BindGroup,
     // A-buffer bind groups (sort result in primary buffers)
     tile_ranges_bg: wgpu::BindGroup,
@@ -129,6 +129,8 @@ struct RMeshRenderer {
     // B-buffer bind groups (sort result in alternate buffers)
     tile_ranges_bg_b: wgpu::BindGroup,
     bwd_tiled_bg0_b: wgpu::BindGroup,
+    // Debug image buffer for backward forward-replay verification
+    debug_image: wgpu::Buffer,
     // Bind groups
     compute_bg: wgpu::BindGroup,
     render_bg: wgpu::BindGroup,
@@ -357,6 +359,15 @@ impl RMeshRenderer {
             &scene_buffers,
         );
 
+        // Debug image buffer for backward forward-replay verification
+        let n_pixels = (width as u64) * (height as u64);
+        let debug_image = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("debug_image"),
+            size: n_pixels * 4 * 4, // RGBA f32
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
         // A-buffer bind groups (sort result in primary tile_sort_keys/values)
         let tile_ranges_bg = create_tile_ranges_bind_group_with_keys(
             &device,
@@ -376,6 +387,7 @@ impl RMeshRenderer {
             &tile_buffers.tile_sort_values,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
+            &debug_image,
         );
 
         // B-buffer bind groups (sort result in radix_state.keys_b/values_b)
@@ -397,6 +409,7 @@ impl RMeshRenderer {
             &radix_state.values_b,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
+            &debug_image,
         );
 
         Ok(Self {
@@ -415,13 +428,14 @@ impl RMeshRenderer {
             tile_buffers,
             radix_pipelines,
             radix_state,
-            _tile_fill_bg: tile_fill_bg,
+            tile_fill_bg,
             tile_gen_bg,
             tile_ranges_bg,
             bwd_tiled_bg0,
             bwd_tiled_bg1,
             tile_ranges_bg_b,
             bwd_tiled_bg0_b,
+            debug_image,
             compute_bg,
             render_bg,
             loss_bg,
@@ -664,6 +678,7 @@ impl RMeshRenderer {
         encoder.clear_buffer(&self.grad_buffers.d_color_grads, 0, None);
         encoder.clear_buffer(&self.tile_buffers.tile_pair_count, 0, None);
         encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
+        encoder.clear_buffer(&self.debug_image, 0, None);
         self.queue.submit(std::iter::once(encoder.finish()));
 
         // Tiled backward pass (with radix sort)
@@ -678,6 +693,7 @@ impl RMeshRenderer {
             &self.tile_pipelines,
             &self.radix_pipelines,
             &self.radix_state,
+            &self.tile_fill_bg,
             &self.tile_gen_bg,
             &self.tile_ranges_bg,
             &self.bwd_tiled_bg0,
@@ -714,6 +730,20 @@ impl RMeshRenderer {
             Array1::from_vec(d_grads).into_pyarray(py),
         )?;
         Ok(dict)
+    }
+
+    /// Read the debug image written by the backward pass's forward replay.
+    ///
+    /// Returns:
+    ///     numpy array [H, W, 4] f32 (composited RGBA from backward's forward replay)
+    fn read_debug_image<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<f32>>> {
+        let data = read_buffer_f32(&self.device, &self.queue, &self.debug_image);
+        let arr = Array3::from_shape_vec(
+            (self.height as usize, self.width as usize, 4),
+            data,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(arr.into_pyarray(py))
     }
 
     /// Full forward+loss+backward+adam step on GPU.
@@ -889,6 +919,7 @@ impl RMeshRenderer {
                 &self.tile_pipelines,
                 &self.radix_pipelines,
                 &self.radix_state,
+                &self.tile_fill_bg,
                 &self.tile_gen_bg,
                 &self.tile_ranges_bg,
                 &self.bwd_tiled_bg0,
