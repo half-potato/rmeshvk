@@ -21,8 +21,9 @@ struct TileUniforms {
 @group(0) @binding(2) var<storage, read_write> tile_sort_values: array<u32>;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = gid.x + gid.y * nwg.x * 256u;
     if (idx >= tile_uniforms.max_pairs_pow2) {
         return;
     }

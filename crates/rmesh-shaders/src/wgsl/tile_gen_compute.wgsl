@@ -51,8 +51,9 @@ fn load_vertex(idx: u32) -> vec3<f32> {
 }
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let vis_idx = gid.x;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+    let vis_idx = gid.x + gid.y * nwg.x * 64u;
     if (vis_idx >= tile_uniforms.visible_tet_count) {
         return;
     }

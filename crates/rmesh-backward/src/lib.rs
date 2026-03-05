@@ -601,7 +601,8 @@ pub fn record_adam_pass(
         });
         pass.set_pipeline(&pipelines.adam_pipeline);
         pass.set_bind_group(0, bg, &[]);
-        pass.dispatch_workgroups((count + 255) / 256, 1, 1);
+        let (ax, ay) = dispatch_2d((count + 255) / 256);
+        pass.dispatch_workgroups(ax, ay, 1);
         // pass is dropped here, ending the pass
     }
 }
@@ -1395,7 +1396,8 @@ pub fn record_tiled_backward(
         });
         pass.set_pipeline(&tile_pipelines.fill_pipeline);
         pass.set_bind_group(0, tile_fill_bg, &[]);
-        pass.dispatch_workgroups((tile_buffers.max_pairs_pow2 + 255) / 256, 1, 1);
+        let (fx, fy) = dispatch_2d((tile_buffers.max_pairs_pow2 + 255) / 256);
+        pass.dispatch_workgroups(fx, fy, 1);
     }
 
     // 1. Generate tile-tet pairs
@@ -1407,7 +1409,8 @@ pub fn record_tiled_backward(
         pass.set_pipeline(&tile_pipelines.tile_gen_pipeline);
         pass.set_bind_group(0, tile_gen_bg, &[]);
         let tet_count_upper = tile_buffers.max_pairs / 16;
-        pass.dispatch_workgroups((tet_count_upper + 63) / 64, 1, 1);
+        let (gx, gy) = dispatch_2d((tet_count_upper + 63) / 64);
+        pass.dispatch_workgroups(gx, gy, 1);
     }
 
     // 2. Radix sort tile keys/values
@@ -1435,7 +1438,8 @@ pub fn record_tiled_backward(
         });
         pass.set_pipeline(&tile_pipelines.tile_ranges_pipeline);
         pass.set_bind_group(0, ranges_bg, &[]);
-        pass.dispatch_workgroups((tile_buffers.max_pairs + 255) / 256, 1, 1);
+        let (rx, ry) = dispatch_2d((tile_buffers.max_pairs + 255) / 256);
+        pass.dispatch_workgroups(rx, ry, 1);
     }
 
     // 4. Tiled backward pass

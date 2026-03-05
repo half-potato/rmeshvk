@@ -22,8 +22,9 @@ struct TileUniforms {
 @group(0) @binding(3) var<storage, read> tile_pair_count: array<u32>;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = gid.x + gid.y * nwg.x * 256u;
     // Use min(actual pair count, max_pairs) as the effective count
     let actual_count = min(tile_pair_count[0], tile_uniforms.max_pairs);
 
