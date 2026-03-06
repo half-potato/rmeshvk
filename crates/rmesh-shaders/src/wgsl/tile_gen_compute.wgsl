@@ -10,11 +10,11 @@ struct TileUniforms {
     tiles_y: u32,
     num_tiles: u32,
     visible_tet_count: u32,
-    max_pairs: u32,
-    max_pairs_pow2: u32,
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    _pad3: u32,
+    _pad4: u32,
 };
 
 struct Uniforms {
@@ -150,7 +150,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
             let key = (tile_id << 17u) | (depth_bits & 0x1FFFFu);
 
             let pair_idx = atomicAdd(&tile_pair_count[0], 1u);
-            if (pair_idx < tile_uniforms.max_pairs) {
+            if (pair_idx < arrayLength(&tile_sort_keys)) {
                 tile_sort_keys[pair_idx] = key;
                 tile_sort_values[pair_idx] = tet_id;
             }

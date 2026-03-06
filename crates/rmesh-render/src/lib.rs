@@ -42,6 +42,10 @@ pub struct SceneBuffers {
     pub indirect_args: wgpu::Buffer,
     /// Per-frame uniforms (Uniforms struct)
     pub uniforms: wgpu::Buffer,
+    /// Tiles touched per visible tet [M] u32 (written by compute at vis_idx)
+    pub tiles_touched: wgpu::Buffer,
+    /// Compact visible tet IDs [M] u32 (written by compute at vis_idx)
+    pub compact_tet_ids: wgpu::Buffer,
 }
 
 impl SceneBuffers {
@@ -131,6 +135,20 @@ impl SceneBuffers {
             mapped_at_creation: false,
         });
 
+        let tiles_touched = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tiles_touched"),
+            size: m * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let compact_tet_ids = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("compact_tet_ids"),
+            size: m * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             vertices,
             indices,
@@ -143,6 +161,8 @@ impl SceneBuffers {
             sort_values,
             indirect_args,
             uniforms,
+            tiles_touched,
+            compact_tet_ids,
         }
     }
 }
@@ -189,15 +209,16 @@ impl ForwardPipelines {
         color_format: wgpu::TextureFormat,
         aux_format: wgpu::TextureFormat,
     ) -> Self {
-        // ----- Compute pipeline (11 bindings) -----
+        // ----- Compute pipeline (13 bindings) -----
         // Bindings 0-6: read-only storage (uniforms, vertices, indices, sh_coeffs, densities, color_grads, circumdata)
-        // Bindings 7-10: read-write storage (colors, sort_keys, sort_values, indirect_args)
+        // Bindings 7-12: read-write storage (colors, sort_keys, sort_values, indirect_args, tiles_touched, compact_tet_ids)
         let compute_read_only = [
             true, true, true, true, true, true, true, // 0-6 read-only
             false, false, false, false,                // 7-10 read-write
+            false, false,                              // 11-12 read-write (tiles_touched, compact_tet_ids)
         ];
         let compute_entries = storage_entries(
-            11,
+            13,
             wgpu::ShaderStages::COMPUTE,
             &compute_read_only,
         );
@@ -727,12 +748,13 @@ pub fn record_tex_to_buffer(
 // Bind Groups
 // ---------------------------------------------------------------------------
 
-/// Create the compute bind group (11 bindings).
+/// Create the compute bind group (13 bindings).
 ///
 /// Binding order matches `forward_compute.wgsl`:
 ///   0: uniforms, 1: vertices, 2: indices, 3: sh_coeffs,
 ///   4: densities, 5: color_grads, 6: circumdata,
-///   7: colors, 8: sort_keys, 9: sort_values, 10: indirect_args
+///   7: colors, 8: sort_keys, 9: sort_values, 10: indirect_args,
+///   11: tiles_touched, 12: compact_tet_ids
 pub fn create_compute_bind_group(
     device: &wgpu::Device,
     pipelines: &ForwardPipelines,
@@ -753,6 +775,8 @@ pub fn create_compute_bind_group(
             buf_entry(8, &buffers.sort_keys),
             buf_entry(9, &buffers.sort_values),
             buf_entry(10, &buffers.indirect_args),
+            buf_entry(11, &buffers.tiles_touched),
+            buf_entry(12, &buffers.compact_tet_ids),
         ],
     })
 }
@@ -1024,6 +1048,108 @@ impl TileSortState {
 // ---------------------------------------------------------------------------
 // Command Recording
 // ---------------------------------------------------------------------------
+
+/// Record only the forward compute pass (no sort).
+///
+/// Stages:
+///   1. Reset indirect args (vertex_count=12, instance_count=0)
+///   2. Compute pass (SH eval + cull + depth keys + tiles_touched + compact_tet_ids)
+///
+/// Use this with the scan-based tile pipeline which reads compact_tet_ids
+/// directly instead of relying on bitonic-sorted sort_values.
+pub fn record_forward_compute(
+    encoder: &mut wgpu::CommandEncoder,
+    pipelines: &ForwardPipelines,
+    buffers: &SceneBuffers,
+    compute_bg: &wgpu::BindGroup,
+    tet_count: u32,
+    queue: &wgpu::Queue,
+) {
+    let reset_cmd = DrawIndirectCommand {
+        vertex_count: 12,
+        instance_count: 0,
+        first_vertex: 0,
+        first_instance: 0,
+    };
+    queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
+
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("forward_compute"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipelines.compute_pipeline);
+        cpass.set_bind_group(0, compute_bg, &[]);
+
+        let workgroup_size = 64u32;
+        let n_pow2 = tet_count.next_power_of_two();
+        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+        let max_per_dim = 65535u32;
+        let dispatch_x = total_workgroups.min(max_per_dim);
+        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    }
+}
+
+/// Record the compute + bitonic sort portion of the forward pass (no hardware rasterization).
+///
+/// Stages:
+///   1. Reset indirect args (vertex_count=12, instance_count=0)
+///   2. Compute pass (SH eval + cull + depth keys)
+///   3. Sort pass (bitonic sort, multiple dispatches)
+///
+/// After this, `sort_values[0..visible_tet_count-1]` contains visible tet IDs
+/// sorted by depth, which is needed by tile_gen.
+pub fn record_forward_compute_and_sort(
+    encoder: &mut wgpu::CommandEncoder,
+    pipelines: &ForwardPipelines,
+    buffers: &SceneBuffers,
+    compute_bg: &wgpu::BindGroup,
+    sort_state: &SortState,
+    tet_count: u32,
+    queue: &wgpu::Queue,
+) {
+    // ----- 1. Reset indirect args -----
+    let reset_cmd = DrawIndirectCommand {
+        vertex_count: 12,
+        instance_count: 0,
+        first_vertex: 0,
+        first_instance: 0,
+    };
+    queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
+
+    // ----- 2. Compute pass -----
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("forward_compute"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipelines.compute_pipeline);
+        cpass.set_bind_group(0, compute_bg, &[]);
+
+        let workgroup_size = 64u32;
+        let n_pow2 = tet_count.next_power_of_two();
+        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+        let max_per_dim = 65535u32;
+        let dispatch_x = total_workgroups.min(max_per_dim);
+        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    }
+
+    // ----- 3. Sort pass (bitonic sort) -----
+    {
+        let mut spass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("bitonic_sort"),
+            timestamp_writes: None,
+        });
+        spass.set_pipeline(&pipelines.sort_pipeline);
+
+        for i in 0..sort_state.step_count {
+            spass.set_bind_group(0, &sort_state.bind_groups[i], &[]);
+            spass.dispatch_workgroups(sort_state.dispatch_x, 1, 1);
+        }
+    }
+}
 
 /// Record the full forward pass into a command encoder.
 ///

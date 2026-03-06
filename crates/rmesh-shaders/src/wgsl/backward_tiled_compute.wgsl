@@ -10,7 +10,7 @@
 //
 // One workgroup per tile. Dispatch: (num_tiles, 1, 1).
 
-enable subgroups;
+// enable subgroups;
 
 struct Uniforms {
     vp_col0: vec4<f32>,
@@ -38,11 +38,11 @@ struct TileUniforms {
     tiles_y: u32,
     num_tiles: u32,
     visible_tet_count: u32,
-    max_pairs: u32,
-    max_pairs_pow2: u32,
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    _pad3: u32,
+    _pad4: u32,
 };
 
 // Group 0: read-only scene data
@@ -238,7 +238,9 @@ fn intersect_and_eval(
     r.intersection_valid = false;
     r.tet_id = tet_id;
 
-    if (!valid_pixel || !has_tet) {
+    // Always load tet data when has_tet is true, even if pixel is invalid.
+    // The flush lane needs valid vidx/tet_id even when its pixel misses the tet.
+    if (!has_tet) {
         return r;
     }
 
@@ -255,6 +257,10 @@ fn intersect_and_eval(
     r.density_raw = densities[tet_id];
     let colors_tet = vec3<f32>(colors_buf[tet_id * 3u], colors_buf[tet_id * 3u + 1u], colors_buf[tet_id * 3u + 2u]);
     r.grad_vec = vec3<f32>(color_grads_buf[tet_id * 3u], color_grads_buf[tet_id * 3u + 1u], color_grads_buf[tet_id * 3u + 2u]);
+
+    if (!valid_pixel) {
+        return r;
+    }
 
     // Ray-tet intersection
     var valid = true;
@@ -307,9 +313,14 @@ fn intersect_and_eval(
     return r;
 }
 
-// Compute gradients for a tet and reduce+flush to global.
+// Compute per-pixel gradients for one tet, reduce across half-warp, and flush to global.
 // `r` contains the per-pixel intersection/forward data.
+// `is_active` indicates whether this lane has valid gradient data (false lanes contribute 0).
 // `color_after` and `log_t_before` are forward replay state BEFORE this tet is composited.
+//
+// IMPORTANT: All 16 lower-half lanes MUST call this function unconditionally so that
+// half_warp_reduce (subgroupShuffleXor) has uniform control flow across the half-warp.
+// Inactive lanes contribute 0 to the reduction.
 fn compute_and_flush_grads(
     r: PerPixelResult,
     d_color: vec3<f32>,
@@ -322,13 +333,16 @@ fn compute_and_flush_grads(
     lane: u32,
     sh_stride: u32,
     nc: u32,
-    flush_lane: u32,  // which lane flushes (0 for tet A, 0 for tet B too since both on threads 0-15)
+    flush_lane: u32,
+    is_active: bool,
 ) {
     var d_density_local: f32 = 0.0;
     var d_vert_local: array<vec3<f32>, 4>;
     var d_grad_local = vec3<f32>(0.0);
+    var d_sh_result = vec3<f32>(0.0);
+    var sh_dir = vec3<f32>(0.0, 0.0, 1.0);
 
-    if (r.intersection_valid) {
+    if (is_active) {
         let T_j = exp(log_t_before);
 
         // Closed-form d_log_t
@@ -378,7 +392,7 @@ fn compute_and_flush_grads(
 
         // Softplus backward
         let centroid = (r.verts[0] + r.verts[1] + r.verts[2] + r.verts[3]) * 0.25;
-        let sh_dir = normalize(centroid - cam);
+        sh_dir = normalize(centroid - cam);
 
         let sh_base = r.tet_id * sh_stride;
         var sh_result = vec3<f32>(0.0);
@@ -395,7 +409,7 @@ fn compute_and_flush_grads(
             d_base_color.z * dsoftplus(sp_input.z),
         );
 
-        let d_sh_result = d_sp_input;
+        d_sh_result = d_sp_input;
         let d_offset_scalar = d_sp_input.x + d_sp_input.y + d_sp_input.z;
 
         d_grad_local += (r.verts[0] - centroid) * d_offset_scalar;
@@ -434,53 +448,55 @@ fn compute_and_flush_grads(
         d_vert_local[1] += d_vother_from_offset;
         d_vert_local[2] += d_vother_from_offset;
         d_vert_local[3] += d_vother_from_offset;
+    }
 
-        // ===== SH gradient reduction + flush =====
-        {
-            let x = sh_dir.x; let y = sh_dir.y; let z = sh_dir.z;
-            var basis: array<f32, 16>;
-            basis[0] = C0;
-            var n_basis = 1u;
-            if (uniforms.sh_degree >= 1u) {
-                basis[1] = -C1 * y;
-                basis[2] = C1 * z;
-                basis[3] = -C1 * x;
-                n_basis = 4u;
+    // ===== SH gradient reduction + flush =====
+    // All 16 lower-half lanes participate (inactive lanes contribute 0).
+    {
+        let x = sh_dir.x; let y = sh_dir.y; let z = sh_dir.z;
+        var basis: array<f32, 16>;
+        basis[0] = C0;
+        var n_basis = 1u;
+        if (uniforms.sh_degree >= 1u) {
+            basis[1] = -C1 * y;
+            basis[2] = C1 * z;
+            basis[3] = -C1 * x;
+            n_basis = 4u;
+        }
+        if (uniforms.sh_degree >= 2u) {
+            let xx = x * x; let yy = y * y; let zz = z * z;
+            basis[4] = C2_0 * x * y;
+            basis[5] = C2_1 * y * z;
+            basis[6] = C2_2 * (2.0 * zz - xx - yy);
+            basis[7] = C2_3 * x * z;
+            basis[8] = C2_4 * (xx - yy);
+            n_basis = 9u;
+            if (uniforms.sh_degree >= 3u) {
+                basis[9] = C3_0 * y * (3.0 * xx - yy);
+                basis[10] = C3_1 * x * y * z;
+                basis[11] = C3_2 * y * (4.0 * zz - xx - yy);
+                basis[12] = C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy);
+                basis[13] = C3_4 * x * (4.0 * zz - xx - yy);
+                basis[14] = C3_5 * z * (xx - yy);
+                basis[15] = C3_6 * x * (xx - 3.0 * yy);
+                n_basis = 16u;
             }
-            if (uniforms.sh_degree >= 2u) {
-                let xx = x * x; let yy = y * y; let zz = z * z;
-                basis[4] = C2_0 * x * y;
-                basis[5] = C2_1 * y * z;
-                basis[6] = C2_2 * (2.0 * zz - xx - yy);
-                basis[7] = C2_3 * x * z;
-                basis[8] = C2_4 * (xx - yy);
-                n_basis = 9u;
-                if (uniforms.sh_degree >= 3u) {
-                    basis[9] = C3_0 * y * (3.0 * xx - yy);
-                    basis[10] = C3_1 * x * y * z;
-                    basis[11] = C3_2 * y * (4.0 * zz - xx - yy);
-                    basis[12] = C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy);
-                    basis[13] = C3_4 * x * (4.0 * zz - xx - yy);
-                    basis[14] = C3_5 * z * (xx - yy);
-                    basis[15] = C3_6 * x * (xx - 3.0 * yy);
-                    n_basis = 16u;
-                }
-            }
-            let d_channels = array<f32, 3>(d_sh_result.x, d_sh_result.y, d_sh_result.z);
-            for (var c = 0u; c < 3u; c++) {
-                for (var k = 0u; k < n_basis; k++) {
-                    let sh_val = d_channels[c] * basis[k];
-                    let reduced = half_warp_reduce(sh_val);
-                    if (lane == flush_lane) {
-                        let sh_global_idx = r.tet_id * sh_stride + c * nc + k;
-                        global_cas_add_sh(sh_global_idx, reduced);
-                    }
+        }
+        let d_channels = array<f32, 3>(d_sh_result.x, d_sh_result.y, d_sh_result.z);
+        for (var c = 0u; c < 3u; c++) {
+            for (var k = 0u; k < n_basis; k++) {
+                let sh_val = d_channels[c] * basis[k];
+                let reduced = half_warp_reduce(sh_val);
+                if (lane == flush_lane) {
+                    let sh_global_idx = r.tet_id * sh_stride + c * nc + k;
+                    global_cas_add_sh(sh_global_idx, reduced);
                 }
             }
         }
     }
 
     // ===== Reduce and flush scalar/vector gradients =====
+    // All 16 lower-half lanes participate (inactive lanes contribute 0).
     let reduced_d_density = half_warp_reduce(d_density_local);
 
     var reduced_d_vert: array<vec3<f32>, 4>;
@@ -495,6 +511,10 @@ fn compute_and_flush_grads(
         half_warp_reduce(d_grad_local.z),
     );
 
+    // Flush reduced gradients to global memory.
+    // No is_active check — the reduced values correctly sum over all pixels
+    // (inactive lanes contributed 0). The flush lane always has valid
+    // r.tet_id and r.vidx since intersect_and_eval loads them when has_tet=true.
     if (lane == flush_lane) {
         global_cas_add_density(r.tet_id, reduced_d_density);
 
@@ -594,19 +614,24 @@ fn main(
         let r = intersect_and_eval(my_tet_id, cam, ray_dir, valid_pixel, true);
 
         // Threads 0-15: forward replay + gradient computation
-        if (!is_second_half && valid_pixel && r.intersection_valid) {
+        // ALL lower-half lanes must call compute_and_flush_grads so that
+        // half_warp_reduce has uniform control flow across the half-warp.
+        if (!is_second_half) {
+            let is_active = valid_pixel && r.intersection_valid;
             let T_j = exp(log_t);
             let color_after = color_accum + r.c_premul * T_j;
 
-            // Compute and reduce+flush gradients
+            // Compute and reduce+flush gradients (inactive lanes contribute 0)
             compute_and_flush_grads(
                 r, d_color, d_log_t_final, color_final, color_after,
-                cam, ray_dir, log_t, lane, sh_stride, nc, 0u
+                cam, ray_dir, log_t, lane, sh_stride, nc, 0u, is_active
             );
 
-            // Update forward state
-            color_accum = color_after;
-            log_t -= r.od;
+            // Update forward state (only for is_active lanes)
+            if (is_active) {
+                color_accum = color_after;
+                log_t -= r.od;
+            }
         }
 
         cursor -= 1u;

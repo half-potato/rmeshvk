@@ -74,7 +74,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     dl_d_image[r_idx + 2u] = grad_b;
     dl_d_image[r_idx + 3u] = 0.0;
 
-    // Atomic add to loss accumulator
-    let loss_bits = bitcast<u32>(pixel_loss);
-    atomicAdd(&loss_value[0], loss_bits);
+    // Atomic float accumulation via CAS loop
+    var old_bits = atomicLoad(&loss_value[0]);
+    loop {
+        let new_bits = bitcast<u32>(bitcast<f32>(old_bits) + pixel_loss);
+        let result = atomicCompareExchangeWeak(&loss_value[0], old_bits, new_bits);
+        if (result.exchanged) { break; }
+        old_bits = result.old_value;
+    }
 }

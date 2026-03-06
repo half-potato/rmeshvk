@@ -144,9 +144,7 @@ pub struct TileUniforms {
     pub tiles_y: u32,
     pub num_tiles: u32,
     pub visible_tet_count: u32,
-    pub max_pairs: u32,
-    pub max_pairs_pow2: u32,
-    pub _pad: [u32; 3],
+    pub _pad: [u32; 5],
 }
 
 // Safe math constants (from safe_math.slang)

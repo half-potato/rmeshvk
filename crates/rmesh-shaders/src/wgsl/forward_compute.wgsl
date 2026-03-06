@@ -39,6 +39,9 @@ struct DrawIndirectArgs {
 @group(0) @binding(8) var<storage, read_write> sort_keys: array<u32>;
 @group(0) @binding(9) var<storage, read_write> sort_values: array<u32>;
 @group(0) @binding(10) var<storage, read_write> indirect_args: DrawIndirectArgs;
+// Compact outputs for tiled path (indexed by vis_idx from atomicAdd)
+@group(0) @binding(11) var<storage, read_write> tiles_touched: array<u32>;
+@group(0) @binding(12) var<storage, read_write> compact_tet_ids: array<u32>;
 
 // --- SH Constants ---
 const C0: f32 = 0.28209479177387814;
@@ -183,8 +186,36 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     sort_keys[tet_id] = ~depth_bits; // Invert for back-to-front sort
     sort_values[tet_id] = tet_id;
 
-    // Atomic increment instance count
-    atomicAdd(&indirect_args.instance_count, 1u);
+    // Atomic increment instance count, get compact vis_idx
+    let vis_idx = atomicAdd(&indirect_args.instance_count, 1u);
+
+    // Write compact tet id list for tiled path
+    compact_tet_ids[vis_idx] = tet_id;
+
+    // Compute tiles_touched for prefix scan (tile AABB extent)
+    let W = uniforms.screen_width;
+    let H = uniforms.screen_height;
+    let tile_size = 4.0; // must match tile_size used in tile_gen
+
+    if (any_behind) {
+        // Conservative: all tiles
+        let tiles_x = u32(ceil(W / tile_size));
+        let tiles_y = u32(ceil(H / tile_size));
+        tiles_touched[vis_idx] = tiles_x * tiles_y;
+    } else {
+        // NDC to pixel coords for AABB
+        let pix_min_x = max((min(min(p0.x, p1.x), min(p2.x, p3.x)) + 1.0) * 0.5 * W, 0.0);
+        let pix_max_x = min((max(max(p0.x, p1.x), max(p2.x, p3.x)) + 1.0) * 0.5 * W, W - 1.0);
+        let pix_min_y = max((1.0 - max(max(p0.y, p1.y), max(p2.y, p3.y))) * 0.5 * H, 0.0);
+        let pix_max_y = min((1.0 - min(min(p0.y, p1.y), min(p2.y, p3.y))) * 0.5 * H, H - 1.0);
+
+        let tile_min_x = u32(pix_min_x / tile_size);
+        let tile_max_x = u32(pix_max_x / tile_size);
+        let tile_min_y = u32(pix_min_y / tile_size);
+        let tile_max_y = u32(pix_max_y / tile_size);
+
+        tiles_touched[vis_idx] = (tile_max_x - tile_min_x + 1u) * (tile_max_y - tile_min_y + 1u);
+    }
 
     // --- 4. SH evaluation ---
     let centroid = (v0 + v1 + v2 + v3) * 0.25;

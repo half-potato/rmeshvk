@@ -636,7 +636,6 @@ pub struct TileBuffers {
     pub tile_pair_count: wgpu::Buffer,
     pub tile_ranges: wgpu::Buffer,
     pub tile_uniforms: wgpu::Buffer,
-    pub max_pairs: u32,
     pub max_pairs_pow2: u32,
     pub tiles_x: u32,
     pub tiles_y: u32,
@@ -646,26 +645,25 @@ pub struct TileBuffers {
 impl TileBuffers {
     /// Allocate tile buffers.
     ///
-    /// `max_pairs = tet_count * 16` — estimated max tile-tet pairs.
+    /// Sort buffer size is `next_power_of_two(tet_count * 16)` (at least `num_tiles`).
     pub fn new(device: &wgpu::Device, tet_count: u32, width: u32, height: u32, tile_size: u32) -> Self {
         let tiles_x = (width + tile_size - 1) / tile_size;
         let tiles_y = (height + tile_size - 1) / tile_size;
         let num_tiles = tiles_x * tiles_y;
 
-        let max_pairs = tet_count * 16;
-        let max_pairs_pow2 = (max_pairs as u64).next_power_of_two() as u32;
+        let max_pairs_pow2 = ((tet_count * 16).max(num_tiles) as u64).next_power_of_two() as u32;
 
         let tile_sort_keys = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tile_sort_keys"),
             size: (max_pairs_pow2 as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let tile_sort_values = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tile_sort_values"),
             size: (max_pairs_pow2 as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -679,7 +677,7 @@ impl TileBuffers {
         let tile_ranges = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tile_ranges"),
             size: (num_tiles as u64) * 2 * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -696,7 +694,6 @@ impl TileBuffers {
             tile_pair_count,
             tile_ranges,
             tile_uniforms,
-            max_pairs,
             max_pairs_pow2,
             tiles_x,
             tiles_y,
@@ -1159,11 +1156,11 @@ pub struct RadixSortState {
 }
 
 impl RadixSortState {
-    pub fn new(device: &wgpu::Device, max_pairs: u32, sorting_bits: u32) -> Self {
-        let max_num_wgs = (max_pairs + RADIX_BLOCK_SIZE - 1) / RADIX_BLOCK_SIZE;
+    pub fn new(device: &wgpu::Device, sort_buf_size: u32, sorting_bits: u32) -> Self {
+        let max_num_wgs = (sort_buf_size + RADIX_BLOCK_SIZE - 1) / RADIX_BLOCK_SIZE;
 
-        let keys_b = create_storage_buffer(device, "radix_keys_b", (max_pairs as u64) * 4);
-        let values_b = create_storage_buffer(device, "radix_values_b", (max_pairs as u64) * 4);
+        let keys_b = create_storage_buffer(device, "radix_keys_b", (sort_buf_size as u64) * 4);
+        let values_b = create_storage_buffer(device, "radix_values_b", (sort_buf_size as u64) * 4);
 
         // counts: [BIN_COUNT * max_num_wgs] u32
         let counts = create_storage_buffer(
@@ -1408,7 +1405,7 @@ pub fn record_tiled_backward(
         });
         pass.set_pipeline(&tile_pipelines.tile_gen_pipeline);
         pass.set_bind_group(0, tile_gen_bg, &[]);
-        let tet_count_upper = tile_buffers.max_pairs / 16;
+        let tet_count_upper = tile_buffers.max_pairs_pow2 / 16;
         let (gx, gy) = dispatch_2d((tet_count_upper + 63) / 64);
         pass.dispatch_workgroups(gx, gy, 1);
     }
@@ -1438,7 +1435,7 @@ pub fn record_tiled_backward(
         });
         pass.set_pipeline(&tile_pipelines.tile_ranges_pipeline);
         pass.set_bind_group(0, ranges_bg, &[]);
-        let (rx, ry) = dispatch_2d((tile_buffers.max_pairs + 255) / 256);
+        let (rx, ry) = dispatch_2d((tile_buffers.max_pairs_pow2 + 255) / 256);
         pass.dispatch_workgroups(rx, ry, 1);
     }
 
@@ -1482,4 +1479,396 @@ fn make_compute_pipeline(
         compilation_options: Default::default(),
         cache: None,
     })
+}
+
+// ===========================================================================
+// Prefix scan + prepare dispatch infrastructure (Changes 2-3)
+// ===========================================================================
+
+/// Pipelines for prefix scan, prepare_dispatch, and scan-based tile gen.
+pub struct ScanPipelines {
+    pub prepare_dispatch_pipeline: wgpu::ComputePipeline,
+    pub prepare_dispatch_bgl: wgpu::BindGroupLayout,
+    pub prefix_scan_pipeline: wgpu::ComputePipeline,
+    pub prefix_scan_bgl: wgpu::BindGroupLayout,
+    pub prefix_scan_add_pipeline: wgpu::ComputePipeline,
+    pub prefix_scan_add_bgl: wgpu::BindGroupLayout,
+    pub tile_gen_scan_pipeline: wgpu::ComputePipeline,
+    pub tile_gen_scan_bgl: wgpu::BindGroupLayout,
+}
+
+impl ScanPipelines {
+    pub fn new(device: &wgpu::Device) -> Self {
+        // Prepare dispatch: indirect_args(r), dispatch_scan(rw), dispatch_tile_gen(rw), visible_count_out(rw)
+        let prepare_dispatch_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("prepare_dispatch"),
+            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::PREPARE_DISPATCH_WGSL.into()),
+        });
+        let prepare_dispatch_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("prepare_dispatch_bgl"),
+            entries: &[
+                storage_entry(0, true),  // indirect_args
+                storage_entry(1, false), // dispatch_scan
+                storage_entry(2, false), // dispatch_tile_gen
+                storage_entry(3, false), // visible_count_out
+            ],
+        });
+        let prepare_dispatch_pipeline = make_compute_pipeline(device, "prepare_dispatch", &prepare_dispatch_shader, &[&prepare_dispatch_bgl]);
+
+        // Prefix scan: tiles_touched(r), pair_offsets(rw), block_sums(rw), visible_count(r)
+        let prefix_scan_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("prefix_scan"),
+            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::PREFIX_SCAN_WGSL.into()),
+        });
+        let prefix_scan_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("prefix_scan_bgl"),
+            entries: &[
+                storage_entry(0, true),  // tiles_touched
+                storage_entry(1, false), // pair_offsets
+                storage_entry(2, false), // block_sums
+                storage_entry(3, true),  // visible_count
+            ],
+        });
+        let prefix_scan_pipeline = make_compute_pipeline(device, "prefix_scan", &prefix_scan_shader, &[&prefix_scan_bgl]);
+
+        // Prefix scan add: pair_offsets(rw), block_sums_scanned(r), visible_count(r), num_keys_buf(rw), block_sums_original(r)
+        let prefix_scan_add_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("prefix_scan_add"),
+            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::PREFIX_SCAN_ADD_WGSL.into()),
+        });
+        let prefix_scan_add_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("prefix_scan_add_bgl"),
+            entries: &[
+                storage_entry(0, false), // pair_offsets
+                storage_entry(1, true),  // block_sums_scanned
+                storage_entry(2, true),  // visible_count
+                storage_entry(3, false), // num_keys_buf
+                storage_entry(4, true),  // block_sums_original
+            ],
+        });
+        let prefix_scan_add_pipeline = make_compute_pipeline(device, "prefix_scan_add", &prefix_scan_add_shader, &[&prefix_scan_add_bgl]);
+
+        // Tile gen scan: tile_uniforms(r), uniforms(r), vertices(r), indices(r),
+        //                compact_tet_ids(r), circumdata(r), tile_sort_keys(rw),
+        //                tile_sort_values(rw), pair_offsets(r), tiles_touched(r), visible_count(r)
+        let tile_gen_scan_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tile_gen_scan"),
+            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::TILE_GEN_SCAN_WGSL.into()),
+        });
+        let tile_gen_scan_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tile_gen_scan_bgl"),
+            entries: &[
+                storage_entry(0, true),  // tile_uniforms
+                storage_entry(1, true),  // uniforms
+                storage_entry(2, true),  // vertices
+                storage_entry(3, true),  // indices
+                storage_entry(4, true),  // compact_tet_ids
+                storage_entry(5, true),  // circumdata
+                storage_entry(6, false), // tile_sort_keys
+                storage_entry(7, false), // tile_sort_values
+                storage_entry(8, true),  // pair_offsets
+                storage_entry(9, true),  // tiles_touched
+                storage_entry(10, true), // visible_count
+            ],
+        });
+        let tile_gen_scan_pipeline = make_compute_pipeline(device, "tile_gen_scan", &tile_gen_scan_shader, &[&tile_gen_scan_bgl]);
+
+        Self {
+            prepare_dispatch_pipeline,
+            prepare_dispatch_bgl,
+            prefix_scan_pipeline,
+            prefix_scan_bgl,
+            prefix_scan_add_pipeline,
+            prefix_scan_add_bgl,
+            tile_gen_scan_pipeline,
+            tile_gen_scan_bgl,
+        }
+    }
+}
+
+/// Buffers for prefix scan and prepare_dispatch.
+pub struct ScanBuffers {
+    /// Indirect dispatch args for prefix scan: [3] u32
+    pub dispatch_scan: wgpu::Buffer,
+    /// Indirect dispatch args for tile gen: [3] u32
+    pub dispatch_tile_gen: wgpu::Buffer,
+    /// Visible tet count output: [1] u32
+    pub visible_count: wgpu::Buffer,
+    /// Pair offsets (exclusive prefix sum of tiles_touched): [max_visible] u32
+    pub pair_offsets: wgpu::Buffer,
+    /// Block sums for prefix scan: [max_blocks] u32
+    pub block_sums: wgpu::Buffer,
+    /// Scanned block sums: [max_blocks] u32
+    pub block_sums_scanned: wgpu::Buffer,
+    /// Scratch buffer for block_scan's unused block_sums output: [1] u32
+    pub block_scan_scratch: wgpu::Buffer,
+    /// Max number of blocks for scan
+    pub max_blocks: u32,
+}
+
+impl ScanBuffers {
+    pub fn new(device: &wgpu::Device, max_visible: u32) -> Self {
+        let max_blocks = (max_visible + 255) / 256;
+
+        let dispatch_scan = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dispatch_scan"),
+            size: 12, // 3 u32
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let dispatch_tile_gen = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dispatch_tile_gen"),
+            size: 12, // 3 u32
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let visible_count = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("visible_count"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let pair_offsets = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pair_offsets"),
+            size: (max_visible as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let block_sums = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("block_sums"),
+            size: (max_blocks as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let block_sums_scanned = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("block_sums_scanned"),
+            size: (max_blocks as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let block_scan_scratch = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("block_scan_scratch"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            dispatch_scan,
+            dispatch_tile_gen,
+            visible_count,
+            pair_offsets,
+            block_sums,
+            block_sums_scanned,
+            block_scan_scratch,
+            max_blocks,
+        }
+    }
+}
+
+/// Create the prepare_dispatch bind group.
+pub fn create_prepare_dispatch_bind_group(
+    device: &wgpu::Device,
+    pipelines: &ScanPipelines,
+    indirect_args: &wgpu::Buffer,
+    scan_buffers: &ScanBuffers,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("prepare_dispatch_bg"),
+        layout: &pipelines.prepare_dispatch_bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: indirect_args.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: scan_buffers.dispatch_scan.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: scan_buffers.dispatch_tile_gen.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: scan_buffers.visible_count.as_entire_binding() },
+        ],
+    })
+}
+
+/// Create the prefix scan bind group.
+pub fn create_prefix_scan_bind_group(
+    device: &wgpu::Device,
+    pipelines: &ScanPipelines,
+    tiles_touched: &wgpu::Buffer,
+    scan_buffers: &ScanBuffers,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("prefix_scan_bg"),
+        layout: &pipelines.prefix_scan_bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: tiles_touched.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: scan_buffers.pair_offsets.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: scan_buffers.block_sums.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: scan_buffers.visible_count.as_entire_binding() },
+        ],
+    })
+}
+
+/// Create the prefix scan for block_sums (same pipeline, different buffers).
+pub fn create_block_scan_bind_group(
+    device: &wgpu::Device,
+    pipelines: &ScanPipelines,
+    scan_buffers: &ScanBuffers,
+) -> wgpu::BindGroup {
+    // Scan block_sums into block_sums_scanned using the same prefix scan pipeline.
+    // For block_sums scan: input = block_sums, output = block_sums_scanned
+    // We need a separate "visible_count" for block sums = num_blocks.
+    // But we can reuse the dispatch_scan buffer's first element as it holds ceil(visible_count/256) = num_blocks.
+    // Actually, we need a dedicated small buffer. For simplicity, we'll use a single-workgroup dispatch
+    // for the block_sums since max_blocks is typically small (< 256).
+    //
+    // For now, we handle this in the recording function by dispatching prefix_scan on block_sums
+    // with a dedicated bind group.
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("block_scan_bg"),
+        layout: &pipelines.prefix_scan_bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: scan_buffers.block_sums.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: scan_buffers.block_sums_scanned.as_entire_binding() },
+            // block_sums output for the block-level scan: written by shader but not needed.
+            wgpu::BindGroupEntry { binding: 2, resource: scan_buffers.block_scan_scratch.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: scan_buffers.dispatch_scan.as_entire_binding() }, // visible_count = dispatch_scan[0] = num_blocks
+        ],
+    })
+}
+
+/// Create the prefix scan add bind group.
+pub fn create_prefix_scan_add_bind_group(
+    device: &wgpu::Device,
+    pipelines: &ScanPipelines,
+    scan_buffers: &ScanBuffers,
+    num_keys_buf: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("prefix_scan_add_bg"),
+        layout: &pipelines.prefix_scan_add_bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: scan_buffers.pair_offsets.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: scan_buffers.block_sums_scanned.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: scan_buffers.visible_count.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: num_keys_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: scan_buffers.block_sums.as_entire_binding() },
+        ],
+    })
+}
+
+/// Create the scan-based tile gen bind group.
+pub fn create_tile_gen_scan_bind_group(
+    device: &wgpu::Device,
+    pipelines: &ScanPipelines,
+    tile_buffers: &TileBuffers,
+    scene_buffers: &SceneBuffers,
+    scan_buffers: &ScanBuffers,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tile_gen_scan_bg"),
+        layout: &pipelines.tile_gen_scan_bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: tile_buffers.tile_uniforms.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: scene_buffers.uniforms.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: scene_buffers.vertices.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: scene_buffers.indices.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: scene_buffers.compact_tet_ids.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: scene_buffers.circumdata.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: tile_buffers.tile_sort_keys.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: tile_buffers.tile_sort_values.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: scan_buffers.pair_offsets.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: scene_buffers.tiles_touched.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 10, resource: scan_buffers.visible_count.as_entire_binding() },
+        ],
+    })
+}
+
+/// Record the full scan-based tile pipeline.
+///
+/// Stages: prepare_dispatch → prefix_scan → block_scan → prefix_scan_add → tile_fill → tile_gen_scan
+///
+/// After this, tile_sort_keys/values are filled with tile-tet pairs and num_keys_buf is set.
+pub fn record_scan_tile_pipeline(
+    encoder: &mut wgpu::CommandEncoder,
+    scan_pipelines: &ScanPipelines,
+    tile_pipelines: &TilePipelines,
+    prepare_dispatch_bg: &wgpu::BindGroup,
+    prefix_scan_bg: &wgpu::BindGroup,
+    block_scan_bg: &wgpu::BindGroup,
+    prefix_scan_add_bg: &wgpu::BindGroup,
+    tile_fill_bg: &wgpu::BindGroup,
+    tile_gen_scan_bg: &wgpu::BindGroup,
+    scan_buffers: &ScanBuffers,
+    tile_buffers: &TileBuffers,
+) {
+    // 1. Prepare dispatch args from visible_tet_count
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("prepare_dispatch"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&scan_pipelines.prepare_dispatch_pipeline);
+        pass.set_bind_group(0, prepare_dispatch_bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+
+    // 2. Prefix scan of tiles_touched → pair_offsets + block_sums
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("prefix_scan"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&scan_pipelines.prefix_scan_pipeline);
+        pass.set_bind_group(0, prefix_scan_bg, &[]);
+        pass.dispatch_workgroups_indirect(&scan_buffers.dispatch_scan, 0);
+    }
+
+    // 3. Scan block_sums → block_sums_scanned (single workgroup for up to 256 blocks = 64K visible tets)
+    // For larger counts, we'd need recursive scan, but 256 blocks * 256 elements = 65536 visible tets
+    // is enough for most scenes.
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("block_scan"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&scan_pipelines.prefix_scan_pipeline);
+        pass.set_bind_group(0, block_scan_bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1); // Single workgroup handles up to 256 blocks
+    }
+
+    // 4. Add scanned block sums to pair_offsets + write total_pairs to num_keys_buf
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("prefix_scan_add"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&scan_pipelines.prefix_scan_add_pipeline);
+        pass.set_bind_group(0, prefix_scan_add_bg, &[]);
+        pass.dispatch_workgroups_indirect(&scan_buffers.dispatch_scan, 0);
+    }
+
+    // 5. Tile fill (sentinel keys)
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tile_fill"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&tile_pipelines.fill_pipeline);
+        pass.set_bind_group(0, tile_fill_bg, &[]);
+        let (fx, fy) = dispatch_2d((tile_buffers.max_pairs_pow2 + 255) / 256);
+        pass.dispatch_workgroups(fx, fy, 1);
+    }
+
+    // 6. Tile gen (scan-based, no atomics)
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tile_gen_scan"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&scan_pipelines.tile_gen_scan_pipeline);
+        pass.set_bind_group(0, tile_gen_scan_bg, &[]);
+        pass.dispatch_workgroups_indirect(&scan_buffers.dispatch_tile_gen, 0);
+    }
 }

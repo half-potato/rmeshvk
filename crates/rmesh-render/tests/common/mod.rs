@@ -442,8 +442,10 @@ async fn gpu_render_scene_async(
             &wgpu::DeviceDescriptor {
                 required_features: wgpu::Features::SUBGROUP,
                 required_limits: wgpu::Limits {
-                    max_storage_buffers_per_shader_stage: 11,
-                    ..wgpu::Limits::downlevel_defaults()
+                    max_storage_buffers_per_shader_stage: 16,
+                    max_storage_buffer_binding_size: 1 << 30,
+                    max_buffer_size: 1 << 30,
+                    ..wgpu::Limits::default()
                 },
                 ..Default::default()
             },

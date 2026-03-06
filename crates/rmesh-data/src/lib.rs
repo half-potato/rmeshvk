@@ -22,6 +22,7 @@ use half::f16;
 use std::io::Read;
 
 /// Loaded scene data, ready for GPU upload.
+#[derive(Clone)]
 pub struct SceneData {
     /// Vertex positions [N × 3] f32
     pub vertices: Vec<f32>,

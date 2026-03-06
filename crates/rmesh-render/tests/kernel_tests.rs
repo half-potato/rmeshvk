@@ -27,7 +27,10 @@ const H: u32 = 16;
 /// Create a GPU device with SUBGROUP feature. Returns None if no adapter.
 fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     pollster::block_on(async {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
+            ..Default::default()
+        });
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -45,7 +48,7 @@ fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
                         max_storage_buffers_per_shader_stage: 16,
                         max_storage_buffer_binding_size: 1 << 30,
                         max_buffer_size: 1 << 30,
-                        ..wgpu::Limits::downlevel_defaults()
+                        ..wgpu::Limits::default()
                     },
                     ..Default::default()
                 },
@@ -311,19 +314,29 @@ fn test_forward_tiled_pipeline_creation() {
 /// Verifies the legacy (non-tiled) pipeline produces output matching CPU.
 #[test]
 fn test_legacy_forward_e2e() {
+    // Use larger resolution (64×64) so the tet covers enough pixels to be visible.
+    // 16×16 can miss pixel centers for small tets at distance.
+    const E2E_W: u32 = 64;
+    const E2E_H: u32 = 64;
+
     let mut rng = ChaCha8Rng::seed_from_u64(SEED);
     let scene = random_single_tet_scene(&mut rng, 0.3);
 
     let verts = load_tet_verts(&scene, 0);
     let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
     let eye = centroid + Vec3::new(2.0, 0.0, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, centroid);
 
-    let cpu_image = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+    let aspect = E2E_W as f32 / E2E_H as f32;
+    let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
+    let view = look_at(eye, centroid, Vec3::new(0.0, 0.0, 1.0));
+    let vp = proj * view;
+    let inv_vp = vp.inverse();
+
+    let cpu_image = cpu_render_scene(&scene, eye, vp, inv_vp, E2E_W, E2E_H);
     let total_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
     assert!(total_alpha > 0.01, "CPU image is all-zero");
 
-    if let Some(gpu_image) = gpu_render_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(gpu_image) = gpu_render_scene(&scene, eye, vp, inv_vp, E2E_W, E2E_H) {
         let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
         eprintln!("legacy_forward_e2e: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
         assert!(mean_diff < 0.1, "mean_diff {mean_diff} >= 0.1");
