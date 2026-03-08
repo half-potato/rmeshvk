@@ -22,9 +22,11 @@ use rmesh_backward::{
     ScanBuffers, ScanPipelines, TileBuffers, TilePipelines, TileUniforms,
 };
 use rmesh_render::{
-    create_compute_bind_group, create_forward_tiled_bind_group, create_render_bind_group,
-    make_uniforms, record_forward_compute, record_forward_pass, record_forward_tiled,
-    record_tex_to_buffer, ForwardPipelines, ForwardTiledPipeline, RenderTargets, SceneBuffers,
+    build_boundary_bvh, compute_tet_neighbors, create_compute_bind_group,
+    create_forward_tiled_bind_group, create_raytrace_bind_group, create_render_bind_group,
+    find_containing_tet, make_uniforms, record_forward_compute, record_forward_pass,
+    record_forward_tiled, record_raytrace, record_tex_to_buffer, ForwardPipelines,
+    ForwardTiledPipeline, RayTraceBuffers, RayTracePipeline, RenderTargets, SceneBuffers,
     SortState, TexToBufferPipeline,
 };
 
@@ -159,6 +161,13 @@ struct RMeshRenderer {
     block_scan_bg: wgpu::BindGroup,
     prefix_scan_add_bg: wgpu::BindGroup,
     tile_gen_scan_bg: wgpu::BindGroup,
+    // Ray trace infrastructure
+    rt_pipeline: RayTracePipeline,
+    rt_buffers: RayTraceBuffers,
+    rt_bind_group: wgpu::BindGroup,
+    // Cached scene data for find_containing_tet
+    cached_vertices: Vec<f32>,
+    cached_indices: Vec<u32>,
     // Scene metadata
     tet_count: u32,
     _vertex_count: u32,
@@ -526,6 +535,13 @@ impl RMeshRenderer {
             &scan_buffers,
         );
 
+        // Ray trace setup
+        let neighbors = compute_tet_neighbors(&scene.indices, tet_count as usize);
+        let bvh = build_boundary_bvh(&scene.vertices, &scene.indices, &neighbors, tet_count as usize);
+        let rt_pipeline = RayTracePipeline::new(&device, width, height);
+        let rt_buffers = RayTraceBuffers::new(&device, &neighbors, &bvh);
+        let rt_bind_group = create_raytrace_bind_group(&device, &rt_pipeline, &scene_buffers, &rt_buffers);
+
         Ok(Self {
             device,
             queue,
@@ -570,6 +586,11 @@ impl RMeshRenderer {
             block_scan_bg,
             prefix_scan_add_bg,
             tile_gen_scan_bg,
+            rt_pipeline,
+            rt_buffers,
+            rt_bind_group,
+            cached_vertices: vertices_slice.to_vec(),
+            cached_indices: indices_slice.to_vec(),
             tet_count,
             _vertex_count: vertex_count,
             sh_degree,
@@ -800,6 +821,107 @@ impl RMeshRenderer {
 
         // Read back rendered image
         let data = read_buffer_f32(&self.device, &self.queue, &self.fwd_tiled.rendered_image);
+
+        let array = Array3::from_shape_vec(
+            (self.height as usize, self.width as usize, 4),
+            data,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+
+        Ok(array.into_pyarray(py))
+    }
+
+    /// Run the ray tracing forward pipeline (adjacency traversal, no sorting).
+    ///
+    /// Args:
+    ///     cam_pos: [3] f32 camera position
+    ///     vp: [16] f32 column-major view-projection matrix
+    ///     inv_vp: [16] f32 column-major inverse view-projection matrix
+    ///
+    /// Returns:
+    ///     numpy array [H, W, 4] f32 (RGBA)
+    fn forward_raytrace<'py>(
+        &mut self,
+        py: Python<'py>,
+        cam_pos: PyReadonlyArray1<f32>,
+        vp: PyReadonlyArray1<f32>,
+        inv_vp: PyReadonlyArray1<f32>,
+    ) -> PyResult<Bound<'py, PyArray3<f32>>> {
+        let cam_pos_slice = cam_pos.as_slice()?;
+        let vp_slice = vp.as_slice()?;
+        let inv_vp_slice = inv_vp.as_slice()?;
+
+        let cam = Vec3::new(cam_pos_slice[0], cam_pos_slice[1], cam_pos_slice[2]);
+        let vp_mat = mat4_from_flat(vp_slice);
+        let inv_vp_mat = mat4_from_flat(inv_vp_slice);
+
+        let uniforms = make_uniforms(
+            vp_mat,
+            inv_vp_mat,
+            cam,
+            self.width as f32,
+            self.height as f32,
+            self.tet_count,
+            self.sh_degree,
+            self.step,
+        );
+
+        // Upload uniforms
+        self.queue.write_buffer(
+            &self.scene_buffers.uniforms,
+            0,
+            bytemuck::bytes_of(&uniforms),
+        );
+
+        // Find containing tet (CPU brute force)
+        let start_tet = find_containing_tet(
+            &self.cached_vertices,
+            &self.cached_indices,
+            self.tet_count as usize,
+            cam,
+        )
+        .map(|t| t as i32)
+        .unwrap_or(-1);
+        self.queue.write_buffer(
+            &self.rt_buffers.start_tet,
+            0,
+            bytemuck::cast_slice(&[start_tet]),
+        );
+
+        // Single encoder: forward compute (SH eval) + raytrace
+        {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("forward_raytrace"),
+                });
+
+            encoder.clear_buffer(&self.rt_pipeline.rendered_image, 0, None);
+
+            // Forward compute (SH eval → colors_buf)
+            record_forward_compute(
+                &mut encoder,
+                &self.fwd_pipelines,
+                &self.scene_buffers,
+                &self.compute_bg,
+                self.tet_count,
+                &self.queue,
+            );
+
+            // Ray trace
+            record_raytrace(
+                &mut encoder,
+                &self.rt_pipeline,
+                &self.rt_bind_group,
+                self.width,
+                self.height,
+            );
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Read back rendered image
+        let data = read_buffer_f32(&self.device, &self.queue, &self.rt_pipeline.rendered_image);
 
         let array = Array3::from_shape_vec(
             (self.height as usize, self.width as usize, 4),

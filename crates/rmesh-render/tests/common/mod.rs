@@ -556,6 +556,134 @@ async fn gpu_render_scene_async(
 }
 
 // ---------------------------------------------------------------------------
+// GPU ray trace pipeline runner (headless)
+// ---------------------------------------------------------------------------
+
+/// Run the GPU ray trace pipeline and read back the color image.
+/// Returns None if no GPU adapter is available.
+pub fn gpu_raytrace_scene(
+    scene: &SceneData,
+    cam_pos: Vec3,
+    vp: Mat4,
+    inv_vp: Mat4,
+    w: u32,
+    h: u32,
+) -> Option<Vec<[f32; 4]>> {
+    pollster::block_on(gpu_raytrace_scene_async(scene, cam_pos, vp, inv_vp, w, h))
+}
+
+async fn gpu_raytrace_scene_async(
+    scene: &SceneData,
+    cam_pos: Vec3,
+    vp: Mat4,
+    inv_vp: Mat4,
+    w: u32,
+    h: u32,
+) -> Option<Vec<[f32; 4]>> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .ok()?;
+
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits {
+                    max_storage_buffers_per_shader_stage: 16,
+                    max_storage_buffer_binding_size: 1 << 30,
+                    max_buffer_size: 1 << 30,
+                    ..wgpu::Limits::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()?;
+
+    // Upload scene
+    let color_format = wgpu::TextureFormat::Rgba16Float;
+    let aux_format = wgpu::TextureFormat::Rgba32Float;
+    let buffers = rmesh_render::SceneBuffers::upload(&device, &queue, scene);
+    let pipelines = rmesh_render::ForwardPipelines::new(&device, color_format, aux_format);
+    let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers);
+
+    // Build ray trace data
+    let neighbors = rmesh_render::compute_tet_neighbors(&scene.indices, scene.tet_count as usize);
+    let bvh = rmesh_render::build_boundary_bvh(
+        &scene.vertices, &scene.indices, &neighbors, scene.tet_count as usize,
+    );
+    let rt_pipeline = rmesh_render::RayTracePipeline::new(&device, w, h);
+    let rt_buffers = rmesh_render::RayTraceBuffers::new(&device, &neighbors, &bvh);
+
+    // Determine start tet
+    let start_tet = rmesh_render::find_containing_tet(
+        &scene.vertices, &scene.indices, scene.tet_count as usize, cam_pos,
+    ).map(|t| t as i32).unwrap_or(-1);
+    queue.write_buffer(&rt_buffers.start_tet, 0, bytemuck::cast_slice(&[start_tet]));
+
+    let rt_bg = rmesh_render::create_raytrace_bind_group(&device, &rt_pipeline, &buffers, &rt_buffers);
+
+    // Write uniforms
+    let uniforms = rmesh_render::make_uniforms(
+        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, scene.sh_degree, 0,
+    );
+    queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+
+    // Record: forward compute (SH eval) + raytrace
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("test_raytrace"),
+    });
+
+    // Clear output
+    encoder.clear_buffer(&rt_pipeline.rendered_image, 0, None);
+
+    // Forward compute (SH eval → colors_buf)
+    rmesh_render::record_forward_compute(
+        &mut encoder, &pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
+    );
+
+    // Ray trace
+    rmesh_render::record_raytrace(&mut encoder, &rt_pipeline, &rt_bg, w, h);
+
+    // Readback
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: (w as u64) * (h as u64) * 4 * 4,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_buffer_to_buffer(
+        &rt_pipeline.rendered_image, 0, &readback, 0, readback.size(),
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let slice = readback.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap();
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    receiver.recv().unwrap().ok()?;
+
+    let data = slice.get_mapped_range();
+    let floats: &[f32] = bytemuck::cast_slice(&data);
+    let mut image = vec![[0.0f32; 4]; (w * h) as usize];
+    for i in 0..(w * h) as usize {
+        image[i] = [floats[i * 4], floats[i * 4 + 1], floats[i * 4 + 2], floats[i * 4 + 3]];
+    }
+    drop(data);
+    readback.unmap();
+
+    Some(image)
+}
+
+// ---------------------------------------------------------------------------
 // Test scene builders
 // ---------------------------------------------------------------------------
 

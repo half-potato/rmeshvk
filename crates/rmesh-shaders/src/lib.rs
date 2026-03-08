@@ -24,3 +24,4 @@ pub const RADIX_SORT_REDUCE_WGSL: &str = include_str!("wgsl/radix_sort_reduce.wg
 pub const RADIX_SORT_SCAN_WGSL: &str = include_str!("wgsl/radix_sort_scan.wgsl");
 pub const RADIX_SORT_SCAN_ADD_WGSL: &str = include_str!("wgsl/radix_sort_scan_add.wgsl");
 pub const RADIX_SORT_SCATTER_WGSL: &str = include_str!("wgsl/radix_sort_scatter.wgsl");
+pub const RAYTRACE_COMPUTE_WGSL: &str = include_str!("wgsl/raytrace_compute.wgsl");

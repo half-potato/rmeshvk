@@ -111,6 +111,72 @@ fn test_face_view() {
     }
 }
 
+/// Ray tracing: camera outside single tet, BVH entry.
+/// Compare GPU raytrace against CPU reference renderer.
+#[test]
+fn test_raytrace_single_tet_outside() {
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+    let scene = random_single_tet_scene(&mut rng, 0.3);
+
+    let verts = load_tet_verts(&scene, 0);
+    let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
+
+    let eye = centroid + Vec3::new(2.0, 0.0, 0.0);
+    let (vp, inv_vp) = setup_camera(eye, centroid);
+
+    let cpu_image = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+
+    let total_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
+    assert!(total_alpha > 0.1, "CPU image is all-zero");
+
+    if let Some(rt_image) = gpu_raytrace_scene(&scene, eye, vp, inv_vp, W, H) {
+        let (max_diff, mean_diff, _) = compare_images(&cpu_image, &rt_image);
+        eprintln!(
+            "raytrace outside: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}"
+        );
+        assert!(
+            mean_diff < ATOL,
+            "raytrace outside: mean_diff {mean_diff} >= {ATOL}"
+        );
+    } else {
+        eprintln!("Skipping GPU raytrace test (no adapter)");
+    }
+}
+
+/// Ray tracing: camera inside single tet.
+/// With single tet, start_tet = 0, adjacency traversal hits 1 tet then exits.
+#[test]
+fn test_raytrace_single_tet_inside() {
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+    let scene = random_single_tet_scene(&mut rng, 0.3);
+
+    let verts = load_tet_verts(&scene, 0);
+    let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
+
+    let eye = centroid;
+    let target = centroid + Vec3::new(1.0, 0.0, 0.0);
+    let (vp, inv_vp) = setup_camera(eye, target);
+
+    let cpu_image = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+
+    let total_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
+    assert!(total_alpha > 0.01, "CPU image is all-zero");
+
+    if let Some(rt_image) = gpu_raytrace_scene(&scene, eye, vp, inv_vp, W, H) {
+        let (max_diff, mean_diff, _) = compare_images(&cpu_image, &rt_image);
+        eprintln!(
+            "raytrace inside: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}"
+        );
+        // Raytrace doesn't clip to near plane like hardware raster, so should be close to CPU
+        assert!(
+            mean_diff < ATOL,
+            "raytrace inside: mean_diff {mean_diff} >= {ATOL}"
+        );
+    } else {
+        eprintln!("Skipping GPU raytrace test (no adapter)");
+    }
+}
+
 /// Verify the CPU reference renderer produces reasonable output
 /// by checking pixel values are bounded and consistent.
 #[test]

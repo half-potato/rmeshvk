@@ -147,6 +147,19 @@ pub struct TileUniforms {
     pub _pad: [u32; 5],
 }
 
+/// BVH node for boundary face acceleration structure.
+/// Matches the WGSL `BVHNode` struct layout (std430).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct BVHNode {
+    pub aabb_min: [f32; 3],
+    /// >= 0: left child index, < 0: -(leaf_start + 1)
+    pub left_or_face: i32,
+    pub aabb_max: [f32; 3],
+    /// Internal: right child index. Leaf: face count.
+    pub right_or_count: i32,
+}
+
 // Safe math constants (from safe_math.slang)
 pub const SAFE_MIN: f32 = -1e20;
 pub const SAFE_MAX: f32 = 1e20;
