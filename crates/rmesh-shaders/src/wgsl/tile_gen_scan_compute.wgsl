@@ -1,7 +1,8 @@
 // Tile-tet pair generation using prefix-scan offsets (no atomics).
 //
-// Same hull overlap test as tile_gen_hull_compute.wgsl, but writes to
-// pre-allocated positions from the prefix scan rather than using atomicAdd.
+// Conservative scanline fill (Variant B) for tile-tet overlap testing.
+// Replaces the AABB + hull_overlaps_tile approach with exact convex hull
+// scanline fill at tile granularity.
 //
 // Key encoding: 17-bit tile_id (supports 131K tiles), 15-bit depth.
 // Dispatched indirectly for visible_tet_count threads.
@@ -50,97 +51,11 @@ struct Uniforms {
 @group(0) @binding(8) var<storage, read> pair_offsets: array<u32>;
 @group(0) @binding(9) var<storage, read> tiles_touched: array<u32>;
 @group(0) @binding(10) var<storage, read> visible_count: array<u32>;
+@group(0) @binding(11) var<storage, read_write> num_keys_out: array<u32>;
 
 fn load_vertex(idx: u32) -> vec3<f32> {
     let i = idx * 3u;
     return vec3<f32>(vertices[i], vertices[i + 1u], vertices[i + 2u]);
-}
-
-fn cross2d(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
-    return ax * by - ay * bx;
-}
-
-fn point_in_tri(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32) -> bool {
-    let d1 = cross2d(bx - ax, by - ay, px - ax, py - ay);
-    let d2 = cross2d(cx - bx, cy - by, px - bx, py - by);
-    let d3 = cross2d(ax - cx, ay - cy, px - cx, py - cy);
-    let has_neg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
-    let has_pos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
-    return !(has_neg && has_pos);
-}
-
-fn point_in_hull(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) -> bool {
-    return point_in_tri(px, py, x0, y0, x1, y1, x2, y2)
-        || point_in_tri(px, py, x0, y0, x1, y1, x3, y3)
-        || point_in_tri(px, py, x0, y0, x2, y2, x3, y3)
-        || point_in_tri(px, py, x1, y1, x2, y2, x3, y3);
-}
-
-fn point_in_rect(px: f32, py: f32, rect_left: f32, rect_top: f32, rect_right: f32, rect_bottom: f32) -> bool {
-    return px >= rect_left && px <= rect_right && py >= rect_top && py <= rect_bottom;
-}
-
-fn segment_intersects_rect(
-    x0: f32, y0: f32, x1: f32, y1: f32,
-    rect_left: f32, rect_top: f32, rect_right: f32, rect_bottom: f32
-) -> bool {
-    let seg_min_x = min(x0, x1);
-    let seg_max_x = max(x0, x1);
-    let seg_min_y = min(y0, y1);
-    let seg_max_y = max(y0, y1);
-
-    if (seg_max_x < rect_left || seg_min_x > rect_right ||
-        seg_max_y < rect_top || seg_min_y > rect_bottom) {
-        return false;
-    }
-
-    let dx = x1 - x0;
-    let dy = y1 - y0;
-
-    let c0 = cross2d(dx, dy, rect_left - x0, rect_top - y0);
-    let c1 = cross2d(dx, dy, rect_right - x0, rect_top - y0);
-    let c2 = cross2d(dx, dy, rect_right - x0, rect_bottom - y0);
-    let c3 = cross2d(dx, dy, rect_left - x0, rect_bottom - y0);
-
-    let all_pos = (c0 > 0.0) && (c1 > 0.0) && (c2 > 0.0) && (c3 > 0.0);
-    let all_neg = (c0 < 0.0) && (c1 < 0.0) && (c2 < 0.0) && (c3 < 0.0);
-
-    return !(all_pos || all_neg);
-}
-
-fn hull_overlaps_tile(
-    proj: array<vec2<f32>, 4>,
-    rect_left: f32, rect_top: f32, rect_right: f32, rect_bottom: f32
-) -> bool {
-    let cx = (rect_left + rect_right) * 0.5;
-    let cy = (rect_top + rect_bottom) * 0.5;
-    if (point_in_hull(cx, cy,
-            proj[0].x, proj[0].y, proj[1].x, proj[1].y,
-            proj[2].x, proj[2].y, proj[3].x, proj[3].y)) {
-        return true;
-    }
-
-    for (var i = 0u; i < 4u; i++) {
-        if (point_in_rect(proj[i].x, proj[i].y, rect_left, rect_top, rect_right, rect_bottom)) {
-            return true;
-        }
-    }
-
-    let edges = array<vec2<u32>, 6>(
-        vec2<u32>(0u, 1u), vec2<u32>(0u, 2u), vec2<u32>(0u, 3u),
-        vec2<u32>(1u, 2u), vec2<u32>(1u, 3u), vec2<u32>(2u, 3u),
-    );
-    for (var e = 0u; e < 6u; e++) {
-        let a = edges[e].x;
-        let b = edges[e].y;
-        if (segment_intersects_rect(
-                proj[a].x, proj[a].y, proj[b].x, proj[b].y,
-                rect_left, rect_top, rect_right, rect_bottom)) {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 @compute @workgroup_size(64)
@@ -153,8 +68,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     }
 
     let tet_id = compact_tet_ids[vis_idx];
-    let write_start = pair_offsets[vis_idx];
+    // pair_offsets contains INCLUSIVE prefix sum; convert to exclusive offset
     let max_write = tiles_touched[vis_idx];
+    let write_start = pair_offsets[vis_idx] - max_write;
+
+    // Last visible tet writes total_pairs for radix sort
+    if (vis_idx == n - 1u) {
+        num_keys_out[0] = pair_offsets[vis_idx];
+    }
+
+    // Early return for behind-camera tets (tiles_touched=0 from forward_compute)
+    if (max_write == 0u) {
+        return;
+    }
 
     // Load tet vertices
     let i0 = indices[tet_id * 4u];
@@ -174,54 +100,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     let c2 = vp * vec4<f32>(v2, 1.0);
     let c3 = vp * vec4<f32>(v3, 1.0);
 
-    let any_behind = (c0.w <= 0.0) || (c1.w <= 0.0) || (c2.w <= 0.0) || (c3.w <= 0.0);
-
     let W = f32(tile_uniforms.screen_width);
     let H = f32(tile_uniforms.screen_height);
     let ts = f32(tile_uniforms.tile_size);
 
-    var tile_min_x: u32;
-    var tile_min_y: u32;
-    var tile_max_x: u32;
-    var tile_max_y: u32;
+    // NDC to pixel coords (epsilon matches forward_compute.wgsl project_to_ndc)
+    let n0 = c0.xyz / (c0.w + 1e-6);
+    let n1 = c1.xyz / (c1.w + 1e-6);
+    let n2 = c2.xyz / (c2.w + 1e-6);
+    let n3 = c3.xyz / (c3.w + 1e-6);
 
     var proj: array<vec2<f32>, 4>;
+    proj[0] = vec2<f32>((n0.x + 1.0) * 0.5 * W, (1.0 - n0.y) * 0.5 * H);
+    proj[1] = vec2<f32>((n1.x + 1.0) * 0.5 * W, (1.0 - n1.y) * 0.5 * H);
+    proj[2] = vec2<f32>((n2.x + 1.0) * 0.5 * W, (1.0 - n2.y) * 0.5 * H);
+    proj[3] = vec2<f32>((n3.x + 1.0) * 0.5 * W, (1.0 - n3.y) * 0.5 * H);
 
-    if (any_behind) {
-        tile_min_x = 0u;
-        tile_min_y = 0u;
-        tile_max_x = tile_uniforms.tiles_x - 1u;
-        tile_max_y = tile_uniforms.tiles_y - 1u;
-    } else {
-        let n0 = c0.xyz / c0.w;
-        let n1 = c1.xyz / c1.w;
-        let n2 = c2.xyz / c2.w;
-        let n3 = c3.xyz / c3.w;
+    // AABB for tile bounds
+    let pix_min_x = max(min(min(proj[0].x, proj[1].x), min(proj[2].x, proj[3].x)), 0.0);
+    let pix_max_x = min(max(max(proj[0].x, proj[1].x), max(proj[2].x, proj[3].x)), W - 1.0);
+    let pix_min_y = max(min(min(proj[0].y, proj[1].y), min(proj[2].y, proj[3].y)), 0.0);
+    let pix_max_y = min(max(max(proj[0].y, proj[1].y), max(proj[2].y, proj[3].y)), H - 1.0);
 
-        proj[0] = vec2<f32>((n0.x + 1.0) * 0.5 * W, (1.0 - n0.y) * 0.5 * H);
-        proj[1] = vec2<f32>((n1.x + 1.0) * 0.5 * W, (1.0 - n1.y) * 0.5 * H);
-        proj[2] = vec2<f32>((n2.x + 1.0) * 0.5 * W, (1.0 - n2.y) * 0.5 * H);
-        proj[3] = vec2<f32>((n3.x + 1.0) * 0.5 * W, (1.0 - n3.y) * 0.5 * H);
-
-        let pix_min_x = min(min(proj[0].x, proj[1].x), min(proj[2].x, proj[3].x));
-        let pix_max_x = max(max(proj[0].x, proj[1].x), max(proj[2].x, proj[3].x));
-        let pix_min_y = min(min(proj[0].y, proj[1].y), min(proj[2].y, proj[3].y));
-        let pix_max_y = max(max(proj[0].y, proj[1].y), max(proj[2].y, proj[3].y));
-
-        let clamped_left = max(pix_min_x, 0.0);
-        let clamped_right = min(pix_max_x, W - 1.0);
-        let clamped_top = max(pix_min_y, 0.0);
-        let clamped_bottom = min(pix_max_y, H - 1.0);
-
-        if (clamped_left > clamped_right || clamped_top > clamped_bottom) {
-            return;
-        }
-
-        tile_min_x = u32(clamped_left / ts);
-        tile_max_x = min(u32(clamped_right / ts), tile_uniforms.tiles_x - 1u);
-        tile_min_y = u32(clamped_top / ts);
-        tile_max_y = min(u32(clamped_bottom / ts), tile_uniforms.tiles_y - 1u);
+    if (pix_min_x > pix_max_x || pix_min_y > pix_max_y) {
+        return;
     }
+
+    let tiles_x_total = u32(ceil(W / ts));
+    let tile_min_x = u32(pix_min_x / ts);
+    let tile_max_x = min(u32(pix_max_x / ts), tiles_x_total - 1u);
+    let tile_min_y = u32(pix_min_y / ts);
+    let tile_max_y = min(u32(pix_max_y / ts), u32(ceil(H / ts)) - 1u);
 
     // Depth key from circumsphere
     let cx = circumdata[tet_id * 4u];
@@ -234,31 +143,60 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     let inv_depth = ~bitcast<u32>(depth);
     let depth_bits = inv_depth >> 17u;
 
-    // Write tile-tet pairs at pre-allocated offsets (no atomics)
+    // Conservative scanline tile enumeration (Variant B) — same algorithm as forward_compute
+    let T = ts;
+    let ei_arr = array<u32, 6>(0u, 0u, 0u, 1u, 1u, 2u);
+    let ej_arr = array<u32, 6>(1u, 2u, 3u, 2u, 3u, 3u);
+
     var local_count = 0u;
     for (var ty = tile_min_y; ty <= tile_max_y; ty++) {
-        for (var tx = tile_min_x; tx <= tile_max_x; tx++) {
-            if (!any_behind) {
-                let rect_left = f32(tx) * ts;
-                let rect_top = f32(ty) * ts;
-                let rect_right = rect_left + ts;
-                let rect_bottom = rect_top + ts;
+        var xl = 1e10f;
+        var xr = -1e10f;
 
-                if (!hull_overlaps_tile(proj, rect_left, rect_top, rect_right, rect_bottom)) {
-                    continue;
+        // Edge intersections at both tile-row boundaries
+        for (var e = 0u; e < 6u; e++) {
+            let ei = ei_arr[e];
+            let ej = ej_arr[e];
+            let yi = proj[ei].y;
+            let yj = proj[ej].y;
+            let xi = proj[ei].x;
+            let xj = proj[ej].x;
+            for (var b = 0u; b < 2u; b++) {
+                let ytest = f32(ty + b) * T;
+                if ((yi <= ytest && yj > ytest) || (yj <= ytest && yi > ytest)) {
+                    let t = (ytest - yi) / (yj - yi);
+                    let x = xi + t * (xj - xi);
+                    xl = min(xl, x);
+                    xr = max(xr, x);
                 }
             }
+        }
 
-            let tile_id = ty * tile_uniforms.tiles_x + tx;
-            let key = (tile_id << 15u) | (depth_bits & 0x7FFFu);
+        // Vertices within tile-row band
+        for (var v = 0u; v < 4u; v++) {
+            let vy = proj[v].y;
+            if (vy >= f32(ty) * T && vy <= f32(ty + 1u) * T) {
+                xl = min(xl, proj[v].x);
+                xr = max(xr, proj[v].x);
+            }
+        }
 
-            if (local_count < max_write) {
-                let write_idx = write_start + local_count;
-                if (write_idx < arrayLength(&tile_sort_keys)) {
-                    tile_sort_keys[write_idx] = key;
-                    tile_sort_values[write_idx] = tet_id;
+        if (xl <= xr) {
+            let tx0 = clamp(u32(max(floor(xl / T), 0.0)), tile_min_x, tile_max_x);
+            let tx1 = clamp(u32(max(floor(xr / T), 0.0)), tile_min_x, tile_max_x);
+
+            for (var tx = tx0; tx <= tx1; tx++) {
+                let tile_id = ty * tile_uniforms.tiles_x + tx;
+                let key = (tile_id << 15u) | (depth_bits & 0x7FFFu);
+
+                if (local_count < max_write) {
+                    let write_idx = write_start + local_count;
+                    if (write_idx < arrayLength(&tile_sort_keys)) {
+                        tile_sort_keys[write_idx] = key;
+                        tile_sort_values[write_idx] = tet_id;
+                    }
+                    local_count++;
                 }
-                local_count++;
             }
         }
     }

@@ -35,7 +35,7 @@ class RMeshForward(torch.autograd.Function):
         inv_vp_np = inv_vp.detach().cpu().numpy().ravel().astype(np.float32)
 
         # Run forward render
-        image_np = renderer.forward(cam_np, vp_np, inv_vp_np)
+        image_np = renderer.forward_tiled(cam_np, vp_np, inv_vp_np)
 
         ctx.renderer = renderer
         ctx.save_for_backward(vertices, sh_coeffs, densities, color_grads)

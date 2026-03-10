@@ -651,7 +651,7 @@ impl TileBuffers {
         let tiles_y = (height + tile_size - 1) / tile_size;
         let num_tiles = tiles_x * tiles_y;
 
-        let max_pairs_pow2 = ((tet_count * 16).max(num_tiles) as u64).next_power_of_two() as u32;
+        let max_pairs_pow2 = ((tet_count * 4).max(num_tiles) as u64).next_power_of_two() as u32;
 
         let tile_sort_keys = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tile_sort_keys"),
@@ -1485,21 +1485,22 @@ fn make_compute_pipeline(
 // Prefix scan + prepare dispatch infrastructure (Changes 2-3)
 // ===========================================================================
 
-/// Pipelines for prefix scan, prepare_dispatch, and scan-based tile gen.
+/// Pipelines for RTS prefix scan, prepare_dispatch, and scan-based tile gen.
 pub struct ScanPipelines {
     pub prepare_dispatch_pipeline: wgpu::ComputePipeline,
     pub prepare_dispatch_bgl: wgpu::BindGroupLayout,
-    pub prefix_scan_pipeline: wgpu::ComputePipeline,
-    pub prefix_scan_bgl: wgpu::BindGroupLayout,
-    pub prefix_scan_add_pipeline: wgpu::ComputePipeline,
-    pub prefix_scan_add_bgl: wgpu::BindGroupLayout,
+    pub rts_reduce_pipeline: wgpu::ComputePipeline,
+    pub rts_spine_scan_pipeline: wgpu::ComputePipeline,
+    pub rts_downsweep_pipeline: wgpu::ComputePipeline,
+    pub rts_bgl: wgpu::BindGroupLayout,
     pub tile_gen_scan_pipeline: wgpu::ComputePipeline,
     pub tile_gen_scan_bgl: wgpu::BindGroupLayout,
 }
 
 impl ScanPipelines {
     pub fn new(device: &wgpu::Device) -> Self {
-        // Prepare dispatch: indirect_args(r), dispatch_scan(rw), dispatch_tile_gen(rw), visible_count_out(rw)
+        // Prepare dispatch: indirect_args(r), dispatch_scan(rw), dispatch_tile_gen(rw),
+        //                   visible_count_out(rw), rts_info(rw)
         let prepare_dispatch_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("prepare_dispatch"),
             source: wgpu::ShaderSource::Wgsl(rmesh_shaders::PREPARE_DISPATCH_WGSL.into()),
@@ -1511,46 +1512,62 @@ impl ScanPipelines {
                 storage_entry(1, false), // dispatch_scan
                 storage_entry(2, false), // dispatch_tile_gen
                 storage_entry(3, false), // visible_count_out
+                storage_entry(4, false), // rts_info
             ],
         });
         let prepare_dispatch_pipeline = make_compute_pipeline(device, "prepare_dispatch", &prepare_dispatch_shader, &[&prepare_dispatch_bgl]);
 
-        // Prefix scan: tiles_touched(r), pair_offsets(rw), block_sums(rw), visible_count(r)
-        let prefix_scan_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("prefix_scan"),
-            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::PREFIX_SCAN_WGSL.into()),
+        // RTS (Reduce Then Scan) — 3 entry points sharing one bind group layout
+        // Bindings: info(r), scan_in(rw), scan_out(rw), scan_bump(rw), reduction(rw), misc(rw)
+        let rts_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rts"),
+            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::RTS_WGSL.into()),
         });
-        let prefix_scan_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("prefix_scan_bgl"),
+        let rts_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rts_bgl"),
             entries: &[
-                storage_entry(0, true),  // tiles_touched
-                storage_entry(1, false), // pair_offsets
-                storage_entry(2, false), // block_sums
-                storage_entry(3, true),  // visible_count
+                storage_entry(0, true),  // info (InfoStruct)
+                storage_entry(1, false), // scan_in (tiles_touched as vec4<u32>)
+                storage_entry(2, false), // scan_out (pair_offsets as vec4<u32>)
+                storage_entry(3, false), // scan_bump (unused, 1 u32)
+                storage_entry(4, false), // reduction (spine buffer)
+                storage_entry(5, false), // misc (unused, 1 u32)
             ],
         });
-        let prefix_scan_pipeline = make_compute_pipeline(device, "prefix_scan", &prefix_scan_shader, &[&prefix_scan_bgl]);
-
-        // Prefix scan add: pair_offsets(rw), block_sums_scanned(r), visible_count(r), num_keys_buf(rw), block_sums_original(r)
-        let prefix_scan_add_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("prefix_scan_add"),
-            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::PREFIX_SCAN_ADD_WGSL.into()),
+        let rts_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rts_pl"),
+            bind_group_layouts: &[&rts_bgl],
+            immediate_size: 0,
         });
-        let prefix_scan_add_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("prefix_scan_add_bgl"),
-            entries: &[
-                storage_entry(0, false), // pair_offsets
-                storage_entry(1, true),  // block_sums_scanned
-                storage_entry(2, true),  // visible_count
-                storage_entry(3, false), // num_keys_buf
-                storage_entry(4, true),  // block_sums_original
-            ],
+        let rts_reduce_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rts_reduce_pipeline"),
+            layout: Some(&rts_layout),
+            module: &rts_shader,
+            entry_point: Some("reduce"),
+            compilation_options: Default::default(),
+            cache: None,
         });
-        let prefix_scan_add_pipeline = make_compute_pipeline(device, "prefix_scan_add", &prefix_scan_add_shader, &[&prefix_scan_add_bgl]);
+        let rts_spine_scan_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rts_spine_scan_pipeline"),
+            layout: Some(&rts_layout),
+            module: &rts_shader,
+            entry_point: Some("spine_scan"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let rts_downsweep_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rts_downsweep_pipeline"),
+            layout: Some(&rts_layout),
+            module: &rts_shader,
+            entry_point: Some("downsweep"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         // Tile gen scan: tile_uniforms(r), uniforms(r), vertices(r), indices(r),
         //                compact_tet_ids(r), circumdata(r), tile_sort_keys(rw),
-        //                tile_sort_values(rw), pair_offsets(r), tiles_touched(r), visible_count(r)
+        //                tile_sort_values(rw), pair_offsets(r), tiles_touched(r),
+        //                visible_count(r), num_keys_out(rw)
         let tile_gen_scan_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile_gen_scan"),
             source: wgpu::ShaderSource::Wgsl(rmesh_shaders::TILE_GEN_SCAN_WGSL.into()),
@@ -1569,6 +1586,7 @@ impl ScanPipelines {
                 storage_entry(8, true),  // pair_offsets
                 storage_entry(9, true),  // tiles_touched
                 storage_entry(10, true), // visible_count
+                storage_entry(11, false), // num_keys_out
             ],
         });
         let tile_gen_scan_pipeline = make_compute_pipeline(device, "tile_gen_scan", &tile_gen_scan_shader, &[&tile_gen_scan_bgl]);
@@ -1576,39 +1594,41 @@ impl ScanPipelines {
         Self {
             prepare_dispatch_pipeline,
             prepare_dispatch_bgl,
-            prefix_scan_pipeline,
-            prefix_scan_bgl,
-            prefix_scan_add_pipeline,
-            prefix_scan_add_bgl,
+            rts_reduce_pipeline,
+            rts_spine_scan_pipeline,
+            rts_downsweep_pipeline,
+            rts_bgl,
             tile_gen_scan_pipeline,
             tile_gen_scan_bgl,
         }
     }
 }
 
-/// Buffers for prefix scan and prepare_dispatch.
+/// Buffers for RTS prefix scan and prepare_dispatch.
 pub struct ScanBuffers {
-    /// Indirect dispatch args for prefix scan: [3] u32
+    /// Indirect dispatch args for RTS reduce/downsweep: [3] u32
     pub dispatch_scan: wgpu::Buffer,
     /// Indirect dispatch args for tile gen: [3] u32
     pub dispatch_tile_gen: wgpu::Buffer,
     /// Visible tet count output: [1] u32
     pub visible_count: wgpu::Buffer,
-    /// Pair offsets (exclusive prefix sum of tiles_touched): [max_visible] u32
+    /// Pair offsets (inclusive prefix sum of tiles_touched): padded to 16-byte alignment
     pub pair_offsets: wgpu::Buffer,
-    /// Block sums for prefix scan: [max_blocks] u32
-    pub block_sums: wgpu::Buffer,
-    /// Scanned block sums: [max_blocks] u32
-    pub block_sums_scanned: wgpu::Buffer,
-    /// Scratch buffer for block_scan's unused block_sums output: [1] u32
-    pub block_scan_scratch: wgpu::Buffer,
-    /// Max number of blocks for scan
-    pub max_blocks: u32,
+    /// RTS info struct: {size, vec_size, thread_blocks} — 3 u32
+    pub rts_uniform: wgpu::Buffer,
+    /// RTS reduction spine: [max_thread_blocks] u32
+    pub rts_reduction: wgpu::Buffer,
+    /// RTS scan_bump: [1] u32 (unused by rts, required by binding)
+    pub rts_scan_bump: wgpu::Buffer,
+    /// RTS misc: [1] u32 (unused by rts, required by binding)
+    pub rts_misc: wgpu::Buffer,
 }
 
 impl ScanBuffers {
     pub fn new(device: &wgpu::Device, max_visible: u32) -> Self {
-        let max_blocks = (max_visible + 255) / 256;
+        // RTS processes in vec4<u32> groups of 1024 per workgroup
+        let max_vec_size = ((max_visible as u64) + 3) / 4;
+        let max_thread_blocks = ((max_vec_size + 1023) / 1024).max(1) as u32;
 
         let dispatch_scan = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dispatch_scan"),
@@ -1631,29 +1651,41 @@ impl ScanBuffers {
             mapped_at_creation: false,
         });
 
+        // Pad pair_offsets to multiple of 16 for vec4<u32> binding in RTS scan_out
         let pair_offsets = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pair_offsets"),
-            size: (max_visible as u64) * 4,
+            size: max_vec_size * 16,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
-        let block_sums = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("block_sums"),
-            size: (max_blocks as u64) * 4,
+        // RTS uniform: 3 u32 = 12 bytes (storage, not uniform — GPU writes it)
+        let rts_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rts_uniform"),
+            size: 12,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // RTS reduction spine
+        let rts_reduction = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rts_reduction"),
+            size: (max_thread_blocks as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // RTS scan_bump (unused, single u32)
+        let rts_scan_bump = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rts_scan_bump"),
+            size: 4,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let block_sums_scanned = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("block_sums_scanned"),
-            size: (max_blocks as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let block_scan_scratch = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("block_scan_scratch"),
+        // RTS misc (unused, single u32)
+        let rts_misc = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rts_misc"),
             size: 4,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -1664,10 +1696,10 @@ impl ScanBuffers {
             dispatch_tile_gen,
             visible_count,
             pair_offsets,
-            block_sums,
-            block_sums_scanned,
-            block_scan_scratch,
-            max_blocks,
+            rts_uniform,
+            rts_reduction,
+            rts_scan_bump,
+            rts_misc,
         }
     }
 }
@@ -1687,73 +1719,31 @@ pub fn create_prepare_dispatch_bind_group(
             wgpu::BindGroupEntry { binding: 1, resource: scan_buffers.dispatch_scan.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: scan_buffers.dispatch_tile_gen.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: scan_buffers.visible_count.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: scan_buffers.rts_uniform.as_entire_binding() },
         ],
     })
 }
 
-/// Create the prefix scan bind group.
-pub fn create_prefix_scan_bind_group(
+/// Create the RTS (Reduce Then Scan) bind group.
+///
+/// Shared by all 3 RTS entry points (reduce, spine_scan, downsweep).
+/// Bindings: info(r), scan_in(rw), scan_out(rw), scan_bump(rw), reduction(rw), misc(rw)
+pub fn create_rts_bind_group(
     device: &wgpu::Device,
     pipelines: &ScanPipelines,
     tiles_touched: &wgpu::Buffer,
     scan_buffers: &ScanBuffers,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("prefix_scan_bg"),
-        layout: &pipelines.prefix_scan_bgl,
+        label: Some("rts_bg"),
+        layout: &pipelines.rts_bgl,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: tiles_touched.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: scan_buffers.pair_offsets.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: scan_buffers.block_sums.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: scan_buffers.visible_count.as_entire_binding() },
-        ],
-    })
-}
-
-/// Create the prefix scan for block_sums (same pipeline, different buffers).
-pub fn create_block_scan_bind_group(
-    device: &wgpu::Device,
-    pipelines: &ScanPipelines,
-    scan_buffers: &ScanBuffers,
-) -> wgpu::BindGroup {
-    // Scan block_sums into block_sums_scanned using the same prefix scan pipeline.
-    // For block_sums scan: input = block_sums, output = block_sums_scanned
-    // We need a separate "visible_count" for block sums = num_blocks.
-    // But we can reuse the dispatch_scan buffer's first element as it holds ceil(visible_count/256) = num_blocks.
-    // Actually, we need a dedicated small buffer. For simplicity, we'll use a single-workgroup dispatch
-    // for the block_sums since max_blocks is typically small (< 256).
-    //
-    // For now, we handle this in the recording function by dispatching prefix_scan on block_sums
-    // with a dedicated bind group.
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("block_scan_bg"),
-        layout: &pipelines.prefix_scan_bgl,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: scan_buffers.block_sums.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: scan_buffers.block_sums_scanned.as_entire_binding() },
-            // block_sums output for the block-level scan: written by shader but not needed.
-            wgpu::BindGroupEntry { binding: 2, resource: scan_buffers.block_scan_scratch.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: scan_buffers.dispatch_scan.as_entire_binding() }, // visible_count = dispatch_scan[0] = num_blocks
-        ],
-    })
-}
-
-/// Create the prefix scan add bind group.
-pub fn create_prefix_scan_add_bind_group(
-    device: &wgpu::Device,
-    pipelines: &ScanPipelines,
-    scan_buffers: &ScanBuffers,
-    num_keys_buf: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("prefix_scan_add_bg"),
-        layout: &pipelines.prefix_scan_add_bgl,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: scan_buffers.pair_offsets.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: scan_buffers.block_sums_scanned.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: scan_buffers.visible_count.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: num_keys_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: scan_buffers.block_sums.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 0, resource: scan_buffers.rts_uniform.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: tiles_touched.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: scan_buffers.pair_offsets.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: scan_buffers.rts_scan_bump.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: scan_buffers.rts_reduction.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: scan_buffers.rts_misc.as_entire_binding() },
         ],
     })
 }
@@ -1765,6 +1755,7 @@ pub fn create_tile_gen_scan_bind_group(
     tile_buffers: &TileBuffers,
     scene_buffers: &SceneBuffers,
     scan_buffers: &ScanBuffers,
+    num_keys_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tile_gen_scan_bg"),
@@ -1781,13 +1772,14 @@ pub fn create_tile_gen_scan_bind_group(
             wgpu::BindGroupEntry { binding: 8, resource: scan_buffers.pair_offsets.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 9, resource: scene_buffers.tiles_touched.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 10, resource: scan_buffers.visible_count.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: num_keys_buf.as_entire_binding() },
         ],
     })
 }
 
-/// Record the full scan-based tile pipeline.
+/// Record the full scan-based tile pipeline using RTS (Reduce Then Scan).
 ///
-/// Stages: prepare_dispatch → prefix_scan → block_scan → prefix_scan_add → tile_fill → tile_gen_scan
+/// Stages: prepare_dispatch → rts_reduce → rts_spine_scan → rts_downsweep → tile_fill → tile_gen_scan
 ///
 /// After this, tile_sort_keys/values are filled with tile-tet pairs and num_keys_buf is set.
 pub fn record_scan_tile_pipeline(
@@ -1795,15 +1787,13 @@ pub fn record_scan_tile_pipeline(
     scan_pipelines: &ScanPipelines,
     tile_pipelines: &TilePipelines,
     prepare_dispatch_bg: &wgpu::BindGroup,
-    prefix_scan_bg: &wgpu::BindGroup,
-    block_scan_bg: &wgpu::BindGroup,
-    prefix_scan_add_bg: &wgpu::BindGroup,
+    rts_bg: &wgpu::BindGroup,
     tile_fill_bg: &wgpu::BindGroup,
     tile_gen_scan_bg: &wgpu::BindGroup,
     scan_buffers: &ScanBuffers,
     tile_buffers: &TileBuffers,
 ) {
-    // 1. Prepare dispatch args from visible_tet_count
+    // 1. Prepare dispatch args + RTS info from visible_tet_count
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("prepare_dispatch"),
@@ -1814,38 +1804,36 @@ pub fn record_scan_tile_pipeline(
         pass.dispatch_workgroups(1, 1, 1);
     }
 
-    // 2. Prefix scan of tiles_touched → pair_offsets + block_sums
+    // 2. RTS reduce: per-workgroup reductions → spine
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("prefix_scan"),
+            label: Some("rts_reduce"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&scan_pipelines.prefix_scan_pipeline);
-        pass.set_bind_group(0, prefix_scan_bg, &[]);
+        pass.set_pipeline(&scan_pipelines.rts_reduce_pipeline);
+        pass.set_bind_group(0, rts_bg, &[]);
         pass.dispatch_workgroups_indirect(&scan_buffers.dispatch_scan, 0);
     }
 
-    // 3. Scan block_sums → block_sums_scanned (single workgroup for up to 256 blocks = 64K visible tets)
-    // For larger counts, we'd need recursive scan, but 256 blocks * 256 elements = 65536 visible tets
-    // is enough for most scenes.
+    // 3. RTS spine scan: scan the spine (single workgroup)
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("block_scan"),
+            label: Some("rts_spine_scan"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&scan_pipelines.prefix_scan_pipeline);
-        pass.set_bind_group(0, block_scan_bg, &[]);
-        pass.dispatch_workgroups(1, 1, 1); // Single workgroup handles up to 256 blocks
+        pass.set_pipeline(&scan_pipelines.rts_spine_scan_pipeline);
+        pass.set_bind_group(0, rts_bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
     }
 
-    // 4. Add scanned block sums to pair_offsets + write total_pairs to num_keys_buf
+    // 4. RTS downsweep: inclusive scan within each workgroup + add spine prefix
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("prefix_scan_add"),
+            label: Some("rts_downsweep"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&scan_pipelines.prefix_scan_add_pipeline);
-        pass.set_bind_group(0, prefix_scan_add_bg, &[]);
+        pass.set_pipeline(&scan_pipelines.rts_downsweep_pipeline);
+        pass.set_bind_group(0, rts_bg, &[]);
         pass.dispatch_workgroups_indirect(&scan_buffers.dispatch_scan, 0);
     }
 
@@ -1861,7 +1849,7 @@ pub fn record_scan_tile_pipeline(
         pass.dispatch_workgroups(fx, fy, 1);
     }
 
-    // 6. Tile gen (scan-based, no atomics)
+    // 6. Tile gen (scan-based, no atomics) — also writes total_pairs to num_keys_out
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("tile_gen_scan"),

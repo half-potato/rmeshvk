@@ -719,19 +719,13 @@ fn test_tiled_forward_e2e() {
     let prepare_dispatch_bg = rmesh_backward::create_prepare_dispatch_bind_group(
         &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
     );
-    let prefix_scan_bg = rmesh_backward::create_prefix_scan_bind_group(
+    let rts_bg = rmesh_backward::create_rts_bind_group(
         &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
-    );
-    let block_scan_bg = rmesh_backward::create_block_scan_bind_group(
-        &device, &scan_pipelines, &scan_buffers,
-    );
-    let prefix_scan_add_bg = rmesh_backward::create_prefix_scan_add_bind_group(
-        &device, &scan_pipelines, &scan_buffers, &radix_state.num_keys_buf,
     );
     let tile_fill_bg =
         rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
     let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
-        &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers,
+        &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers, &radix_state.num_keys_buf,
     );
 
     // Tile ranges uses num_keys_buf (scan pipeline writes total_pairs there)
@@ -763,7 +757,7 @@ fn test_tiled_forward_e2e() {
     // 1. Scan-based tile pipeline
     rmesh_backward::record_scan_tile_pipeline(
         &mut encoder, &scan_pipelines, &tile_pipelines,
-        &prepare_dispatch_bg, &prefix_scan_bg, &block_scan_bg, &prefix_scan_add_bg,
+        &prepare_dispatch_bg, &rts_bg,
         &tile_fill_bg, &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
     );
 
@@ -896,19 +890,13 @@ fn test_tiled_backward_e2e() {
     let prepare_dispatch_bg = rmesh_backward::create_prepare_dispatch_bind_group(
         &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
     );
-    let prefix_scan_bg = rmesh_backward::create_prefix_scan_bind_group(
+    let rts_bg = rmesh_backward::create_rts_bind_group(
         &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
-    );
-    let block_scan_bg = rmesh_backward::create_block_scan_bind_group(
-        &device, &scan_pipelines, &scan_buffers,
-    );
-    let prefix_scan_add_bg = rmesh_backward::create_prefix_scan_add_bind_group(
-        &device, &scan_pipelines, &scan_buffers, &radix_state.num_keys_buf,
     );
     let tile_fill_bg =
         rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
     let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
-        &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers,
+        &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers, &radix_state.num_keys_buf,
     );
 
     // Tile ranges uses num_keys_buf (scan pipeline writes total_pairs there)
@@ -936,7 +924,7 @@ fn test_tiled_backward_e2e() {
 
     rmesh_backward::record_scan_tile_pipeline(
         &mut encoder, &scan_pipelines, &tile_pipelines,
-        &prepare_dispatch_bg, &prefix_scan_bg, &block_scan_bg, &prefix_scan_add_bg,
+        &prepare_dispatch_bg, &rts_bg,
         &tile_fill_bg, &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
     );
 
@@ -1135,18 +1123,12 @@ fn test_single_tet_gradient_finite_diff() {
         let prepare_dispatch_bg = rmesh_backward::create_prepare_dispatch_bind_group(
             &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
         );
-        let prefix_scan_bg = rmesh_backward::create_prefix_scan_bind_group(
+        let rts_bg = rmesh_backward::create_rts_bind_group(
             &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
-        );
-        let block_scan_bg = rmesh_backward::create_block_scan_bind_group(
-            &device, &scan_pipelines, &scan_buffers,
-        );
-        let prefix_scan_add_bg = rmesh_backward::create_prefix_scan_add_bind_group(
-            &device, &scan_pipelines, &scan_buffers, &radix_state.num_keys_buf,
         );
         let tile_fill_bg = rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
         let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
-            &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers,
+            &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers, &radix_state.num_keys_buf,
         );
 
         let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
@@ -1174,7 +1156,7 @@ fn test_single_tet_gradient_finite_diff() {
 
         rmesh_backward::record_scan_tile_pipeline(
             &mut encoder, &scan_pipelines, &tile_pipelines,
-            &prepare_dispatch_bg, &prefix_scan_bg, &block_scan_bg, &prefix_scan_add_bg,
+            &prepare_dispatch_bg, &rts_bg,
             &tile_fill_bg, &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
         );
 
@@ -1249,18 +1231,12 @@ fn test_single_tet_gradient_finite_diff() {
         let prepare_dispatch_bg = rmesh_backward::create_prepare_dispatch_bind_group(
             &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
         );
-        let prefix_scan_bg = rmesh_backward::create_prefix_scan_bind_group(
+        let rts_bg = rmesh_backward::create_rts_bind_group(
             &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
-        );
-        let block_scan_bg = rmesh_backward::create_block_scan_bind_group(
-            &device, &scan_pipelines, &scan_buffers,
-        );
-        let prefix_scan_add_bg = rmesh_backward::create_prefix_scan_add_bind_group(
-            &device, &scan_pipelines, &scan_buffers, &radix_state.num_keys_buf,
         );
         let tile_fill_bg = rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
         let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
-            &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers,
+            &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers, &radix_state.num_keys_buf,
         );
 
         let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
@@ -1288,7 +1264,7 @@ fn test_single_tet_gradient_finite_diff() {
 
         rmesh_backward::record_scan_tile_pipeline(
             &mut encoder, &scan_pipelines, &tile_pipelines,
-            &prepare_dispatch_bg, &prefix_scan_bg, &block_scan_bg, &prefix_scan_add_bg,
+            &prepare_dispatch_bg, &rts_bg,
             &tile_fill_bg, &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
         );
 
@@ -1569,19 +1545,13 @@ fn test_single_tet_loss_decreases() {
     let prepare_dispatch_bg = rmesh_backward::create_prepare_dispatch_bind_group(
         &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
     );
-    let prefix_scan_bg = rmesh_backward::create_prefix_scan_bind_group(
+    let rts_bg = rmesh_backward::create_rts_bind_group(
         &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
-    );
-    let block_scan_bg = rmesh_backward::create_block_scan_bind_group(
-        &device, &scan_pipelines, &scan_buffers,
-    );
-    let prefix_scan_add_bg = rmesh_backward::create_prefix_scan_add_bind_group(
-        &device, &scan_pipelines, &scan_buffers, &radix_state.num_keys_buf,
     );
     let tile_fill_bg =
         rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
     let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
-        &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers,
+        &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers, &radix_state.num_keys_buf,
     );
 
     let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
@@ -1719,7 +1689,7 @@ fn test_single_tet_loss_decreases() {
         // Scan pipeline
         rmesh_backward::record_scan_tile_pipeline(
             &mut encoder, &scan_pipelines, &tile_pipelines,
-            &prepare_dispatch_bg, &prefix_scan_bg, &block_scan_bg, &prefix_scan_add_bg,
+            &prepare_dispatch_bg, &rts_bg,
             &tile_fill_bg, &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
         );
 

@@ -14,8 +14,7 @@ use pyo3::types::PyDict;
 use glam::{Mat4, Vec3, Vec4};
 use rmesh_backward::{
     create_adam_bind_group, create_backward_bind_groups, create_backward_tiled_bind_groups,
-    create_loss_bind_group, create_prepare_dispatch_bind_group, create_prefix_scan_add_bind_group,
-    create_prefix_scan_bind_group, create_block_scan_bind_group,
+    create_loss_bind_group, create_prepare_dispatch_bind_group, create_rts_bind_group,
     create_tile_fill_bind_group, create_tile_gen_bind_group, create_tile_gen_scan_bind_group,
     create_tile_ranges_bind_group_with_keys, AdamState, AdamUniforms, BackwardPipelines,
     GradientBuffers, LossBuffers, LossUniforms, RadixSortPipelines, RadixSortState,
@@ -153,13 +152,11 @@ struct RMeshRenderer {
     _bwd_bg1: wgpu::BindGroup,
     adam_bgs: Vec<wgpu::BindGroup>,
     adam_uniforms_bufs: Vec<wgpu::Buffer>,
-    // Scan-based tile pipeline (Changes 2-3)
+    // Scan-based tile pipeline (RTS prefix scan)
     scan_pipelines: ScanPipelines,
     scan_buffers: ScanBuffers,
     prepare_dispatch_bg: wgpu::BindGroup,
-    prefix_scan_bg: wgpu::BindGroup,
-    block_scan_bg: wgpu::BindGroup,
-    prefix_scan_add_bg: wgpu::BindGroup,
+    rts_bg: wgpu::BindGroup,
     tile_gen_scan_bg: wgpu::BindGroup,
     // Ray trace infrastructure
     rt_pipeline: RayTracePipeline,
@@ -374,7 +371,7 @@ impl RMeshRenderer {
         ];
 
         // Tiled backward infrastructure
-        let tile_size = 4u32;
+        let tile_size = 16u32;
         let tile_pipelines = TilePipelines::new(&device);
         let tile_buffers = TileBuffers::new(&device, tet_count, width, height, tile_size);
 
@@ -501,7 +498,7 @@ impl RMeshRenderer {
             &debug_image,
         );
 
-        // Scan-based tile pipeline infrastructure
+        // Scan-based tile pipeline infrastructure (RTS prefix scan)
         let scan_pipelines = ScanPipelines::new(&device);
         let scan_buffers = ScanBuffers::new(&device, tet_count);
         let prepare_dispatch_bg = create_prepare_dispatch_bind_group(
@@ -510,22 +507,11 @@ impl RMeshRenderer {
             &scene_buffers.indirect_args,
             &scan_buffers,
         );
-        let prefix_scan_bg = create_prefix_scan_bind_group(
+        let rts_bg = create_rts_bind_group(
             &device,
             &scan_pipelines,
             &scene_buffers.tiles_touched,
             &scan_buffers,
-        );
-        let block_scan_bg = create_block_scan_bind_group(
-            &device,
-            &scan_pipelines,
-            &scan_buffers,
-        );
-        let prefix_scan_add_bg = create_prefix_scan_add_bind_group(
-            &device,
-            &scan_pipelines,
-            &scan_buffers,
-            &radix_state.num_keys_buf,
         );
         let tile_gen_scan_bg = create_tile_gen_scan_bind_group(
             &device,
@@ -533,6 +519,7 @@ impl RMeshRenderer {
             &tile_buffers,
             &scene_buffers,
             &scan_buffers,
+            &radix_state.num_keys_buf,
         );
 
         // Ray trace setup
@@ -582,9 +569,7 @@ impl RMeshRenderer {
             scan_pipelines,
             scan_buffers,
             prepare_dispatch_bg,
-            prefix_scan_bg,
-            block_scan_bg,
-            prefix_scan_add_bg,
+            rts_bg,
             tile_gen_scan_bg,
             rt_pipeline,
             rt_buffers,
@@ -726,7 +711,7 @@ impl RMeshRenderer {
         let tile_uni = TileUniforms {
             screen_width: self.width,
             screen_height: self.height,
-            tile_size: 4,
+            tile_size: 16,
             tiles_x: self.tile_buffers.tiles_x,
             tiles_y: self.tile_buffers.tiles_y,
             num_tiles: self.tile_buffers.num_tiles,
@@ -761,15 +746,13 @@ impl RMeshRenderer {
                 &self.queue,
             );
 
-            // Scan-based tile pipeline
+            // RTS scan-based tile pipeline
             rmesh_backward::record_scan_tile_pipeline(
                 &mut encoder,
                 &self.scan_pipelines,
                 &self.tile_pipelines,
                 &self.prepare_dispatch_bg,
-                &self.prefix_scan_bg,
-                &self.block_scan_bg,
-                &self.prefix_scan_add_bg,
+                &self.rts_bg,
                 &self.tile_fill_bg,
                 &self.tile_gen_scan_bg,
                 &self.scan_buffers,
@@ -817,6 +800,49 @@ impl RMeshRenderer {
             );
 
             self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Debug readbacks
+        {
+            let vis_raw = read_buffer_raw(&self.device, &self.queue, &self.scan_buffers.visible_count);
+            let vis_count = u32::from_le_bytes([vis_raw[0], vis_raw[1], vis_raw[2], vis_raw[3]]);
+
+            let nk_raw = read_buffer_raw(&self.device, &self.queue, &self.radix_state.num_keys_buf);
+            let total_pairs = u32::from_le_bytes([nk_raw[0], nk_raw[1], nk_raw[2], nk_raw[3]]);
+
+            // Read tiles_touched to verify forward_compute wrote non-zero values
+            let tt_raw = read_buffer_raw(&self.device, &self.queue, &self.scene_buffers.tiles_touched);
+            let tt_count = tt_raw.len() / 4;
+            let mut tt_nonzero = 0u32;
+            let mut tt_sum = 0u64;
+            let mut tt_first16 = Vec::new();
+            for i in 0..tt_count {
+                let v = u32::from_le_bytes([tt_raw[i*4], tt_raw[i*4+1], tt_raw[i*4+2], tt_raw[i*4+3]]);
+                if v > 0 { tt_nonzero += 1; }
+                tt_sum += v as u64;
+                if i < 16 { tt_first16.push(v); }
+            }
+
+            // Read RTS info (size, vec_size, thread_blocks)
+            let ri_raw = read_buffer_raw(&self.device, &self.queue, &self.scan_buffers.rts_uniform);
+            let rts_size = u32::from_le_bytes([ri_raw[0], ri_raw[1], ri_raw[2], ri_raw[3]]);
+            let rts_vec_size = u32::from_le_bytes([ri_raw[4], ri_raw[5], ri_raw[6], ri_raw[7]]);
+            let rts_tblocks = u32::from_le_bytes([ri_raw[8], ri_raw[9], ri_raw[10], ri_raw[11]]);
+
+            // Read first 8 RTS reduction spine values
+            let red_raw = read_buffer_raw(&self.device, &self.queue, &self.scan_buffers.rts_reduction);
+            let mut red_first8 = Vec::new();
+            for i in 0..red_raw.len().min(32)/4 {
+                let v = u32::from_le_bytes([red_raw[i*4], red_raw[i*4+1], red_raw[i*4+2], red_raw[i*4+3]]);
+                red_first8.push(v);
+            }
+
+            eprintln!("[DEBUG forward_tiled] visible_count={vis_count}, total_pairs={total_pairs}, max_pairs_pow2={}",
+                self.tile_buffers.max_pairs_pow2);
+            eprintln!("[DEBUG forward_tiled] tiles_touched: nonzero={tt_nonzero}/{tt_count}, sum={tt_sum}");
+            eprintln!("[DEBUG forward_tiled] tiles_touched first 16: {:?}", tt_first16);
+            eprintln!("[DEBUG forward_tiled] rts_info: size={rts_size}, vec_size={rts_vec_size}, thread_blocks={rts_tblocks}");
+            eprintln!("[DEBUG forward_tiled] rts_reduction first 8: {:?}", red_first8);
         }
 
         // Read back rendered image
@@ -1042,7 +1068,7 @@ impl RMeshRenderer {
         let tile_uni = TileUniforms {
             screen_width: self.width,
             screen_height: self.height,
-            tile_size: 4,
+            tile_size: 16,
             tiles_x: self.tile_buffers.tiles_x,
             tiles_y: self.tile_buffers.tiles_y,
             num_tiles: self.tile_buffers.num_tiles,
@@ -1068,15 +1094,13 @@ impl RMeshRenderer {
         encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
         encoder.clear_buffer(&self.debug_image, 0, None);
 
-        // Scan-based tile pipeline (reads compact_tet_ids + tiles_touched from forward compute)
+        // RTS scan-based tile pipeline (reads compact_tet_ids + tiles_touched from forward compute)
         rmesh_backward::record_scan_tile_pipeline(
             &mut encoder,
             &self.scan_pipelines,
             &self.tile_pipelines,
             &self.prepare_dispatch_bg,
-            &self.prefix_scan_bg,
-            &self.block_scan_bg,
-            &self.prefix_scan_add_bg,
+            &self.rts_bg,
             &self.tile_fill_bg,
             &self.tile_gen_scan_bg,
             &self.scan_buffers,
@@ -1252,7 +1276,7 @@ impl RMeshRenderer {
         let tile_uni = TileUniforms {
             screen_width: self.width,
             screen_height: self.height,
-            tile_size: 4,
+            tile_size: 16,
             tiles_x: self.tile_buffers.tiles_x,
             tiles_y: self.tile_buffers.tiles_y,
             num_tiles: self.tile_buffers.num_tiles,
@@ -1292,16 +1316,14 @@ impl RMeshRenderer {
             &self.queue,
         );
 
-        // Scan-based tile pipeline: prepare_dispatch → prefix_scan → block_scan
-        // → prefix_scan_add (writes total_pairs to num_keys_buf) → tile_fill → tile_gen_scan
+        // RTS scan-based tile pipeline: prepare_dispatch → rts_reduce → rts_spine_scan
+        // → rts_downsweep → tile_fill → tile_gen_scan (writes total_pairs to num_keys_buf)
         rmesh_backward::record_scan_tile_pipeline(
             &mut encoder,
             &self.scan_pipelines,
             &self.tile_pipelines,
             &self.prepare_dispatch_bg,
-            &self.prefix_scan_bg,
-            &self.block_scan_bg,
-            &self.prefix_scan_add_bg,
+            &self.rts_bg,
             &self.tile_fill_bg,
             &self.tile_gen_scan_bg,
             &self.scan_buffers,

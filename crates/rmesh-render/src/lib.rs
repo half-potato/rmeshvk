@@ -136,10 +136,11 @@ impl SceneBuffers {
             mapped_at_creation: false,
         });
 
+        // Pad to multiple of 16 bytes for vec4<u32> binding in RTS prefix scan
         let tiles_touched = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tiles_touched"),
-            size: m * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            size: ((m + 3) / 4) * 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -1073,6 +1074,9 @@ pub fn record_forward_compute(
         first_instance: 0,
     };
     queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
+
+    // Clear tiles_touched so RTS vec4 padding elements are zero
+    encoder.clear_buffer(&buffers.tiles_touched, 0, None);
 
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
