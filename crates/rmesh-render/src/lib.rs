@@ -2,8 +2,7 @@
 //!
 //! Sets up the wgpu compute and render pipelines for the forward pass:
 //!   1. Compute pass: SH eval, cull, depth key generation
-//!   2. Sort pass: Bitonic sort of tets back-to-front
-//!   3. Render pass: Hardware rasterization with MRT output
+//!   2. Render pass: Hardware rasterization with MRT output
 //!
 //! All GPU buffer management and bind group creation lives here.
 
@@ -13,13 +12,7 @@ use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
 // Re-export shared types for CPU-side use.
-pub use rmesh_shaders::shared::{BVHNode, DrawIndirectCommand, SortUniforms, Uniforms};
-
-// Re-export sort types (moved to rmesh-sort crate).
-pub use rmesh_sort::{
-    BitonicSortPipeline, SortState, TileSortState,
-    create_sort_bind_group, SORT_UNIFORM_ALIGNMENT,
-};
+pub use rmesh_shaders::shared::{BVHNode, DrawIndirectCommand, Uniforms};
 
 // Re-export tile types (moved to rmesh-tile crate).
 pub use rmesh_tile::{
@@ -130,7 +123,7 @@ impl SceneBuffers {
             mapped_at_creation: false,
         });
 
-        // Sort buffers padded to next power of 2 for correct bitonic sort.
+        // Sort buffers padded to next power of 2.
         let sort_keys = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sort_keys"),
             size: n_pow2 * 4,
@@ -205,7 +198,6 @@ pub struct ForwardPipelines {
     pub compute_bind_group_layout: wgpu::BindGroupLayout,
     pub render_pipeline: wgpu::RenderPipeline,
     pub render_bind_group_layout: wgpu::BindGroupLayout,
-    pub bitonic_sort: BitonicSortPipeline,
 }
 
 /// Helper: create N storage buffer layout entries for the given visibility.
@@ -361,15 +353,11 @@ impl ForwardPipelines {
                 cache: None,
             });
 
-        // ----- Bitonic sort pipeline -----
-        let bitonic_sort = BitonicSortPipeline::new(device);
-
         Self {
             compute_pipeline,
             compute_bind_group_layout,
             render_pipeline,
             render_bind_group_layout,
-            bitonic_sort,
         }
     }
 }
@@ -682,7 +670,7 @@ fn buf_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 ///   2. Compute pass (SH eval + cull + depth keys + tiles_touched + compact_tet_ids)
 ///
 /// Use this with the scan-based tile pipeline which reads compact_tet_ids
-/// directly instead of relying on bitonic-sorted sort_values.
+/// directly instead of relying on sorted sort_values.
 pub fn record_forward_compute(
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &ForwardPipelines,
@@ -720,21 +708,16 @@ pub fn record_forward_compute(
     }
 }
 
-/// Record the compute + bitonic sort portion of the forward pass (no hardware rasterization).
+/// Record just the forward compute pass (no sort, no hardware rasterization).
 ///
 /// Stages:
 ///   1. Reset indirect args (vertex_count=12, instance_count=0)
 ///   2. Compute pass (SH eval + cull + depth keys)
-///   3. Sort pass (bitonic sort, multiple dispatches)
-///
-/// After this, `sort_values[0..visible_tet_count-1]` contains visible tet IDs
-/// sorted by depth, which is needed by tile_gen.
 pub fn record_forward_compute_and_sort(
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &ForwardPipelines,
     buffers: &SceneBuffers,
     compute_bg: &wgpu::BindGroup,
-    sort_state: &SortState,
     tet_count: u32,
     queue: &wgpu::Queue,
 ) {
@@ -764,20 +747,6 @@ pub fn record_forward_compute_and_sort(
         let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
         cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
     }
-
-    // ----- 3. Sort pass (bitonic sort) -----
-    {
-        let mut spass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("bitonic_sort"),
-            timestamp_writes: None,
-        });
-        spass.set_pipeline(&pipelines.bitonic_sort.pipeline);
-
-        for i in 0..sort_state.step_count {
-            spass.set_bind_group(0, &sort_state.bind_groups[i], &[]);
-            spass.dispatch_workgroups(sort_state.dispatch_x, 1, 1);
-        }
-    }
 }
 
 /// Record the full forward pass into a command encoder.
@@ -785,8 +754,7 @@ pub fn record_forward_compute_and_sort(
 /// Stages:
 ///   1. Reset indirect args (vertex_count=12, instance_count=0)
 ///   2. Compute pass (SH eval + cull + depth keys)
-///   3. Sort pass (bitonic sort, multiple dispatches)
-///   4. Render pass (hardware rasterization with MRT, draw_indirect)
+///   3. Render pass (hardware rasterization with MRT, draw_indirect)
 ///
 /// The caller must have already written the Uniforms into `buffers.uniforms`
 /// via `queue.write_buffer` before calling this function.
@@ -797,7 +765,6 @@ pub fn record_forward_pass(
     targets: &RenderTargets,
     compute_bg: &wgpu::BindGroup,
     render_bg: &wgpu::BindGroup,
-    sort_state: &SortState,
     tet_count: u32,
     queue: &wgpu::Queue,
 ) {
@@ -831,23 +798,7 @@ pub fn record_forward_pass(
         cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
     }
 
-    // ----- 3. Sort pass (bitonic sort -- multiple dispatches) -----
-    // Each dispatch needs its own bind group (with different SortUniforms offset).
-    // wgpu handles compute-to-compute barriers automatically between passes.
-    {
-        let mut spass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("bitonic_sort"),
-            timestamp_writes: None,
-        });
-        spass.set_pipeline(&pipelines.bitonic_sort.pipeline);
-
-        for i in 0..sort_state.step_count {
-            spass.set_bind_group(0, &sort_state.bind_groups[i], &[]);
-            spass.dispatch_workgroups(sort_state.dispatch_x, 1, 1);
-        }
-    }
-
-    // ----- 4. Render pass -----
+    // ----- 3. Render pass -----
     {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("forward_render"),
@@ -912,7 +863,7 @@ pub fn record_forward_pass(
 
 /// Convenience: set up everything needed for a forward frame.
 ///
-/// Returns (SceneBuffers, ForwardPipelines, RenderTargets, compute_bg, render_bg, SortState).
+/// Returns (SceneBuffers, ForwardPipelines, RenderTargets, compute_bg, render_bg).
 pub fn setup_forward(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -925,7 +876,6 @@ pub fn setup_forward(
     RenderTargets,
     wgpu::BindGroup,
     wgpu::BindGroup,
-    SortState,
 ) {
     let color_format = wgpu::TextureFormat::Rgba16Float;
     let aux_format = wgpu::TextureFormat::Rgba32Float;
@@ -936,15 +886,8 @@ pub fn setup_forward(
 
     let compute_bg = create_compute_bind_group(device, &pipelines, &buffers);
     let render_bg = create_render_bind_group(device, &pipelines, &buffers);
-    let sort_state = SortState::new(
-        device,
-        &pipelines.bitonic_sort,
-        &buffers.sort_keys,
-        &buffers.sort_values,
-        scene.tet_count,
-    );
 
-    (buffers, pipelines, targets, compute_bg, render_bg, sort_state)
+    (buffers, pipelines, targets, compute_bg, render_bg)
 }
 
 /// Build a `Uniforms` struct from camera matrices and scene metadata.

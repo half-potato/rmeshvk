@@ -20,7 +20,7 @@ use winit::window::{Window, WindowId};
 
 use rmesh_render::{
     create_compute_bind_group, create_render_bind_group, ForwardPipelines, RenderTargets,
-    SceneBuffers, SortState, Uniforms,
+    SceneBuffers, Uniforms,
 };
 
 /// Orbit camera matching the webrm Camera class.
@@ -97,7 +97,6 @@ struct GpuState {
     pipelines: ForwardPipelines,
     buffers: SceneBuffers,
     targets: RenderTargets,
-    sort_state: SortState,
     compute_bg: wgpu::BindGroup,
     render_bg: wgpu::BindGroup,
     tet_count: u32,
@@ -193,13 +192,6 @@ impl App {
         let pipelines = ForwardPipelines::new(&device, color_format, aux_format);
         let buffers = SceneBuffers::upload(&device, &queue, &self.scene_data);
         let targets = RenderTargets::new(&device, size.width.max(1), size.height.max(1));
-        let sort_state = SortState::new(
-            &device,
-            &pipelines.bitonic_sort,
-            &buffers.sort_keys,
-            &buffers.sort_values,
-            self.scene_data.tet_count,
-        );
 
         let compute_bg = create_compute_bind_group(&device, &pipelines, &buffers);
         let render_bg = create_render_bind_group(&device, &pipelines, &buffers);
@@ -212,7 +204,6 @@ impl App {
             pipelines,
             buffers,
             targets,
-            sort_state,
             compute_bg,
             render_bg,
             tet_count: self.scene_data.tet_count,
@@ -288,7 +279,6 @@ impl App {
             &gpu.targets,
             &gpu.compute_bg,
             &gpu.render_bg,
-            &gpu.sort_state,
             gpu.tet_count,
             &gpu.queue,
         );

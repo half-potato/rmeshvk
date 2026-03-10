@@ -16,7 +16,7 @@ use rmesh_backward::{
 use rmesh_data::SceneData;
 use rmesh_render::{
     create_compute_bind_group, create_render_bind_group, record_tex_to_buffer,
-    ForwardPipelines, RenderTargets, SceneBuffers, SortState, TexToBufferPipeline, Uniforms,
+    ForwardPipelines, RenderTargets, SceneBuffers, TexToBufferPipeline, Uniforms,
 };
 use rmesh_shaders::shared::{AdamUniforms, LossUniforms};
 
@@ -422,15 +422,6 @@ pub fn train(
     // Create render targets
     let targets = RenderTargets::new(device, config.render_width, config.render_height);
 
-    // Create sort state
-    let sort_state = SortState::new(
-        device,
-        &fwd_pipelines.bitonic_sort,
-        &buffers.sort_keys,
-        &buffers.sort_values,
-        scene.tet_count,
-    );
-
     // Create bind groups for forward pass
     let compute_bg = create_compute_bind_group(device, &fwd_pipelines, &buffers);
     let render_bg = create_render_bind_group(device, &fwd_pipelines, &buffers);
@@ -602,7 +593,6 @@ pub fn train(
                 &targets,
                 &compute_bg,
                 &render_bg,
-                &sort_state,
                 scene.tet_count,
                 queue,
             );

@@ -453,7 +453,7 @@ async fn gpu_render_scene_async(
         .await
         .ok()?;
 
-    let (buffers, pipelines, targets, compute_bg, render_bg, sort_state) =
+    let (buffers, pipelines, targets, compute_bg, render_bg) =
         rmesh_render::setup_forward(&device, &queue, scene, w, h);
 
     // Write uniforms
@@ -480,7 +480,6 @@ async fn gpu_render_scene_async(
         &targets,
         &compute_bg,
         &render_bg,
-        &sort_state,
         scene.tet_count,
         &queue,
     );

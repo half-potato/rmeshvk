@@ -94,18 +94,6 @@ pub struct AdamUniforms {
     pub _pad: [u32; 2],
 }
 
-/// Bitonic sort uniforms.
-#[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
-pub struct SortUniforms {
-    pub count: u32,
-    /// Bitonic sort stage (outer loop)
-    pub stage: u32,
-    /// Bitonic sort step within stage (inner loop)
-    pub step_size: u32,
-    pub _pad: u32,
-}
-
 // Constant face winding for all tets (4 faces × 3 vertex indices)
 // 12 vertices total when unrolled for triangle-list topology
 pub const TET_FACE_INDICES: [u32; 12] = [

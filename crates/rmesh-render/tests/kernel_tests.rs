@@ -2,7 +2,7 @@
 //!
 //! Tests each shader/kernel in isolation:
 //!   - forward_compute.wgsl: SH eval, cull, depth key generation
-//!   - radix_sort.wgsl (bitonic): tet depth sorting
+//!   - radix sort (5-pass): tet depth sorting
 //!   - forward_tiled_compute.wgsl: subgroup-based tiled forward rendering
 //!   - tex_to_buffer.wgsl: texture → storage buffer conversion
 //!
@@ -174,110 +174,6 @@ fn test_forward_compute_kernel() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: radix_sort.wgsl (bitonic sort)
-// ---------------------------------------------------------------------------
-
-/// Creates unsorted depth keys and tet indices, runs bitonic sort,
-/// and verifies the keys are in ascending order.
-#[test]
-fn test_bitonic_sort_kernel() {
-    let (device, queue) = match create_test_device() {
-        Some(dq) => dq,
-        None => {
-            eprintln!("Skipping test_bitonic_sort_kernel (no GPU)");
-            return;
-        }
-    };
-
-    // Create 8 test keys (must be power of 2 for bitonic sort)
-    let n = 8u32;
-    let keys_data: Vec<u32> = vec![50, 30, 80, 10, 90, 20, 70, 40];
-    let values_data: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7]; // original indices
-
-    let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
-    let sort_keys = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("test_sort_keys"),
-        size: (n as u64) * 4,
-        usage,
-        mapped_at_creation: true,
-    });
-    sort_keys
-        .slice(..)
-        .get_mapped_range_mut()
-        .copy_from_slice(bytemuck::cast_slice(&keys_data));
-    sort_keys.unmap();
-
-    let sort_values = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("test_sort_values"),
-        size: (n as u64) * 4,
-        usage,
-        mapped_at_creation: true,
-    });
-    sort_values
-        .slice(..)
-        .get_mapped_range_mut()
-        .copy_from_slice(bytemuck::cast_slice(&values_data));
-    sort_values.unmap();
-
-    // Create pipeline and sort state
-    let pipelines = rmesh_render::ForwardPipelines::new(
-        &device,
-        wgpu::TextureFormat::Rgba16Float,
-        wgpu::TextureFormat::Rgba32Float,
-    );
-    let sort_state =
-        rmesh_render::SortState::new(&device, &pipelines.bitonic_sort, &sort_keys, &sort_values, n);
-
-    // Dispatch sort
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("bitonic_sort"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&pipelines.bitonic_sort.pipeline);
-        for i in 0..sort_state.step_count {
-            pass.set_bind_group(0, &sort_state.bind_groups[i], &[]);
-            pass.dispatch_workgroups(sort_state.dispatch_x, 1, 1);
-        }
-    }
-    queue.submit(std::iter::once(encoder.finish()));
-
-    // Read back and verify
-    let sorted_keys: Vec<u32> = read_buffer(&device, &queue, &sort_keys, n as usize);
-    let sorted_values: Vec<u32> = read_buffer(&device, &queue, &sort_values, n as usize);
-
-    eprintln!("sorted_keys: {sorted_keys:?}");
-    eprintln!("sorted_values: {sorted_values:?}");
-
-    // Keys should be in ascending order
-    for i in 1..n as usize {
-        assert!(
-            sorted_keys[i] >= sorted_keys[i - 1],
-            "Keys not sorted at position {i}: {} > {}",
-            sorted_keys[i - 1],
-            sorted_keys[i]
-        );
-    }
-
-    // Values should be a valid permutation
-    let mut seen = vec![false; n as usize];
-    for &v in &sorted_values {
-        assert!((v as usize) < n as usize, "Invalid value: {v}");
-        assert!(!seen[v as usize], "Duplicate value: {v}");
-        seen[v as usize] = true;
-    }
-
-    // Verify key-value correspondence
-    for (i, &val) in sorted_values.iter().enumerate() {
-        assert_eq!(
-            sorted_keys[i], keys_data[val as usize],
-            "Key-value mismatch at position {i}"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Test: forward_tiled_compute.wgsl (subgroup shader compilation)
 // ---------------------------------------------------------------------------
 
@@ -310,7 +206,7 @@ fn test_forward_tiled_pipeline_creation() {
 // Test: full forward pass (compute + sort + render)
 // ---------------------------------------------------------------------------
 
-/// End-to-end forward pass: compute → bitonic sort → hardware rasterize.
+/// End-to-end forward pass: compute → hardware rasterize.
 /// Verifies the legacy (non-tiled) pipeline produces output matching CPU.
 #[test]
 fn test_legacy_forward_e2e() {

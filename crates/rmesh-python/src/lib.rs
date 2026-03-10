@@ -26,7 +26,7 @@ use rmesh_render::{
     find_containing_tet, make_uniforms, record_forward_compute, record_forward_pass,
     record_forward_tiled, record_raytrace, record_tex_to_buffer, ForwardPipelines,
     ForwardTiledPipeline, RayTraceBuffers, RayTracePipeline, RenderTargets, SceneBuffers,
-    SortState, TexToBufferPipeline,
+    TexToBufferPipeline,
 };
 use rmesh_train::{
     create_adam_bind_group, create_loss_bind_group, AdamPipeline, AdamState, LossBuffers,
@@ -117,7 +117,6 @@ struct RMeshRenderer {
     scene_buffers: SceneBuffers,
     fwd_pipelines: ForwardPipelines,
     targets: RenderTargets,
-    sort_state: SortState,
     ttb: TexToBufferPipeline,
     // Backward infrastructure
     bwd_pipelines: BackwardPipelines,
@@ -282,15 +281,6 @@ impl RMeshRenderer {
         // Render targets
         let targets = RenderTargets::new(&device, width, height);
 
-        // Sort state
-        let sort_state = SortState::new(
-            &device,
-            &fwd_pipelines.bitonic_sort,
-            &scene_buffers.sort_keys,
-            &scene_buffers.sort_values,
-            tet_count,
-        );
-
         // Forward bind groups
         let compute_bg = create_compute_bind_group(&device, &fwd_pipelines, &scene_buffers);
         let render_bg = create_render_bind_group(&device, &fwd_pipelines, &scene_buffers);
@@ -385,7 +375,7 @@ impl RMeshRenderer {
         let tile_pipelines = TilePipelines::new(&device);
         let tile_buffers = TileBuffers::new(&device, tet_count, width, height, tile_size);
 
-        // Radix sort (replaces bitonic TileSortState)
+        // Radix sort
         let sorting_bits = 32u32; // full 32-bit key sort
         let radix_pipelines = RadixSortPipelines::new(&device);
         let radix_state = RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits);
@@ -593,7 +583,6 @@ impl RMeshRenderer {
             scene_buffers,
             fwd_pipelines,
             targets,
-            sort_state,
             ttb,
             bwd_pipelines,
             bwd_tiled_pipelines,
@@ -702,7 +691,6 @@ impl RMeshRenderer {
             &self.targets,
             &self.compute_bg,
             &self.render_bg,
-            &self.sort_state,
             self.tet_count,
             &self.queue,
         );
