@@ -1,7 +1,7 @@
 //! Per-kernel unit tests for the forward rendering pipeline.
 //!
 //! Tests each shader/kernel in isolation:
-//!   - forward_compute.wgsl: SH eval, cull, depth key generation
+//!   - forward_compute.wgsl: color eval, cull, depth key generation
 //!   - radix sort (5-pass): tet depth sorting
 //!   - forward_tiled_compute.wgsl: subgroup-based tiled forward rendering
 //!   - tex_to_buffer.wgsl: texture → storage buffer conversion
@@ -102,7 +102,7 @@ fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat4) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: forward_compute.wgsl (SH eval + cull + depth keys)
+// Test: forward_compute.wgsl (color eval + cull + depth keys)
 // ---------------------------------------------------------------------------
 
 /// Dispatches only the forward compute kernel (no sort, no render).
@@ -123,12 +123,14 @@ fn test_forward_compute_kernel() {
     let scene = random_single_tet_scene(&mut rng, 0.3);
 
     let buffers = rmesh_render::SceneBuffers::upload(&device, &queue, &scene);
+    let zero_sh = vec![0.0f32; scene.tet_count as usize * 3];
+    let material = rmesh_render::MaterialBuffers::upload(&device, &zero_sh, &scene.color_grads, scene.tet_count, 0);
     let pipelines = rmesh_render::ForwardPipelines::new(
         &device,
         wgpu::TextureFormat::Rgba16Float,
         wgpu::TextureFormat::Rgba32Float,
     );
-    let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers);
+    let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers, &material);
 
     // Camera looking at tet from outside
     let verts = load_tet_verts(&scene, 0);
@@ -137,7 +139,7 @@ fn test_forward_compute_kernel() {
     let (vp, inv_vp) = setup_camera(eye, centroid);
 
     let uniforms =
-        rmesh_render::make_uniforms(vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, scene.sh_degree, 0);
+        rmesh_render::make_uniforms(vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 0);
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     // Reset indirect args

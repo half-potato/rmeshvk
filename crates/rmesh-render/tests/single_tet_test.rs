@@ -62,7 +62,7 @@ fn test_center_view() {
             );
             // Relaxed tolerance for interior views: near-plane clipping on GPU
             // causes larger divergence with bigger tets.
-            let tol = ATOL + radius * 0.3;
+            let tol = ATOL + radius * 0.2;
             assert!(
                 mean_diff < tol,
                 "radius={radius}: mean_diff {mean_diff} >= {tol}"

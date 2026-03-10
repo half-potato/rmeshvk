@@ -41,7 +41,6 @@ fn two_tet_scene(rng: &mut ChaCha8Rng) -> SceneData {
         0, 2, 1, 4, // tet 1
     ];
 
-    let sh_coeffs = random_sh_degree0(rng, 2);
     let densities = vec![
         rng.random::<f32>() * 3.0 + 0.5,
         rng.random::<f32>() * 3.0 + 0.5,
@@ -55,7 +54,7 @@ fn two_tet_scene(rng: &mut ChaCha8Rng) -> SceneData {
         (rng.random::<f32>() - 0.5) * 0.1,
     ];
 
-    build_test_scene(vertices, indices, sh_coeffs, densities, color_grads, 0)
+    build_test_scene(vertices, indices, densities, color_grads)
 }
 
 /// Four tetrahedra forming a larger shape (8 vertices at cube corners + center).
@@ -81,7 +80,6 @@ fn four_tet_scene(rng: &mut ChaCha8Rng) -> SceneData {
     ];
 
     let tet_count = 4;
-    let sh_coeffs = random_sh_degree0(rng, tet_count);
     let densities: Vec<f32> = (0..tet_count)
         .map(|_| rng.random::<f32>() * 3.0 + 0.5)
         .collect();
@@ -89,7 +87,7 @@ fn four_tet_scene(rng: &mut ChaCha8Rng) -> SceneData {
         .map(|_| (rng.random::<f32>() - 0.5) * 0.1)
         .collect();
 
-    build_test_scene(vertices, indices, sh_coeffs, densities, color_grads, 0)
+    build_test_scene(vertices, indices, densities, color_grads)
 }
 
 /// Camera inside the two-tet scene, looking outward.
@@ -114,8 +112,8 @@ fn test_two_tet_center_view() {
         // Relaxed tolerance: camera inside tet causes near-plane clipping on GPU
         // that the CPU ray caster doesn't have, leading to larger differences.
         assert!(
-            mean_diff < 0.3,
-            "two_tet_center: mean_diff {mean_diff} >= 0.3"
+            mean_diff < 0.15,
+            "two_tet_center: mean_diff {mean_diff} >= 0.15"
         );
     } else {
         eprintln!("Skipping GPU test (no adapter)");

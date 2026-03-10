@@ -61,14 +61,12 @@ fn clone_scene(scene: &SceneData) -> SceneData {
     SceneData {
         vertices: scene.vertices.clone(),
         indices: scene.indices.clone(),
-        sh_coeffs: scene.sh_coeffs.clone(),
         densities: scene.densities.clone(),
         color_grads: scene.color_grads.clone(),
         circumdata: scene.circumdata.clone(),
         start_pose: scene.start_pose,
         vertex_count: scene.vertex_count,
         tet_count: scene.tet_count,
-        sh_degree: scene.sh_degree,
     }
 }
 
@@ -112,43 +110,6 @@ fn test_density_gradient() {
         diff < FD_ATOL,
         "density FD not converging: fd1={fd}, fd2={fd2}, diff={diff}"
     );
-}
-
-/// Verify finite difference gradient for SH coefficients.
-#[test]
-fn test_sh_coeff_gradient() {
-    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
-    let scene = random_single_tet_scene(&mut rng, 0.3);
-
-    let verts = load_tet_verts(&scene, 0);
-    let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
-    let eye = centroid + Vec3::new(2.0, 0.0, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, centroid);
-
-    // Test gradient for each of the 3 SH degree-0 coefficients (R, G, B)
-    for ch in 0..3 {
-        let fd = finite_diff(&scene, eye, vp, inv_vp, &|s, eps| {
-            s.sh_coeffs[ch] += eps;
-        });
-
-        let fd2 = {
-            let eps2 = EPS * 2.0;
-            let mut sp = clone_scene(&scene);
-            sp.sh_coeffs[ch] += eps2;
-            let lp = render_loss(&sp, eye, vp, inv_vp);
-            let mut sm = clone_scene(&scene);
-            sm.sh_coeffs[ch] -= eps2;
-            let lm = render_loss(&sm, eye, vp, inv_vp);
-            (lp - lm) / (2.0 * eps2)
-        };
-
-        let diff = (fd - fd2).abs();
-        eprintln!("sh_coeff[{ch}] gradient: fd={fd:.6}, fd2={fd2:.6}, |diff|={diff:.6}");
-        assert!(
-            diff < FD_ATOL,
-            "sh_coeff[{ch}] FD not converging: diff={diff}"
-        );
-    }
 }
 
 /// Verify finite difference gradient for color gradient parameters.

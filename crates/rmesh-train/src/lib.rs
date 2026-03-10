@@ -11,12 +11,12 @@
 use anyhow::Result;
 use glam::{Mat4, Quat, Vec3};
 use rmesh_backward::{
-    create_backward_bind_groups, BackwardPipelines, GradientBuffers,
+    create_backward_bind_groups, BackwardPipelines, GradientBuffers, MaterialGradBuffers,
 };
-use rmesh_data::SceneData;
+use rmesh_data::{SceneData, ShCoeffs};
 use rmesh_render::{
     create_compute_bind_group, create_render_bind_group, record_tex_to_buffer,
-    ForwardPipelines, RenderTargets, SceneBuffers, TexToBufferPipeline, Uniforms,
+    ForwardPipelines, MaterialBuffers, RenderTargets, SceneBuffers, TexToBufferPipeline, Uniforms,
 };
 use rmesh_shaders::shared::{AdamUniforms, LossUniforms};
 
@@ -198,16 +198,12 @@ pub fn record_loss_pass(
 // Adam optimizer
 // ===========================================================================
 
-/// Adam optimizer state -- first and second moments per parameter group.
+/// Adam optimizer state for geometry parameters.
 pub struct AdamState {
-    pub m_sh: wgpu::Buffer,
-    pub v_sh: wgpu::Buffer,
     pub m_vertices: wgpu::Buffer,
     pub v_vertices: wgpu::Buffer,
     pub m_densities: wgpu::Buffer,
     pub v_densities: wgpu::Buffer,
-    pub m_color_grads: wgpu::Buffer,
-    pub v_color_grads: wgpu::Buffer,
 }
 
 impl AdamState {
@@ -215,20 +211,39 @@ impl AdamState {
         device: &wgpu::Device,
         vertex_count: u32,
         tet_count: u32,
-        sh_stride: u32,
     ) -> Self {
-        let sh_size = (tet_count as u64) * (sh_stride as u64) * 4;
         let vert_size = (vertex_count as u64) * 3 * 4;
         let density_size = (tet_count as u64) * 4;
-        let grad_size = (tet_count as u64) * 3 * 4;
 
         Self {
-            m_sh: create_storage_buffer(device, "adam_m_sh", sh_size),
-            v_sh: create_storage_buffer(device, "adam_v_sh", sh_size),
             m_vertices: create_storage_buffer(device, "adam_m_vertices", vert_size),
             v_vertices: create_storage_buffer(device, "adam_v_vertices", vert_size),
             m_densities: create_storage_buffer(device, "adam_m_densities", density_size),
             v_densities: create_storage_buffer(device, "adam_v_densities", density_size),
+        }
+    }
+}
+
+/// Adam optimizer state for material parameters.
+pub struct MaterialAdamState {
+    pub m_coeffs: wgpu::Buffer,
+    pub v_coeffs: wgpu::Buffer,
+    pub m_color_grads: wgpu::Buffer,
+    pub v_color_grads: wgpu::Buffer,
+}
+
+impl MaterialAdamState {
+    pub fn new(
+        device: &wgpu::Device,
+        tet_count: u32,
+        sh_stride: u32,
+    ) -> Self {
+        let sh_size = (tet_count as u64) * (sh_stride as u64) * 4;
+        let grad_size = (tet_count as u64) * 3 * 4;
+
+        Self {
+            m_coeffs: create_storage_buffer(device, "adam_m_sh", sh_size),
+            v_coeffs: create_storage_buffer(device, "adam_v_sh", sh_size),
             m_color_grads: create_storage_buffer(device, "adam_m_color_grads", grad_size),
             v_color_grads: create_storage_buffer(device, "adam_v_color_grads", grad_size),
         }
@@ -399,6 +414,7 @@ pub fn train(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     scene: &SceneData,
+    sh: &ShCoeffs,
     views: &[TrainingView],
     config: &TrainConfig,
 ) -> Result<()> {
@@ -411,25 +427,28 @@ pub fn train(
     let loss_pipeline = LossPipeline::new(device);
     let adam_pipeline = AdamPipeline::new(device);
 
-    // Upload scene data
+    // Upload scene + material data
     let buffers = SceneBuffers::upload(device, queue, scene);
+    let material = MaterialBuffers::upload(device, &sh.coeffs, &scene.color_grads, scene.tet_count, sh.degree);
+    let sh_stride = material.stride;
 
     // Allocate gradient + optimizer state
-    let sh_stride = scene.num_sh_coeffs() * 3;
-    let grads = GradientBuffers::new(device, scene.vertex_count, scene.tet_count, sh_stride);
-    let adam = AdamState::new(device, scene.vertex_count, scene.tet_count, sh_stride);
+    let grads = GradientBuffers::new(device, scene.vertex_count, scene.tet_count);
+    let mat_grads = MaterialGradBuffers::new(device, scene.tet_count, sh_stride);
+    let adam = AdamState::new(device, scene.vertex_count, scene.tet_count);
+    let mat_adam = MaterialAdamState::new(device, scene.tet_count, sh_stride);
 
     // Create render targets
     let targets = RenderTargets::new(device, config.render_width, config.render_height);
 
     // Create bind groups for forward pass
-    let compute_bg = create_compute_bind_group(device, &fwd_pipelines, &buffers);
-    let render_bg = create_render_bind_group(device, &fwd_pipelines, &buffers);
+    let compute_bg = create_compute_bind_group(device, &fwd_pipelines, &buffers, &material);
+    let render_bg = create_render_bind_group(device, &fwd_pipelines, &buffers, &material);
 
     // Loss buffers
     let loss_buffers = LossBuffers::new(device, config.render_width, config.render_height);
 
-    // Tex-to-buffer pipeline: converts Rgba16Float render target to f32 storage buffer
+    // Tex-to-buffer pipeline
     let ttb = TexToBufferPipeline::new(
         device,
         queue,
@@ -441,7 +460,7 @@ pub fn train(
     // Create bind groups for backward pass
     let loss_bg = create_loss_bind_group(device, &loss_pipeline, &loss_buffers, &ttb.rendered_image);
     let (bwd_bg0, bwd_bg1) =
-        create_backward_bind_groups(device, &bwd_pipelines, &buffers, &loss_buffers.dl_d_image, &grads, &ttb.rendered_image);
+        create_backward_bind_groups(device, &bwd_pipelines, &buffers, &material, &loss_buffers.dl_d_image, &grads, &mat_grads, &ttb.rendered_image);
 
     // Adam bind groups — one per parameter group
     let adam_uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -456,10 +475,10 @@ pub fn train(
             device,
             &adam_pipeline,
             &adam_uniforms_buf,
-            &buffers.sh_coeffs,
-            &grads.d_sh_coeffs,
-            &adam.m_sh,
-            &adam.v_sh,
+            &material.coeffs,
+            &mat_grads.d_coeffs,
+            &mat_adam.m_coeffs,
+            &mat_adam.v_coeffs,
         ),
         create_adam_bind_group(
             device,
@@ -483,10 +502,10 @@ pub fn train(
             device,
             &adam_pipeline,
             &adam_uniforms_buf,
-            &buffers.color_grads,
-            &grads.d_color_grads,
-            &adam.m_color_grads,
-            &adam.v_color_grads,
+            &material.color_grads,
+            &mat_grads.d_color_grads,
+            &mat_adam.m_color_grads,
+            &mat_adam.v_color_grads,
         ),
     ];
 
@@ -541,7 +560,7 @@ pub fn train(
                 screen_width: view.width as f32,
                 screen_height: view.height as f32,
                 tet_count: scene.tet_count,
-                sh_degree: scene.sh_degree,
+                sh_degree: sh.degree,
                 step,
                 _pad1: [0; 7],
             };
@@ -574,10 +593,10 @@ pub fn train(
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("clear grads"),
                 });
-            encoder.clear_buffer(&grads.d_sh_coeffs, 0, None);
+            encoder.clear_buffer(&mat_grads.d_coeffs, 0, None);
             encoder.clear_buffer(&grads.d_vertices, 0, None);
             encoder.clear_buffer(&grads.d_densities, 0, None);
-            encoder.clear_buffer(&grads.d_color_grads, 0, None);
+            encoder.clear_buffer(&mat_grads.d_color_grads, 0, None);
             encoder.clear_buffer(&loss_buffers.loss_value, 0, None);
             queue.submit(std::iter::once(encoder.finish()));
 
@@ -596,7 +615,6 @@ pub fn train(
                 scene.tet_count,
                 queue,
             );
-            // Convert f16 render target texture to f32 storage buffer for loss/backward
             record_tex_to_buffer(&mut encoder, &ttb);
             queue.submit(std::iter::once(encoder.finish()));
 

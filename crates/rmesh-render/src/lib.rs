@@ -38,22 +38,16 @@ const FORWARD_TILED_WGSL: &str = include_str!("wgsl/forward_tiled_compute.wgsl")
 // GPU Buffers
 // ---------------------------------------------------------------------------
 
-/// All GPU buffers for the forward rendering pipeline.
+/// GPU buffers for scene geometry (independent of material/appearance model).
 pub struct SceneBuffers {
     /// Vertex positions [N x 3] f32
     pub vertices: wgpu::Buffer,
     /// Tet vertex indices [M x 4] u32
     pub indices: wgpu::Buffer,
-    /// Direct SH coefficients [M x (deg+1)^2 x 3] f32
-    pub sh_coeffs: wgpu::Buffer,
     /// Per-tet density [M] f32
     pub densities: wgpu::Buffer,
-    /// Per-tet color gradient [M x 3] f32
-    pub color_grads: wgpu::Buffer,
     /// Circumsphere data [M x 4] f32 (cx, cy, cz, r^2)
     pub circumdata: wgpu::Buffer,
-    /// Evaluated per-tet color [M x 3] f32 (written by compute)
-    pub colors: wgpu::Buffer,
     /// Sort keys [M] u32 (written by compute, sorted in place)
     pub sort_keys: wgpu::Buffer,
     /// Sort values [M] u32 (written by compute, sorted in place)
@@ -68,11 +62,24 @@ pub struct SceneBuffers {
     pub compact_tet_ids: wgpu::Buffer,
 }
 
+/// GPU buffers for per-tet material/appearance data (pluggable per rendering mode).
+pub struct MaterialBuffers {
+    /// Raw SH coefficients [M x stride] f32 (binding 3 in forward_compute)
+    pub coeffs: wgpu::Buffer,
+    /// Per-tet color gradient [M x 3] f32 (binding 5 in forward_compute)
+    pub color_grads: wgpu::Buffer,
+    /// Evaluated per-tet color [M x 3] f32 (written by forward_compute)
+    pub colors: wgpu::Buffer,
+    /// Floats per tet in coeffs buffer (num_coeffs * 3)
+    pub stride: u32,
+    /// SH degree (passed to Uniforms)
+    pub sh_degree: u32,
+}
+
 impl SceneBuffers {
-    /// Upload scene data to GPU buffers.
+    /// Upload scene geometry to GPU buffers.
     pub fn upload(device: &wgpu::Device, _queue: &wgpu::Queue, scene: &SceneData) -> Self {
         let storage_copy = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        // Trainable parameter buffers need COPY_DST (for upload) and COPY_SRC (for readback).
         let trainable = wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_DST
             | wgpu::BufferUsages::COPY_SRC;
@@ -89,21 +96,9 @@ impl SceneBuffers {
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-        let sh_coeffs = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("sh_coeffs"),
-            contents: bytemuck::cast_slice(&scene.sh_coeffs),
-            usage: trainable,
-        });
-
         let densities = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("densities"),
             contents: bytemuck::cast_slice(&scene.densities),
-            usage: trainable,
-        });
-
-        let color_grads = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("color_grads"),
-            contents: bytemuck::cast_slice(&scene.color_grads),
             usage: trainable,
         });
 
@@ -116,14 +111,6 @@ impl SceneBuffers {
         let m = scene.tet_count as u64;
         let n_pow2 = (scene.tet_count as u64).next_power_of_two();
 
-        let colors = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("colors"),
-            size: m * 3 * 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        // Sort buffers padded to next power of 2.
         let sort_keys = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sort_keys"),
             size: n_pow2 * 4,
@@ -140,7 +127,7 @@ impl SceneBuffers {
 
         let indirect_args = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("indirect_args"),
-            size: 16, // DrawIndirectCommand = 4 x u32
+            size: 16,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::INDIRECT
                 | wgpu::BufferUsages::COPY_DST
@@ -155,7 +142,6 @@ impl SceneBuffers {
             mapped_at_creation: false,
         });
 
-        // Pad to multiple of 16 bytes for vec4<u32> binding in RTS prefix scan
         let tiles_touched = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tiles_touched"),
             size: ((m + 3) / 4) * 16,
@@ -173,17 +159,64 @@ impl SceneBuffers {
         Self {
             vertices,
             indices,
-            sh_coeffs,
             densities,
-            color_grads,
             circumdata,
-            colors,
             sort_keys,
             sort_values,
             indirect_args,
             uniforms,
             tiles_touched,
             compact_tet_ids,
+        }
+    }
+}
+
+impl MaterialBuffers {
+    /// Upload material data to GPU buffers.
+    ///
+    /// * `sh_coeffs` — flat SH coefficients `[M × stride]` f32
+    /// * `color_grads` — per-tet color gradient `[M × 3]` f32
+    /// * `tet_count` — number of tetrahedra
+    /// * `sh_degree` — SH degree (0–3)
+    pub fn upload(
+        device: &wgpu::Device,
+        sh_coeffs: &[f32],
+        color_grads: &[f32],
+        tet_count: u32,
+        sh_degree: u32,
+    ) -> Self {
+        let trainable = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
+
+        let num_coeffs = (sh_degree + 1) * (sh_degree + 1);
+        let stride = num_coeffs * 3;
+
+        let coeffs = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("sh_coeffs"),
+            contents: bytemuck::cast_slice(sh_coeffs),
+            usage: trainable,
+        });
+
+        let color_grads_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("color_grads"),
+            contents: bytemuck::cast_slice(color_grads),
+            usage: trainable,
+        });
+
+        let colors = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("colors"),
+            size: (tet_count as u64) * 3 * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            coeffs,
+            color_grads: color_grads_buf,
+            colors,
+            stride,
+            sh_degree,
         }
     }
 }
@@ -604,6 +637,7 @@ pub fn create_compute_bind_group(
     device: &wgpu::Device,
     pipelines: &ForwardPipelines,
     buffers: &SceneBuffers,
+    material: &MaterialBuffers,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute_bind_group"),
@@ -612,11 +646,11 @@ pub fn create_compute_bind_group(
             buf_entry(0, &buffers.uniforms),
             buf_entry(1, &buffers.vertices),
             buf_entry(2, &buffers.indices),
-            buf_entry(3, &buffers.sh_coeffs),
+            buf_entry(3, &material.coeffs),
             buf_entry(4, &buffers.densities),
-            buf_entry(5, &buffers.color_grads),
+            buf_entry(5, &material.color_grads),
             buf_entry(6, &buffers.circumdata),
-            buf_entry(7, &buffers.colors),
+            buf_entry(7, &material.colors),
             buf_entry(8, &buffers.sort_keys),
             buf_entry(9, &buffers.sort_values),
             buf_entry(10, &buffers.indirect_args),
@@ -635,6 +669,7 @@ pub fn create_render_bind_group(
     device: &wgpu::Device,
     pipelines: &ForwardPipelines,
     buffers: &SceneBuffers,
+    material: &MaterialBuffers,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("render_bind_group"),
@@ -643,9 +678,9 @@ pub fn create_render_bind_group(
             buf_entry(0, &buffers.uniforms),
             buf_entry(1, &buffers.vertices),
             buf_entry(2, &buffers.indices),
-            buf_entry(3, &buffers.colors),
+            buf_entry(3, &material.colors),
             buf_entry(4, &buffers.densities),
-            buf_entry(5, &buffers.color_grads),
+            buf_entry(5, &material.color_grads),
             buf_entry(6, &buffers.sort_values), // sorted indices
         ],
     })
@@ -863,15 +898,19 @@ pub fn record_forward_pass(
 
 /// Convenience: set up everything needed for a forward frame.
 ///
-/// Returns (SceneBuffers, ForwardPipelines, RenderTargets, compute_bg, render_bg).
+/// Returns (SceneBuffers, MaterialBuffers, ForwardPipelines, RenderTargets, compute_bg, render_bg).
 pub fn setup_forward(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     scene: &SceneData,
+    sh_coeffs: &[f32],
+    color_grads: &[f32],
+    sh_degree: u32,
     width: u32,
     height: u32,
 ) -> (
     SceneBuffers,
+    MaterialBuffers,
     ForwardPipelines,
     RenderTargets,
     wgpu::BindGroup,
@@ -881,13 +920,14 @@ pub fn setup_forward(
     let aux_format = wgpu::TextureFormat::Rgba32Float;
 
     let buffers = SceneBuffers::upload(device, queue, scene);
+    let material = MaterialBuffers::upload(device, sh_coeffs, color_grads, scene.tet_count, sh_degree);
     let pipelines = ForwardPipelines::new(device, color_format, aux_format);
     let targets = RenderTargets::new(device, width, height);
 
-    let compute_bg = create_compute_bind_group(device, &pipelines, &buffers);
-    let render_bg = create_render_bind_group(device, &pipelines, &buffers);
+    let compute_bg = create_compute_bind_group(device, &pipelines, &buffers, &material);
+    let render_bg = create_render_bind_group(device, &pipelines, &buffers, &material);
 
-    (buffers, pipelines, targets, compute_bg, render_bg)
+    (buffers, material, pipelines, targets, compute_bg, render_bg)
 }
 
 /// Build a `Uniforms` struct from camera matrices and scene metadata.
@@ -1276,6 +1316,7 @@ pub fn create_raytrace_bind_group(
     device: &wgpu::Device,
     rt_pipeline: &RayTracePipeline,
     scene_buffers: &SceneBuffers,
+    material: &MaterialBuffers,
     rt_buffers: &RayTraceBuffers,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1285,9 +1326,9 @@ pub fn create_raytrace_bind_group(
             buf_entry(0, &scene_buffers.uniforms),
             buf_entry(1, &scene_buffers.vertices),
             buf_entry(2, &scene_buffers.indices),
-            buf_entry(3, &scene_buffers.colors),
+            buf_entry(3, &material.colors),
             buf_entry(4, &scene_buffers.densities),
-            buf_entry(5, &scene_buffers.color_grads),
+            buf_entry(5, &material.color_grads),
             buf_entry(6, &rt_buffers.tet_neighbors),
             buf_entry(7, &rt_pipeline.rendered_image),
             buf_entry(8, &rt_buffers.bvh_nodes),

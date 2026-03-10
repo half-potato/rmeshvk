@@ -54,7 +54,7 @@ fn main() -> Result<()> {
     // Load scene
     let file_data = std::fs::read(&input_path)
         .with_context(|| format!("Failed to read {}", input_path.display()))?;
-    let scene = rmesh_data::load_rmesh(&file_data)
+    let (scene, sh) = rmesh_data::load_rmesh(&file_data)
         .or_else(|_| rmesh_data::load_rmesh_raw(&file_data))
         .context("Failed to parse scene file")?;
 
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
         "Scene: {} vertices, {} tets, SH degree {}",
         scene.vertex_count,
         scene.tet_count,
-        scene.sh_degree
+        sh.degree
     );
 
     // Create wgpu device (headless — no window)
@@ -104,7 +104,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    rmesh_train::train(&device, &queue, &scene, &views, &config)?;
+    rmesh_train::train(&device, &queue, &scene, &sh, &views, &config)?;
 
     log::info!("Training complete.");
     Ok(())

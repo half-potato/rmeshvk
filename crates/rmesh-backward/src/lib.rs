@@ -5,7 +5,7 @@
 //!   - Backward tiled compute dispatch
 //!   - Gradient buffer management
 
-use rmesh_render::SceneBuffers;
+use rmesh_render::{MaterialBuffers, SceneBuffers};
 use rmesh_shaders::shared;
 use wgpu;
 
@@ -32,11 +32,15 @@ pub use rmesh_tile::{
 const BACKWARD_COMPUTE_WGSL: &str = include_str!("wgsl/backward_compute.wgsl");
 const BACKWARD_TILED_WGSL: &str = include_str!("wgsl/backward_tiled_compute.wgsl");
 
-/// Gradient buffers -- one per trainable parameter group.
+/// Gradient buffers for scene geometry parameters.
 pub struct GradientBuffers {
-    pub d_sh_coeffs: wgpu::Buffer,
     pub d_vertices: wgpu::Buffer,
     pub d_densities: wgpu::Buffer,
+}
+
+/// Gradient buffers for material/appearance parameters.
+pub struct MaterialGradBuffers {
+    pub d_coeffs: wgpu::Buffer,
     pub d_color_grads: wgpu::Buffer,
 }
 
@@ -59,23 +63,13 @@ fn create_storage_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu:
 // ---------------------------------------------------------------------------
 
 impl GradientBuffers {
-    /// Allocate zero-initialized gradient buffers.
-    ///
-    /// * `vertex_count` -- number of unique vertices
-    /// * `tet_count`    -- number of tetrahedra
-    /// * `sh_stride`    -- floats per tet in the SH buffer (num_coeffs * 3)
+    /// Allocate zero-initialized geometry gradient buffers.
     pub fn new(
         device: &wgpu::Device,
         vertex_count: u32,
         tet_count: u32,
-        sh_stride: u32,
     ) -> Self {
         Self {
-            d_sh_coeffs: create_storage_buffer(
-                device,
-                "d_sh_coeffs",
-                (tet_count as u64) * (sh_stride as u64) * 4,
-            ),
             d_vertices: create_storage_buffer(
                 device,
                 "d_vertices",
@@ -85,6 +79,23 @@ impl GradientBuffers {
                 device,
                 "d_densities",
                 (tet_count as u64) * 4,
+            ),
+        }
+    }
+}
+
+impl MaterialGradBuffers {
+    /// Allocate zero-initialized material gradient buffers.
+    pub fn new(
+        device: &wgpu::Device,
+        tet_count: u32,
+        sh_stride: u32,
+    ) -> Self {
+        Self {
+            d_coeffs: create_storage_buffer(
+                device,
+                "d_sh_coeffs",
+                (tet_count as u64) * (sh_stride as u64) * 4,
             ),
             d_color_grads: create_storage_buffer(
                 device,
@@ -253,7 +264,7 @@ impl BackwardTiledPipelines {
 /// Create bind groups for the backward compute pass.
 ///
 /// Returns `(group0, group1)` where:
-///   - group0: 11 read-only bindings (scene + loss data)
+///   - group0: 11 read-only bindings (scene + material + loss data)
 ///   - group1: 4 read-write gradient output bindings
 ///
 /// `rendered_image` is the [W x H x 4] f32 buffer from the tex-to-buffer pass.
@@ -261,8 +272,10 @@ pub fn create_backward_bind_groups(
     device: &wgpu::Device,
     pipelines: &BackwardPipelines,
     scene_buffers: &SceneBuffers,
+    material: &MaterialBuffers,
     dl_d_image: &wgpu::Buffer,
     grad_buffers: &GradientBuffers,
+    mat_grad_buffers: &MaterialGradBuffers,
     rendered_image: &wgpu::Buffer,
 ) -> (wgpu::BindGroup, wgpu::BindGroup) {
     let bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -291,7 +304,7 @@ pub fn create_backward_bind_groups(
             },
             wgpu::BindGroupEntry {
                 binding: 5,
-                resource: scene_buffers.sh_coeffs.as_entire_binding(),
+                resource: material.coeffs.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 6,
@@ -299,7 +312,7 @@ pub fn create_backward_bind_groups(
             },
             wgpu::BindGroupEntry {
                 binding: 7,
-                resource: scene_buffers.color_grads.as_entire_binding(),
+                resource: material.color_grads.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 8,
@@ -307,7 +320,7 @@ pub fn create_backward_bind_groups(
             },
             wgpu::BindGroupEntry {
                 binding: 9,
-                resource: scene_buffers.colors.as_entire_binding(),
+                resource: material.colors.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 10,
@@ -322,7 +335,7 @@ pub fn create_backward_bind_groups(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: grad_buffers.d_sh_coeffs.as_entire_binding(),
+                resource: mat_grad_buffers.d_coeffs.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -334,7 +347,7 @@ pub fn create_backward_bind_groups(
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: grad_buffers.d_color_grads.as_entire_binding(),
+                resource: mat_grad_buffers.d_color_grads.as_entire_binding(),
             },
         ],
     });

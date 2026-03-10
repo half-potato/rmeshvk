@@ -28,8 +28,6 @@ pub struct SceneData {
     pub vertices: Vec<f32>,
     /// Tet vertex indices [M × 4] u32
     pub indices: Vec<u32>,
-    /// Direct SH coefficients [M × (deg+1)^2 × 3] f32 (decompressed from PCA if .rmesh)
-    pub sh_coeffs: Vec<f32>,
     /// Per-tet density [M] f32
     pub densities: Vec<f32>,
     /// Per-tet color gradient [M × 3] f32
@@ -42,26 +40,46 @@ pub struct SceneData {
     pub vertex_count: u32,
     /// Number of tetrahedra
     pub tet_count: u32,
-    /// SH degree
-    pub sh_degree: u32,
 }
 
-impl SceneData {
+/// SH color coefficients loaded from an .rmesh file (separate from scene geometry).
+#[derive(Clone)]
+pub struct ShCoeffs {
+    /// Direct SH coefficients [M × (deg+1)^2 × 3] f32 (decompressed from PCA)
+    pub coeffs: Vec<f32>,
+    /// SH degree (0–3)
+    pub degree: u32,
+}
+
+impl ShCoeffs {
     /// Number of SH coefficients per channel: (deg+1)^2
-    pub fn num_sh_coeffs(&self) -> u32 {
-        (self.sh_degree + 1) * (self.sh_degree + 1)
+    pub fn num_coeffs(&self) -> u32 {
+        (self.degree + 1) * (self.degree + 1)
+    }
+
+    /// Stride per tet: num_coeffs * 3 channels
+    pub fn stride(&self) -> u32 {
+        self.num_coeffs() * 3
+    }
+
+    /// Create zeroed-out coefficients (degree 0, all zeros).
+    pub fn zero(tet_count: u32) -> Self {
+        ShCoeffs {
+            coeffs: vec![0.0; tet_count as usize * 3],
+            degree: 0,
+        }
     }
 }
 
 /// Load a .rmesh file (gzip-compressed binary).
-pub fn load_rmesh(data: &[u8]) -> Result<SceneData> {
+pub fn load_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs)> {
     // Decompress gzip
     let decompressed = decompress_gzip(data)?;
     parse_rmesh(&decompressed)
 }
 
 /// Load a raw (uncompressed) .rmesh binary.
-pub fn load_rmesh_raw(data: &[u8]) -> Result<SceneData> {
+pub fn load_rmesh_raw(data: &[u8]) -> Result<(SceneData, ShCoeffs)> {
     parse_rmesh(data)
 }
 
@@ -78,7 +96,7 @@ fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-fn parse_rmesh(data: &[u8]) -> Result<SceneData> {
+fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs)> {
     let mut offset = 0usize;
 
     // Helper to read typed slices
@@ -200,18 +218,21 @@ fn parse_rmesh(data: &[u8]) -> Result<SceneData> {
     // --- Compute circumspheres ---
     let circumdata = compute_circumspheres(&vertices, &indices, tet_count as usize);
 
-    Ok(SceneData {
+    let sh = ShCoeffs {
+        coeffs: sh_coeffs,
+        degree: sh_degree,
+    };
+
+    Ok((SceneData {
         vertices,
         indices,
-        sh_coeffs,
         densities,
         color_grads,
         circumdata,
         start_pose,
         vertex_count,
         tet_count,
-        sh_degree,
-    })
+    }, sh))
 }
 
 /// Compute circumsphere (center + radius²) for each tetrahedron.

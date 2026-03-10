@@ -19,8 +19,8 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use rmesh_render::{
-    create_compute_bind_group, create_render_bind_group, ForwardPipelines, RenderTargets,
-    SceneBuffers, Uniforms,
+    create_compute_bind_group, create_render_bind_group, ForwardPipelines, MaterialBuffers,
+    RenderTargets, SceneBuffers, Uniforms,
 };
 
 /// Orbit camera matching the webrm Camera class.
@@ -96,6 +96,7 @@ struct GpuState {
     surface_config: wgpu::SurfaceConfiguration,
     pipelines: ForwardPipelines,
     buffers: SceneBuffers,
+    material_buffers: MaterialBuffers,
     targets: RenderTargets,
     compute_bg: wgpu::BindGroup,
     render_bg: wgpu::BindGroup,
@@ -107,12 +108,13 @@ struct App {
     gpu: Option<GpuState>,
     camera: Camera,
     scene_data: rmesh_data::SceneData,
+    sh_data: rmesh_data::ShCoeffs,
     mouse_pressed: bool,
     last_mouse: (f64, f64),
 }
 
 impl App {
-    fn new(scene: rmesh_data::SceneData) -> Self {
+    fn new(scene: rmesh_data::SceneData, sh: rmesh_data::ShCoeffs) -> Self {
         let pos = Vec3::new(scene.start_pose[0], scene.start_pose[1], scene.start_pose[2]);
         let cam_pos = if pos.length() < 0.001 {
             Vec3::new(0.0, 3.0, -2.0)
@@ -125,6 +127,7 @@ impl App {
             gpu: None,
             camera: Camera::new(cam_pos),
             scene_data: scene,
+            sh_data: sh,
             mouse_pressed: false,
             last_mouse: (0.0, 0.0),
         }
@@ -191,10 +194,17 @@ impl App {
 
         let pipelines = ForwardPipelines::new(&device, color_format, aux_format);
         let buffers = SceneBuffers::upload(&device, &queue, &self.scene_data);
+        let material = MaterialBuffers::upload(
+            &device,
+            &self.sh_data.coeffs,
+            &self.scene_data.color_grads,
+            self.scene_data.tet_count,
+            self.sh_data.degree,
+        );
         let targets = RenderTargets::new(&device, size.width.max(1), size.height.max(1));
 
-        let compute_bg = create_compute_bind_group(&device, &pipelines, &buffers);
-        let render_bg = create_render_bind_group(&device, &pipelines, &buffers);
+        let compute_bg = create_compute_bind_group(&device, &pipelines, &buffers, &material);
+        let render_bg = create_render_bind_group(&device, &pipelines, &buffers, &material);
 
         self.gpu = Some(GpuState {
             device,
@@ -203,6 +213,7 @@ impl App {
             surface_config,
             pipelines,
             buffers,
+            material_buffers: material,
             targets,
             compute_bg,
             render_bg,
@@ -258,7 +269,7 @@ impl App {
             screen_width: w as f32,
             screen_height: h as f32,
             tet_count: gpu.tet_count,
-            sh_degree: self.scene_data.sh_degree,
+            sh_degree: self.sh_data.degree,
             step: 0,
             _pad1: [0; 7],
         };
@@ -405,7 +416,7 @@ fn main() -> Result<()> {
 
     let file_data = std::fs::read(&scene_path)
         .with_context(|| format!("Failed to read {}", scene_path.display()))?;
-    let scene = rmesh_data::load_rmesh(&file_data)
+    let (scene, sh) = rmesh_data::load_rmesh(&file_data)
         .or_else(|_| rmesh_data::load_rmesh_raw(&file_data))
         .context("Failed to parse scene file")?;
 
@@ -413,11 +424,11 @@ fn main() -> Result<()> {
         "Scene: {} vertices, {} tets, SH degree {}",
         scene.vertex_count,
         scene.tet_count,
-        scene.sh_degree,
+        sh.degree,
     );
 
     let event_loop = EventLoop::new().context("Failed to create event loop")?;
-    let mut app = App::new(scene);
+    let mut app = App::new(scene, sh);
     event_loop.run_app(&mut app)?;
 
     Ok(())

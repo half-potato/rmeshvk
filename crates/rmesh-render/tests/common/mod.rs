@@ -9,25 +9,6 @@ use glam::{Mat4, Vec3, Vec4};
 pub use rand::Rng;
 pub use rmesh_data::SceneData;
 
-// ---------------------------------------------------------------------------
-// SH constants (must match forward_compute.wgsl and shared.rs)
-// ---------------------------------------------------------------------------
-
-const C0: f32 = 0.28209479177387814;
-const C1: f32 = 0.4886025119029199;
-const C2_0: f32 = 1.0925484305920792;
-const C2_1: f32 = -1.0925484305920792;
-const C2_2: f32 = 0.31539156525252005;
-const C2_3: f32 = -1.0925484305920792;
-const C2_4: f32 = 0.5462742152960396;
-const C3_0: f32 = -0.5900435899266435;
-const C3_1: f32 = 2.890611442640554;
-const C3_2: f32 = -0.4570457994644658;
-const C3_3: f32 = 0.3731763325901154;
-const C3_4: f32 = -0.4570457994644658;
-const C3_5: f32 = 1.445305721320277;
-const C3_6: f32 = -0.5900435899266435;
-
 // Face winding: matches TET_FACES in forward_vertex.wgsl
 const TET_FACES: [[usize; 3]; 4] = [[0, 2, 1], [1, 2, 3], [0, 3, 2], [3, 0, 1]];
 
@@ -51,62 +32,17 @@ fn phi(x: f32) -> f32 {
     }
 }
 
-pub fn eval_sh(dir: Vec3, sh_degree: u32, coeffs: &[f32]) -> f32 {
-    let (x, y, z) = (dir.x, dir.y, dir.z);
-    let mut val = C0 * coeffs[0];
-
-    if sh_degree >= 1 {
-        val += -C1 * y * coeffs[1];
-        val += C1 * z * coeffs[2];
-        val += -C1 * x * coeffs[3];
-    }
-    if sh_degree >= 2 {
-        let (xx, yy, zz) = (x * x, y * y, z * z);
-        val += C2_0 * x * y * coeffs[4];
-        val += C2_1 * y * z * coeffs[5];
-        val += C2_2 * (2.0 * zz - xx - yy) * coeffs[6];
-        val += C2_3 * x * z * coeffs[7];
-        val += C2_4 * (xx - yy) * coeffs[8];
-
-        if sh_degree >= 3 {
-            val += C3_0 * y * (3.0 * xx - yy) * coeffs[9];
-            val += C3_1 * x * y * z * coeffs[10];
-            val += C3_2 * y * (4.0 * zz - xx - yy) * coeffs[11];
-            val += C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * coeffs[12];
-            val += C3_4 * x * (4.0 * zz - xx - yy) * coeffs[13];
-            val += C3_5 * z * (xx - yy) * coeffs[14];
-            val += C3_6 * x * (xx - 3.0 * yy) * coeffs[15];
-        }
-    }
-    val
-}
-
 // ---------------------------------------------------------------------------
-// CPU compute pass: SH eval + color gradient + softplus
+// CPU compute pass: color eval + color gradient + softplus
 // ---------------------------------------------------------------------------
 
-/// Evaluate SH and apply color gradient for a single tet (matches forward_compute.wgsl).
-/// Returns (base_color, color_grad_vec) where base_color has offset baked in.
-fn compute_tet_color(scene: &SceneData, tet_id: usize, cam_pos: Vec3) -> Vec3 {
+/// Evaluate per-tet color (matches forward_compute.wgsl).
+/// Base color is 0.5 (constant bias from the shader).
+fn compute_tet_color(scene: &SceneData, tet_id: usize, _cam_pos: Vec3) -> Vec3 {
     let verts = load_tet_verts(scene, tet_id);
     let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
-    let dir = (centroid - cam_pos).normalize();
 
-    let num_coeffs = ((scene.sh_degree + 1) * (scene.sh_degree + 1)) as usize;
-    let sh_stride = num_coeffs * 3;
-    let sh_base = tet_id * sh_stride;
-
-    let mut result_color = Vec3::ZERO;
-    result_color.x = eval_sh(dir, scene.sh_degree, &scene.sh_coeffs[sh_base..]);
-    result_color.y = eval_sh(dir, scene.sh_degree, &scene.sh_coeffs[sh_base + num_coeffs..]);
-    result_color.z = eval_sh(
-        dir,
-        scene.sh_degree,
-        &scene.sh_coeffs[sh_base + 2 * num_coeffs..],
-    );
-
-    // SH2RGB bias
-    result_color += Vec3::splat(0.5);
+    let result_color = Vec3::splat(0.5);
 
     // Color gradient offset
     let grad = load_color_grad(scene, tet_id);
@@ -453,8 +389,9 @@ async fn gpu_render_scene_async(
         .await
         .ok()?;
 
-    let (buffers, pipelines, targets, compute_bg, render_bg) =
-        rmesh_render::setup_forward(&device, &queue, scene, w, h);
+    let zero_sh = vec![0.0f32; scene.tet_count as usize * 3];
+    let (buffers, _material, pipelines, targets, compute_bg, render_bg) =
+        rmesh_render::setup_forward(&device, &queue, scene, &zero_sh, &scene.color_grads, 0, w, h);
 
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
@@ -464,7 +401,7 @@ async fn gpu_render_scene_async(
         w as f32,
         h as f32,
         scene.tet_count,
-        scene.sh_degree,
+        0u32,
         0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
@@ -609,8 +546,10 @@ async fn gpu_raytrace_scene_async(
     let color_format = wgpu::TextureFormat::Rgba16Float;
     let aux_format = wgpu::TextureFormat::Rgba32Float;
     let buffers = rmesh_render::SceneBuffers::upload(&device, &queue, scene);
+    let zero_sh = vec![0.0f32; scene.tet_count as usize * 3];
+    let material = rmesh_render::MaterialBuffers::upload(&device, &zero_sh, &scene.color_grads, scene.tet_count, 0);
     let pipelines = rmesh_render::ForwardPipelines::new(&device, color_format, aux_format);
-    let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers);
+    let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers, &material);
 
     // Build ray trace data
     let neighbors = rmesh_render::compute_tet_neighbors(&scene.indices, scene.tet_count as usize);
@@ -626,15 +565,15 @@ async fn gpu_raytrace_scene_async(
     ).map(|t| t as i32).unwrap_or(-1);
     queue.write_buffer(&rt_buffers.start_tet, 0, bytemuck::cast_slice(&[start_tet]));
 
-    let rt_bg = rmesh_render::create_raytrace_bind_group(&device, &rt_pipeline, &buffers, &rt_buffers);
+    let rt_bg = rmesh_render::create_raytrace_bind_group(&device, &rt_pipeline, &buffers, &material, &rt_buffers);
 
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, scene.sh_degree, 0,
+        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
-    // Record: forward compute (SH eval) + raytrace
+    // Record: forward compute + raytrace
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("test_raytrace"),
     });
@@ -642,7 +581,7 @@ async fn gpu_raytrace_scene_async(
     // Clear output
     encoder.clear_buffer(&rt_pipeline.rendered_image, 0, None);
 
-    // Forward compute (SH eval → colors_buf)
+    // Forward compute (color eval → colors_buf)
     rmesh_render::record_forward_compute(
         &mut encoder, &pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
     );
@@ -687,13 +626,12 @@ async fn gpu_raytrace_scene_async(
 // ---------------------------------------------------------------------------
 
 /// Build a SceneData from raw vertices, indices, and per-tet parameters.
+/// Color coefficients are zeroed out (color comes from the 0.5 bias + color_grads).
 pub fn build_test_scene(
     vertices: Vec<f32>,
     indices: Vec<u32>,
-    sh_coeffs: Vec<f32>,
     densities: Vec<f32>,
     color_grads: Vec<f32>,
-    sh_degree: u32,
 ) -> SceneData {
     let vertex_count = vertices.len() as u32 / 3;
     let tet_count = indices.len() as u32 / 4;
@@ -702,14 +640,12 @@ pub fn build_test_scene(
     SceneData {
         vertices,
         indices,
-        sh_coeffs,
         densities,
         color_grads,
         circumdata,
         start_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
         vertex_count,
         tet_count,
-        sh_degree,
     }
 }
 
@@ -773,17 +709,9 @@ pub fn random_tet_vertices<R: Rng>(rng: &mut R, radius: f32) -> ([f32; 12], [u32
     (verts, [0, 1, 2, 3])
 }
 
-/// Generate random SH coefficients for degree 0 (just DC term, 1 coeff per channel = 3 total).
-pub fn random_sh_degree0<R: Rng>(rng: &mut R, tet_count: usize) -> Vec<f32> {
-    (0..tet_count * 3)
-        .map(|_| rng.random::<f32>() * 2.0 - 1.0)
-        .collect()
-}
-
 /// Build a single-tet test scene with random parameters.
 pub fn random_single_tet_scene<R: Rng>(rng: &mut R, radius: f32) -> SceneData {
     let (verts, indices) = random_tet_vertices(rng, radius);
-    let sh_coeffs = random_sh_degree0(rng, 1);
     let density = vec![rng.random::<f32>() * 5.0 + 0.5];
     let color_grads = vec![
         (rng.random::<f32>() - 0.5) * 0.2,
@@ -791,7 +719,7 @@ pub fn random_single_tet_scene<R: Rng>(rng: &mut R, radius: f32) -> SceneData {
         (rng.random::<f32>() - 0.5) * 0.2,
     ];
 
-    build_test_scene(verts.to_vec(), indices.to_vec(), sh_coeffs, density, color_grads, 0)
+    build_test_scene(verts.to_vec(), indices.to_vec(), density, color_grads)
 }
 
 /// Build a simple perspective projection matrix.
