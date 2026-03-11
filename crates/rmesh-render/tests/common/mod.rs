@@ -384,8 +384,9 @@ async fn gpu_render_scene_async(
         .await
         .ok()?;
 
+    let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, _material, pipelines, targets, compute_bg, render_bg) =
-        rmesh_render::setup_forward(&device, &queue, scene, &scene.color_grads, w, h);
+        rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
 
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
@@ -539,7 +540,8 @@ async fn gpu_raytrace_scene_async(
     let color_format = wgpu::TextureFormat::Rgba16Float;
     let aux_format = wgpu::TextureFormat::Rgba32Float;
     let buffers = rmesh_render::SceneBuffers::upload(&device, &queue, scene);
-    let material = rmesh_render::MaterialBuffers::upload(&device, &scene.color_grads, scene.tet_count);
+    let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
+    let material = rmesh_render::MaterialBuffers::upload(&device, &zero_base_colors, &scene.color_grads, scene.tet_count);
     let pipelines = rmesh_render::ForwardPipelines::new(&device, color_format, aux_format);
     let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers, &material);
 

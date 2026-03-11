@@ -64,6 +64,8 @@ pub struct SceneBuffers {
 
 /// GPU buffers for per-tet material/appearance data (pluggable per rendering mode).
 pub struct MaterialBuffers {
+    /// Per-tet base color [M x 3] f32 (uploaded from model, input to softplus)
+    pub base_colors: wgpu::Buffer,
     /// Per-tet color gradient [M x 3] f32
     pub color_grads: wgpu::Buffer,
     /// Evaluated per-tet color [M x 3] f32 (written by forward_compute)
@@ -168,16 +170,24 @@ impl SceneBuffers {
 impl MaterialBuffers {
     /// Upload material data to GPU buffers.
     ///
+    /// * `base_colors` — per-tet base color `[M × 3]` f32 (pre-softplus)
     /// * `color_grads` — per-tet color gradient `[M × 3]` f32
     /// * `tet_count` — number of tetrahedra
     pub fn upload(
         device: &wgpu::Device,
+        base_colors: &[f32],
         color_grads: &[f32],
         tet_count: u32,
     ) -> Self {
         let trainable = wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_DST
             | wgpu::BufferUsages::COPY_SRC;
+
+        let base_colors_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("base_colors"),
+            contents: bytemuck::cast_slice(base_colors),
+            usage: trainable,
+        });
 
         let color_grads_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("color_grads"),
@@ -193,6 +203,7 @@ impl MaterialBuffers {
         });
 
         Self {
+            base_colors: base_colors_buf,
             color_grads: color_grads_buf,
             colors,
         }
@@ -239,16 +250,18 @@ impl ForwardPipelines {
         color_format: wgpu::TextureFormat,
         aux_format: wgpu::TextureFormat,
     ) -> Self {
-        // ----- Compute pipeline (12 bindings) -----
+        // ----- Compute pipeline (13 bindings) -----
         // Bindings 0-5: read-only storage (uniforms, vertices, indices, densities, color_grads, circumdata)
         // Bindings 6-11: read-write storage (colors, sort_keys, sort_values, indirect_args, tiles_touched, compact_tet_ids)
+        // Binding 12: read-only storage (base_colors)
         let compute_read_only = [
             true, true, true, true, true, true, // 0-5 read-only
             false, false, false, false,          // 6-9 read-write
             false, false,                        // 10-11 read-write (tiles_touched, compact_tet_ids)
+            true,                                // 12 read-only (base_colors)
         ];
         let compute_entries = storage_entries(
-            12,
+            13,
             wgpu::ShaderStages::COMPUTE,
             &compute_read_only,
         );
@@ -610,7 +623,7 @@ pub fn record_tex_to_buffer(
 ///   0: uniforms, 1: vertices, 2: indices, 3: densities,
 ///   4: color_grads, 5: circumdata,
 ///   6: colors, 7: sort_keys, 8: sort_values, 9: indirect_args,
-///   10: tiles_touched, 11: compact_tet_ids
+///   10: tiles_touched, 11: compact_tet_ids, 12: base_colors
 pub fn create_compute_bind_group(
     device: &wgpu::Device,
     pipelines: &ForwardPipelines,
@@ -633,6 +646,7 @@ pub fn create_compute_bind_group(
             buf_entry(9, &buffers.indirect_args),
             buf_entry(10, &buffers.tiles_touched),
             buf_entry(11, &buffers.compact_tet_ids),
+            buf_entry(12, &material.base_colors),
         ],
     })
 }
@@ -880,6 +894,7 @@ pub fn setup_forward(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     scene: &SceneData,
+    base_colors: &[f32],
     color_grads: &[f32],
     width: u32,
     height: u32,
@@ -895,7 +910,7 @@ pub fn setup_forward(
     let aux_format = wgpu::TextureFormat::Rgba32Float;
 
     let buffers = SceneBuffers::upload(device, queue, scene);
-    let material = MaterialBuffers::upload(device, color_grads, scene.tet_count);
+    let material = MaterialBuffers::upload(device, base_colors, color_grads, scene.tet_count);
     let pipelines = ForwardPipelines::new(device, color_format, aux_format);
     let targets = RenderTargets::new(device, width, height);
 

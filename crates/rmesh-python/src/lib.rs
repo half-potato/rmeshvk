@@ -190,6 +190,7 @@ impl RMeshRenderer {
     /// Args:
     ///     vertices: [N*3] f32 flat array of vertex positions
     ///     indices: [M*4] u32 flat array of tet indices
+    ///     base_colors: [M*3] f32 per-tet base colors (pre-softplus)
     ///     densities: [M] f32 per-tet densities
     ///     color_grads: [M*3] f32 per-tet color gradients
     ///     circumdata: [M*4] f32 circumsphere data (cx, cy, cz, r^2)
@@ -199,6 +200,7 @@ impl RMeshRenderer {
     fn new(
         vertices: PyReadonlyArray1<f32>,
         indices: PyReadonlyArray1<u32>,
+        base_colors: PyReadonlyArray1<f32>,
         densities: PyReadonlyArray1<f32>,
         color_grads: PyReadonlyArray1<f32>,
         circumdata: PyReadonlyArray1<f32>,
@@ -207,6 +209,7 @@ impl RMeshRenderer {
     ) -> PyResult<Self> {
         let vertices_slice = vertices.as_slice()?;
         let indices_slice = indices.as_slice()?;
+        let base_colors_slice = base_colors.as_slice()?;
         let densities_slice = densities.as_slice()?;
         let color_grads_slice = color_grads.as_slice()?;
         let circumdata_slice = circumdata.as_slice()?;
@@ -271,7 +274,7 @@ impl RMeshRenderer {
         let scene_buffers = SceneBuffers::upload(&device, &queue, &scene);
 
         // Upload material data separately
-        let material_buffers = MaterialBuffers::upload(&device, color_grads_slice, tet_count);
+        let material_buffers = MaterialBuffers::upload(&device, base_colors_slice, color_grads_slice, tet_count);
 
         // Render targets
         let targets = RenderTargets::new(&device, width, height);
@@ -406,9 +409,11 @@ impl RMeshRenderer {
             &scene_buffers.circumdata,
             &material_buffers.colors,
             &tile_buffers.tile_sort_values,
+            &material_buffers.base_colors,
             &grad_buffers.d_vertices,
             &grad_buffers.d_densities,
             &mat_grad_buffers.d_color_grads,
+            &mat_grad_buffers.d_base_colors,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
             &debug_image,
@@ -436,9 +441,11 @@ impl RMeshRenderer {
             &scene_buffers.circumdata,
             &material_buffers.colors,
             &radix_state.values_b,
+            &material_buffers.base_colors,
             &grad_buffers.d_vertices,
             &grad_buffers.d_densities,
             &mat_grad_buffers.d_color_grads,
+            &mat_grad_buffers.d_base_colors,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
             &debug_image,
@@ -494,9 +501,11 @@ impl RMeshRenderer {
             &scene_buffers.circumdata,
             &material_buffers.colors,
             &tile_buffers.tile_sort_values,
+            &material_buffers.base_colors,
             &grad_buffers.d_vertices,
             &grad_buffers.d_densities,
             &mat_grad_buffers.d_color_grads,
+            &mat_grad_buffers.d_base_colors,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
             &debug_image,
@@ -514,9 +523,11 @@ impl RMeshRenderer {
             &scene_buffers.circumdata,
             &material_buffers.colors,
             &radix_state.values_b,
+            &material_buffers.base_colors,
             &grad_buffers.d_vertices,
             &grad_buffers.d_densities,
             &mat_grad_buffers.d_color_grads,
+            &mat_grad_buffers.d_base_colors,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
             &debug_image,
@@ -1073,6 +1084,7 @@ impl RMeshRenderer {
             });
         encoder.clear_buffer(&self.grad_buffers.d_vertices, 0, None);
         encoder.clear_buffer(&self.grad_buffers.d_densities, 0, None);
+        encoder.clear_buffer(&self.mat_grad_buffers.d_base_colors, 0, None);
         encoder.clear_buffer(&self.mat_grad_buffers.d_color_grads, 0, None);
         encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
         encoder.clear_buffer(&self.debug_image, 0, None);
@@ -1100,10 +1112,12 @@ impl RMeshRenderer {
             &self.tile_buffers.tile_sort_values,
         );
 
+        // Use _tiled bind groups that reference fwd_tiled.rendered_image
+        // (backward() is called after forward_tiled() in the autograd path)
         let (ranges_bg, bwd_bg0) = if result_in_b {
-            (&self.tile_ranges_bg_b, &self.bwd_tiled_bg0_b)
+            (&self.tile_ranges_bg_b, &self.bwd_tiled_bg0_tiled_b)
         } else {
-            (&self.tile_ranges_bg, &self.bwd_tiled_bg0)
+            (&self.tile_ranges_bg, &self.bwd_tiled_bg0_tiled)
         };
 
         // Tile ranges
@@ -1146,6 +1160,8 @@ impl RMeshRenderer {
         // bitcast f32. The raw bytes are already valid f32 on readback.
         let d_verts = read_buffer_f32(&self.device, &self.queue, &self.grad_buffers.d_vertices);
         let d_dens = read_buffer_f32(&self.device, &self.queue, &self.grad_buffers.d_densities);
+        let d_base_cols =
+            read_buffer_f32(&self.device, &self.queue, &self.mat_grad_buffers.d_base_colors);
         let d_grads =
             read_buffer_f32(&self.device, &self.queue, &self.mat_grad_buffers.d_color_grads);
 
@@ -1157,6 +1173,10 @@ impl RMeshRenderer {
         dict.set_item(
             "d_densities",
             Array1::from_vec(d_dens).into_pyarray(py),
+        )?;
+        dict.set_item(
+            "d_base_colors",
+            Array1::from_vec(d_base_cols).into_pyarray(py),
         )?;
         dict.set_item(
             "d_color_grads",
@@ -1274,6 +1294,7 @@ impl RMeshRenderer {
         // Clear buffers
         encoder.clear_buffer(&self.grad_buffers.d_vertices, 0, None);
         encoder.clear_buffer(&self.grad_buffers.d_densities, 0, None);
+        encoder.clear_buffer(&self.mat_grad_buffers.d_base_colors, 0, None);
         encoder.clear_buffer(&self.mat_grad_buffers.d_color_grads, 0, None);
         encoder.clear_buffer(&self.loss_buffers.loss_value, 0, None);
         encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
@@ -1426,6 +1447,7 @@ impl RMeshRenderer {
     fn update_params(
         &mut self,
         vertices: PyReadonlyArray1<f32>,
+        base_colors: PyReadonlyArray1<f32>,
         densities: PyReadonlyArray1<f32>,
         color_grads: PyReadonlyArray1<f32>,
     ) -> PyResult<()> {
@@ -1433,6 +1455,11 @@ impl RMeshRenderer {
             &self.scene_buffers.vertices,
             0,
             bytemuck::cast_slice(vertices.as_slice()?),
+        );
+        self.queue.write_buffer(
+            &self.material_buffers.base_colors,
+            0,
+            bytemuck::cast_slice(base_colors.as_slice()?),
         );
         self.queue.write_buffer(
             &self.scene_buffers.densities,
@@ -1452,11 +1479,13 @@ impl RMeshRenderer {
     /// Use this after wgpu-only training to get the optimized parameters.
     fn get_params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let verts = read_buffer_f32(&self.device, &self.queue, &self.scene_buffers.vertices);
+        let base_cols = read_buffer_f32(&self.device, &self.queue, &self.material_buffers.base_colors);
         let dens = read_buffer_f32(&self.device, &self.queue, &self.scene_buffers.densities);
         let grads = read_buffer_f32(&self.device, &self.queue, &self.material_buffers.color_grads);
 
         let dict = PyDict::new(py);
         dict.set_item("vertices", Array1::from_vec(verts).into_pyarray(py))?;
+        dict.set_item("base_colors", Array1::from_vec(base_cols).into_pyarray(py))?;
         dict.set_item("densities", Array1::from_vec(dens).into_pyarray(py))?;
         dict.set_item("color_grads", Array1::from_vec(grads).into_pyarray(py))?;
         Ok(dict)

@@ -20,11 +20,11 @@ class RMeshForward(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, renderer, cam_pos, vp, inv_vp, vertices, sh_coeffs, densities, color_grads):
+    def forward(ctx, renderer, cam_pos, vp, inv_vp, vertices, base_colors, densities, color_grads):
         # Upload current parameters to GPU
         renderer.update_params(
             vertices.detach().cpu().numpy().ravel(),
-            sh_coeffs.detach().cpu().numpy().ravel(),
+            base_colors.detach().cpu().numpy().ravel(),
             densities.detach().cpu().numpy().ravel(),
             color_grads.detach().cpu().numpy().ravel(),
         )
@@ -38,7 +38,7 @@ class RMeshForward(torch.autograd.Function):
         image_np = renderer.forward_tiled(cam_np, vp_np, inv_vp_np)
 
         ctx.renderer = renderer
-        ctx.save_for_backward(vertices, sh_coeffs, densities, color_grads)
+        ctx.save_for_backward(vertices, base_colors, densities, color_grads)
 
         device = vertices.device
         return torch.from_numpy(image_np.copy()).to(device)
@@ -51,9 +51,25 @@ class RMeshForward(torch.autograd.Function):
         device = ctx.saved_tensors[0].device
 
         d_vertices = torch.from_numpy(grads["d_vertices"].copy()).to(device)
-        d_sh_coeffs = torch.from_numpy(grads["d_sh_coeffs"].copy()).to(device)
+        d_base_colors = torch.from_numpy(grads["d_base_colors"].copy()).to(device)
         d_densities = torch.from_numpy(grads["d_densities"].copy()).to(device)
         d_color_grads = torch.from_numpy(grads["d_color_grads"].copy()).to(device)
+
+        # Diagnostic: log raw VK gradient magnitudes
+        if hasattr(RMeshForward, '_log_counter'):
+            RMeshForward._log_counter += 1
+        else:
+            RMeshForward._log_counter = 0
+        if RMeshForward._log_counter % 50 == 0:
+            nz_bc = d_base_colors[d_base_colors.abs() > 0]
+            nz_dn = d_densities[d_densities.abs() > 0]
+            nz_cg = d_color_grads[d_color_grads.abs() > 0]
+            nz_vt = d_vertices[d_vertices.abs() > 0]
+            print(f"  [VK grads] d_base_colors: std={d_base_colors.std():.6f} max={d_base_colors.abs().max():.6f} nnz={nz_bc.numel()}/{d_base_colors.numel()}")
+            print(f"  [VK grads] d_densities:   std={d_densities.std():.6f} max={d_densities.abs().max():.6f} nnz={nz_dn.numel()}/{d_densities.numel()}")
+            print(f"  [VK grads] d_color_grads: std={d_color_grads.std():.6f} max={d_color_grads.abs().max():.6f} nnz={nz_cg.numel()}/{d_color_grads.numel()}")
+            print(f"  [VK grads] d_vertices:    std={d_vertices.std():.6f} max={d_vertices.abs().max():.6f} nnz={nz_vt.numel()}/{d_vertices.numel()}")
+            print(f"  [VK grads] dl_d_image:    std={grad_output.std():.6f} max={grad_output.abs().max():.6f}")
 
         return (
             None,  # renderer
@@ -61,7 +77,7 @@ class RMeshForward(torch.autograd.Function):
             None,  # vp
             None,  # inv_vp
             d_vertices,
-            d_sh_coeffs,
+            d_base_colors,
             d_densities,
             d_color_grads,
         )
@@ -71,8 +87,8 @@ class RMeshModule(nn.Module):
     """nn.Module that wraps RMeshRenderer with learnable parameters.
 
     Usage:
-        model = RMeshModule(vertices, indices, sh_coeffs, densities,
-                            color_grads, circumdata, sh_degree, w, h)
+        model = RMeshModule(vertices, indices, base_colors, densities,
+                            color_grads, circumdata, w, h)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
         image = model(cam_pos, vp, inv_vp)
@@ -85,25 +101,23 @@ class RMeshModule(nn.Module):
         self,
         vertices: np.ndarray,
         indices: np.ndarray,
-        sh_coeffs: np.ndarray,
+        base_colors: np.ndarray,
         densities: np.ndarray,
         color_grads: np.ndarray,
         circumdata: np.ndarray,
-        sh_degree: int,
         width: int,
         height: int,
     ):
         super().__init__()
 
         self.vertices = nn.Parameter(torch.tensor(vertices.ravel(), dtype=torch.float32))
-        self.sh_coeffs = nn.Parameter(torch.tensor(sh_coeffs.ravel(), dtype=torch.float32))
+        self.base_colors = nn.Parameter(torch.tensor(base_colors.ravel(), dtype=torch.float32))
         self.densities = nn.Parameter(torch.tensor(densities.ravel(), dtype=torch.float32))
         self.color_grads = nn.Parameter(torch.tensor(color_grads.ravel(), dtype=torch.float32))
 
         # Non-differentiable data
         self._indices = indices.ravel().astype(np.uint32)
         self._circumdata = circumdata.ravel().astype(np.float32)
-        self._sh_degree = sh_degree
         self._width = width
         self._height = height
 
@@ -111,11 +125,10 @@ class RMeshModule(nn.Module):
         self.renderer = RMeshRenderer(
             vertices.ravel().astype(np.float32),
             self._indices,
-            sh_coeffs.ravel().astype(np.float32),
+            base_colors.ravel().astype(np.float32),
             densities.ravel().astype(np.float32),
             color_grads.ravel().astype(np.float32),
             self._circumdata,
-            sh_degree,
             width,
             height,
         )
@@ -137,7 +150,7 @@ class RMeshModule(nn.Module):
             vp,
             inv_vp,
             self.vertices,
-            self.sh_coeffs,
+            self.base_colors,
             self.densities,
             self.color_grads,
         )

@@ -534,8 +534,9 @@ fn test_tiled_forward_e2e() {
     let (vp, inv_vp) = setup_camera(eye, centroid);
 
     // --- Forward compute (populates colors, tiles_touched, compact_tet_ids, indirect_args) ---
+    let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
-        rmesh_render::setup_forward(&device, &queue, &scene, &scene.color_grads, W, H);
+        rmesh_render::setup_forward(&device, &queue, &scene, &zero_base_colors, &scene.color_grads, W, H);
 
     let uniforms = rmesh_render::make_uniforms(
         vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32,
@@ -713,8 +714,9 @@ fn test_tiled_backward_e2e() {
     let (vp, inv_vp) = setup_camera(eye, centroid);
 
     // --- Forward setup ---
+    let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
-        rmesh_render::setup_forward(&device, &queue, &scene, &scene.color_grads, W, H);
+        rmesh_render::setup_forward(&device, &queue, &scene, &zero_base_colors, &scene.color_grads, W, H);
 
     let uniforms = rmesh_render::make_uniforms(
         vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32,
@@ -878,8 +880,10 @@ fn test_tiled_backward_e2e() {
         &buffers.vertices, &buffers.indices,
         &buffers.densities, &material.color_grads, &buffers.circumdata,
         &material.colors, tile_sort_values_sorted,
+        &material.base_colors,
         &grad_buffers.d_vertices,
         &grad_buffers.d_densities, &mat_grad_buffers.d_color_grads,
+        &mat_grad_buffers.d_base_colors,
         &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
     );
 
@@ -967,8 +971,9 @@ fn test_single_tet_gradient_finite_diff() {
     // Uses scan-based tile pipeline (same as Python path).
     // Re-creates scene buffers each time because we modify parameters.
     let run_forward_loss = |scene_data: &SceneData| -> f32 {
+        let zero_base_colors = vec![0.5f32; scene_data.tet_count as usize * 3];
         let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
-            rmesh_render::setup_forward(&device, &queue, scene_data, &scene_data.color_grads, W, H);
+            rmesh_render::setup_forward(&device, &queue, scene_data, &zero_base_colors, &scene_data.color_grads, W, H);
 
         let uniforms = rmesh_render::make_uniforms(
             vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32,
@@ -1082,8 +1087,9 @@ fn test_single_tet_gradient_finite_diff() {
     // -----------------------------------------------------------------------
     // Uses scan-based tile pipeline (same as Python path).
     let run_backward = |scene_data: &SceneData| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let zero_base_colors = vec![0.5f32; scene_data.tet_count as usize * 3];
         let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
-            rmesh_render::setup_forward(&device, &queue, scene_data, &scene_data.color_grads, W, H);
+            rmesh_render::setup_forward(&device, &queue, scene_data, &zero_base_colors, &scene_data.color_grads, W, H);
 
         let uniforms = rmesh_render::make_uniforms(
             vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32,
@@ -1226,8 +1232,10 @@ fn test_single_tet_gradient_finite_diff() {
             &buffers.vertices, &buffers.indices,
             &buffers.densities, &material.color_grads, &buffers.circumdata,
             &material.colors, tile_sort_values_sorted,
+            &material.base_colors,
             &grad_buffers.d_vertices,
             &grad_buffers.d_densities, &mat_grad_buffers.d_color_grads,
+            &mat_grad_buffers.d_base_colors,
             &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
         );
 
@@ -1400,8 +1408,9 @@ fn test_single_tet_loss_decreases() {
     // --- Setup (all created ONCE, reused across steps) ---
 
     // Forward buffers + compute pipeline (Adam updates these buffers in-place)
+    let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
-        rmesh_render::setup_forward(&device, &queue, &scene, &scene.color_grads, W, H);
+        rmesh_render::setup_forward(&device, &queue, &scene, &zero_base_colors, &scene.color_grads, W, H);
     let uniforms = rmesh_render::make_uniforms(
         vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32,
     );
@@ -1500,8 +1509,10 @@ fn test_single_tet_loss_decreases() {
         &buffers.vertices, &buffers.indices,
         &buffers.densities, &material.color_grads, &buffers.circumdata,
         &material.colors, &tile_buffers.tile_sort_values,
+        &material.base_colors,
         &grad_buffers.d_vertices,
         &grad_buffers.d_densities, &mat_grad_buffers.d_color_grads,
+        &mat_grad_buffers.d_base_colors,
         &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
     );
     let (bwd_bg0_b, _) = rmesh_backward::create_backward_tiled_bind_groups(
@@ -1510,8 +1521,10 @@ fn test_single_tet_loss_decreases() {
         &buffers.vertices, &buffers.indices,
         &buffers.densities, &material.color_grads, &buffers.circumdata,
         &material.colors, &radix_state.values_b,
+        &material.base_colors,
         &grad_buffers.d_vertices,
         &grad_buffers.d_densities, &mat_grad_buffers.d_color_grads,
+        &mat_grad_buffers.d_base_colors,
         &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
     );
 
@@ -1819,10 +1832,11 @@ fn test_camera_gpu_visibility() {
     let target = Vec3::ZERO;
     let (vp, inv_vp) = setup_camera(eye, target);
 
+    let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, _material, fwd_pipelines, _targets, compute_bg, _render_bg) =
         rmesh_render::setup_forward(
             &device, &queue, &scene,
-            &scene.color_grads, W, H,
+            &zero_base_colors, &scene.color_grads, W, H,
         );
 
     let uniforms = rmesh_render::make_uniforms(
@@ -1876,10 +1890,11 @@ fn test_camera_tiled_forward_deterministic() {
     let (vp, inv_vp) = setup_camera(eye, target);
 
     // --- Forward compute ---
+    let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
         rmesh_render::setup_forward(
             &device, &queue, &scene,
-            &scene.color_grads, W, H,
+            &zero_base_colors, &scene.color_grads, W, H,
         );
 
     let uniforms = rmesh_render::make_uniforms(

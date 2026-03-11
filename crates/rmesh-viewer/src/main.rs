@@ -192,8 +192,10 @@ impl App {
 
         let pipelines = ForwardPipelines::new(&device, color_format, aux_format);
         let buffers = SceneBuffers::upload(&device, &queue, &self.scene_data);
+        let default_base_colors = vec![0.5f32; self.scene_data.tet_count as usize * 3];
         let material = MaterialBuffers::upload(
             &device,
+            &default_base_colors,
             &self.scene_data.color_grads,
             self.scene_data.tet_count,
         );

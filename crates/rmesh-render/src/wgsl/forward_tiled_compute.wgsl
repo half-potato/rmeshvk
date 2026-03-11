@@ -75,6 +75,11 @@ fn phi(x: f32) -> f32 {
     return (1.0 - exp(-x)) / x;
 }
 
+fn softplus(x: f32) -> f32 {
+    if (x > 8.0) { return x; }
+    return 0.1 * log(1.0 + exp(10.0 * x));
+}
+
 fn load_f32x3_v(idx: u32) -> vec3<f32> {
     return vec3<f32>(vertices[idx * 3u], vertices[idx * 3u + 1u], vertices[idx * 3u + 2u]);
 }

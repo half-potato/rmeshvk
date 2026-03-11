@@ -40,6 +40,7 @@ pub struct GradientBuffers {
 
 /// Gradient buffers for material/appearance parameters.
 pub struct MaterialGradBuffers {
+    pub d_base_colors: wgpu::Buffer,
     pub d_color_grads: wgpu::Buffer,
 }
 
@@ -90,6 +91,11 @@ impl MaterialGradBuffers {
         tet_count: u32,
     ) -> Self {
         Self {
+            d_base_colors: create_storage_buffer(
+                device,
+                "d_base_colors",
+                (tet_count as u64) * 3 * 4,
+            ),
             d_color_grads: create_storage_buffer(
                 device,
                 "d_color_grads",
@@ -193,7 +199,7 @@ impl BackwardTiledPipelines {
             source: wgpu::ShaderSource::Wgsl(BACKWARD_TILED_WGSL.into()),
         });
 
-        // Group 0: 10 read-only bindings
+        // Group 0: 11 read-only bindings
         let bg_layout_0 =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("backward_tiled_bgl_0"),
@@ -208,10 +214,11 @@ impl BackwardTiledPipelines {
                     storage_entry(7, true),  // circumdata
                     storage_entry(8, true),  // colors_buf
                     storage_entry(9, true),  // tile_sort_values
+                    storage_entry(10, true), // base_colors
                 ],
             });
 
-        // Group 1: 6 bindings (3 rw + 2 read + 1 rw)
+        // Group 1: 7 bindings (4 rw + 2 read + 1 rw)
         let bg_layout_1 =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("backward_tiled_bgl_1"),
@@ -222,6 +229,7 @@ impl BackwardTiledPipelines {
                     storage_entry(3, true),  // tile_ranges
                     storage_entry(4, true),  // tile_uniforms
                     storage_entry(5, false), // debug_image
+                    storage_entry(6, false), // d_base_colors
                 ],
             });
 
@@ -352,9 +360,11 @@ pub fn create_backward_tiled_bind_groups(
     circumdata: &wgpu::Buffer,
     colors: &wgpu::Buffer,
     tile_sort_values: &wgpu::Buffer,
+    base_colors: &wgpu::Buffer,
     d_vertices: &wgpu::Buffer,
     d_densities: &wgpu::Buffer,
     d_color_grads: &wgpu::Buffer,
+    d_base_colors: &wgpu::Buffer,
     tile_ranges: &wgpu::Buffer,
     tile_uniforms: &wgpu::Buffer,
     debug_image: &wgpu::Buffer,
@@ -373,6 +383,7 @@ pub fn create_backward_tiled_bind_groups(
             wgpu::BindGroupEntry { binding: 7, resource: circumdata.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 8, resource: colors.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 9, resource: tile_sort_values.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 10, resource: base_colors.as_entire_binding() },
         ],
     });
 
@@ -386,6 +397,7 @@ pub fn create_backward_tiled_bind_groups(
             wgpu::BindGroupEntry { binding: 3, resource: tile_ranges.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: tile_uniforms.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: debug_image.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: d_base_colors.as_entire_binding() },
         ],
     });
 

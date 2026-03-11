@@ -51,6 +51,7 @@ struct TileUniforms {
 @group(0) @binding(7) var<storage, read> circumdata: array<f32>;
 @group(0) @binding(8) var<storage, read> colors_buf: array<f32>;
 @group(0) @binding(9) var<storage, read> tile_sort_values: array<u32>;
+@group(0) @binding(10) var<storage, read> base_colors_buf: array<f32>;
 
 // Group 1: read-write gradient outputs + tile metadata
 @group(1) @binding(0) var<storage, read_write> d_vertices: array<atomic<u32>>;
@@ -59,6 +60,7 @@ struct TileUniforms {
 @group(1) @binding(3) var<storage, read> tile_ranges: array<u32>;
 @group(1) @binding(4) var<storage, read> tile_uniforms: TileUniforms;
 @group(1) @binding(5) var<storage, read_write> debug_image: array<f32>;
+@group(1) @binding(6) var<storage, read_write> d_base_colors: array<atomic<u32>>;
 
 // Face winding
 const FACES: array<vec3<u32>, 4> = array<vec3<u32>, 4>(
@@ -125,6 +127,16 @@ fn global_cas_add_color_grad(buf_idx: u32, val: f32) {
     loop {
         let nv = bitcast<u32>(bitcast<f32>(ob) + val);
         let r = atomicCompareExchangeWeak(&d_color_grads[buf_idx], ob, nv);
+        if (r.exchanged) { break; }
+        ob = r.old_value;
+    }
+}
+
+fn global_cas_add_base_color(buf_idx: u32, val: f32) {
+    var ob = atomicLoad(&d_base_colors[buf_idx]);
+    loop {
+        let nv = bitcast<u32>(bitcast<f32>(ob) + val);
+        let r = atomicCompareExchangeWeak(&d_base_colors[buf_idx], ob, nv);
         if (r.exchanged) { break; }
         ob = r.old_value;
     }
@@ -288,15 +300,11 @@ fn main(
         let colors_tet = vec3<f32>(colors_buf[tet_id * 3u], colors_buf[tet_id * 3u + 1u], colors_buf[tet_id * 3u + 2u]);
         let grad_vec = vec3<f32>(color_grads_buf[tet_id * 3u], color_grads_buf[tet_id * 3u + 1u], color_grads_buf[tet_id * 3u + 2u]);
 
-        // Per-tet constants
-        let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
-        let offset_val = dot(grad_vec, verts[0] - centroid);
-        let sp_input = vec3<f32>(0.5 + offset_val);
-
         // Per-thread gradient accumulators (sum across all pixels this thread processes)
         var d_density_accum: f32 = 0.0;
         var d_vert_accum: array<vec3<f32>, 4>;
         var d_grad_accum = vec3<f32>(0.0);
+        var d_base_colors_accum = vec3<f32>(0.0);
 
         // Process covered pixels
         for (var idx = lane; idx < total; idx += 32u) {
@@ -440,18 +448,8 @@ fn main(
             let d_v0_from_base = -grad_vec * d_base_offset_scalar;
             d_grad_local += ray_dir * d_dc_dt_val;
 
-            // Softplus backward
-            let d_sp_input = vec3<f32>(
-                d_base_color.x * dsoftplus(sp_input.x),
-                d_base_color.y * dsoftplus(sp_input.y),
-                d_base_color.z * dsoftplus(sp_input.z),
-            );
-
-            let d_offset_scalar = d_sp_input.x + d_sp_input.y + d_sp_input.z;
-
-            d_grad_local += (verts[0] - centroid) * d_offset_scalar;
-            let d_v0_from_offset = grad_vec * d_offset_scalar * 0.75;
-            let d_vother_from_offset = -grad_vec * d_offset_scalar * 0.25;
+            // Gradient w.r.t. base_colors — no softplus in forward (ReLU only, matching Slang interp)
+            d_base_colors_accum += d_base_color;
 
             // Intersection gradients
             var d_vert_local: array<vec3<f32>, 4>;
@@ -482,10 +480,7 @@ fn main(
                 d_vert_local[f[2]] += dt_dvc * d_t_max;
             }
 
-            d_vert_local[0] += d_v0_from_base + d_v0_from_offset;
-            d_vert_local[1] += d_vother_from_offset;
-            d_vert_local[2] += d_vother_from_offset;
-            d_vert_local[3] += d_vother_from_offset;
+            d_vert_local[0] += d_v0_from_base;
 
             // Accumulate per-thread
             d_density_accum += d_density_local;
@@ -510,6 +505,11 @@ fn main(
             warp_reduce(d_grad_accum.y),
             warp_reduce(d_grad_accum.z),
         );
+        let reduced_d_base = vec3<f32>(
+            warp_reduce(d_base_colors_accum.x),
+            warp_reduce(d_base_colors_accum.y),
+            warp_reduce(d_base_colors_accum.z),
+        );
 
         // Lane 0 writes to global memory
         if (lane == 0u) {
@@ -525,6 +525,10 @@ fn main(
             global_cas_add_color_grad(tet_id * 3u, reduced_d_grad.x);
             global_cas_add_color_grad(tet_id * 3u + 1u, reduced_d_grad.y);
             global_cas_add_color_grad(tet_id * 3u + 2u, reduced_d_grad.z);
+
+            global_cas_add_base_color(tet_id * 3u, reduced_d_base.x);
+            global_cas_add_base_color(tet_id * 3u + 1u, reduced_d_base.y);
+            global_cas_add_base_color(tet_id * 3u + 2u, reduced_d_base.z);
         }
         workgroupBarrier();
     }

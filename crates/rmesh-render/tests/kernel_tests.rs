@@ -52,7 +52,8 @@ fn test_forward_compute_kernel() {
     let scene = random_single_tet_scene(&mut rng, 0.3);
 
     let buffers = rmesh_render::SceneBuffers::upload(&device, &queue, &scene);
-    let material = rmesh_render::MaterialBuffers::upload(&device, &scene.color_grads, scene.tet_count);
+    let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
+    let material = rmesh_render::MaterialBuffers::upload(&device, &zero_base_colors, &scene.color_grads, scene.tet_count);
     let pipelines = rmesh_render::ForwardPipelines::new(
         &device,
         wgpu::TextureFormat::Rgba16Float,

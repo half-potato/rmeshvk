@@ -416,7 +416,8 @@ pub fn train(
 
     // Upload scene + material data
     let buffers = SceneBuffers::upload(device, queue, scene);
-    let material = MaterialBuffers::upload(device, &scene.color_grads, scene.tet_count);
+    let default_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
+    let material = MaterialBuffers::upload(device, &default_base_colors, &scene.color_grads, scene.tet_count);
 
     // Allocate gradient + optimizer state
     let grads = GradientBuffers::new(device, scene.vertex_count, scene.tet_count);

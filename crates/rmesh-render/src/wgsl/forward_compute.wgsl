@@ -41,6 +41,7 @@ struct DrawIndirectArgs {
 // Compact outputs for tiled path (indexed by vis_idx from atomicAdd)
 @group(0) @binding(10) var<storage, read_write> tiles_touched: array<u32>;
 @group(0) @binding(11) var<storage, read_write> compact_tet_ids: array<u32>;
+@group(0) @binding(12) var<storage, read> base_colors_buf: array<f32>;
 
 fn project_to_ndc(pos: vec3<f32>, vp: mat4x4<f32>) -> vec4<f32> {
     let clip = vp * vec4<f32>(pos, 1.0);
@@ -215,22 +216,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
         }
     }
 
-    // --- 4. Color evaluation (constant 0.5 base) ---
-    let centroid = (v0 + v1 + v2 + v3) * 0.25;
-    var result_color = vec3<f32>(0.5);
-
-    // --- 5. Apply color gradient (linear field) ---
-    let gx = color_grads[tet_id * 3u];
-    let gy = color_grads[tet_id * 3u + 1u];
-    let gz = color_grads[tet_id * 3u + 2u];
-    let grad = vec3<f32>(gx, gy, gz);
-    let offset = dot(grad, v0 - centroid);
-    let input_val = result_color + vec3<f32>(offset);
-
-    // Softplus activation
-    let sp = vec3<f32>(softplus(input_val.x), softplus(input_val.y), softplus(input_val.z));
-
-    colors[tet_id * 3u] = sp.x;
-    colors[tet_id * 3u + 1u] = sp.y;
-    colors[tet_id * 3u + 2u] = sp.z;
+    // --- 4. Color evaluation ---
+    // Write raw pre-softplus base colors to colors_buf.
+    // Softplus is applied per-pixel in forward_tiled_compute.wgsl to match
+    // the Slang renderer's per-pixel activation model.
+    colors[tet_id * 3u] = base_colors_buf[tet_id * 3u];
+    colors[tet_id * 3u + 1u] = base_colors_buf[tet_id * 3u + 1u];
+    colors[tet_id * 3u + 2u] = base_colors_buf[tet_id * 3u + 2u];
 }
