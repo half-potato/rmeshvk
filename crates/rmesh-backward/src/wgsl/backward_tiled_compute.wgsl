@@ -62,12 +62,12 @@ struct TileUniforms {
 @group(1) @binding(5) var<storage, read_write> debug_image: array<f32>;
 @group(1) @binding(6) var<storage, read_write> d_base_colors: array<atomic<u32>>;
 
-// Face winding
-const FACES: array<vec3<u32>, 4> = array<vec3<u32>, 4>(
-    vec3<u32>(0u, 2u, 1u),
-    vec3<u32>(1u, 2u, 3u),
-    vec3<u32>(0u, 3u, 2u),
-    vec3<u32>(3u, 0u, 1u),
+// Face (a, b, c, opposite_vertex) — opposite used to flip normal inward
+const FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
+    vec4<u32>(0u, 2u, 1u, 3u),
+    vec4<u32>(1u, 2u, 3u, 0u),
+    vec4<u32>(0u, 3u, 2u, 1u),
+    vec4<u32>(3u, 0u, 1u, 2u),
 );
 
 // Workgroup shared memory
@@ -301,8 +301,14 @@ fn main(
         let grad_vec = vec3<f32>(color_grads_buf[tet_id * 3u], color_grads_buf[tet_id * 3u + 1u], color_grads_buf[tet_id * 3u + 2u]);
 
         // Per-thread gradient accumulators (sum across all pixels this thread processes)
+        // NOTE: explicit zero-init required — WGSL var inside a loop may retain
+        // values from the previous iteration in some runtimes (naga/wgpu).
         var d_density_accum: f32 = 0.0;
         var d_vert_accum: array<vec3<f32>, 4>;
+        d_vert_accum[0] = vec3<f32>(0.0);
+        d_vert_accum[1] = vec3<f32>(0.0);
+        d_vert_accum[2] = vec3<f32>(0.0);
+        d_vert_accum[3] = vec3<f32>(0.0);
         var d_grad_accum = vec3<f32>(0.0);
         var d_base_colors_accum = vec3<f32>(0.0);
 
@@ -345,7 +351,12 @@ fn main(
             for (var fi = 0u; fi < 4u; fi++) {
                 let f = FACES[fi];
                 let va = verts[f[0]]; let vb = verts[f[1]]; let vc = verts[f[2]];
-                let n = cross(vc - va, vb - va);
+                var n = cross(vc - va, vb - va);
+                // Flip normal to point inward (toward opposite vertex)
+                let v_opp = verts[f[3]];
+                if (dot(n, v_opp - va) < 0.0) {
+                    n = -n;
+                }
                 let num = dot(n, va - cam);
                 let den = dot(n, ray_dir);
                 if (abs(den) < 1e-20) {
@@ -452,7 +463,13 @@ fn main(
             d_base_colors_accum += d_base_color;
 
             // Intersection gradients
+            // NOTE: explicit zero-init required — WGSL var inside a loop may not
+            // be re-zero-initialized on each iteration in some runtimes.
             var d_vert_local: array<vec3<f32>, 4>;
+            d_vert_local[0] = vec3<f32>(0.0);
+            d_vert_local[1] = vec3<f32>(0.0);
+            d_vert_local[2] = vec3<f32>(0.0);
+            d_vert_local[3] = vec3<f32>(0.0);
             {
                 let f = FACES[min_face];
                 let va = verts[f[0]]; let vb = verts[f[1]]; let vc = verts[f[2]];

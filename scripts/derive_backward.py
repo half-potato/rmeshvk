@@ -6,8 +6,8 @@ Derives derivatives for:
   1. compute_integral (volume rendering integral)
   2. update_pixel_state (alpha blending composition)
   3. Ray-plane intersection (dt/d(vertices))
-  4. Color chain (softplus, SH, color_grads)
-  5. Full chain composition test
+  4. Color chain (simplified: no SH, no softplus, colors are leaf params)
+  5. Full chain composition test (simplified color model)
 
 Each section prints simplified symbolic expressions and validates
 them against finite differences.
@@ -552,80 +552,54 @@ def section3_intersection():
 
 
 # ============================================================================
-# Section 4: Color chain backward
+# Section 4: Color chain backward (simplified: no SH, no softplus)
 # ============================================================================
 
 def section4_color_chain():
     print("\n" + "=" * 70)
-    print("SECTION 4: Color chain backward")
+    print("SECTION 4: Color chain backward (simplified: no SH, no softplus)")
     print("=" * 70)
 
-    print("\nForward color chain:")
-    print("  1. SH eval:       sh_result = sum_k(sh_coeff[k] * Y_k(dir))")
-    print("  2. Bias + offset: sp_input = sh_result + 0.5 + grad . (v0 - centroid)")
-    print("  3. Softplus:      colors = softplus(sp_input)     [per channel]")
-    print("  4. Base color:    base_color = colors + grad . (cam - v0)  [scalar broadcast]")
-    print("  5. dc/dt:         dc_dt = grad . ray_dir                   [scalar]")
-    print("  6. Entry/exit:    c_start = max(base_color + dc_dt * t_min, 0)")
-    print("                    c_end   = max(base_color + dc_dt * t_max, 0)")
+    print("\nForward color chain (simplified — colors are raw leaf parameters):")
+    print("  1. base_offset = grad . (cam - v0)              [scalar]")
+    print("  2. base_color  = colors + base_offset            [vec3, scalar broadcast]")
+    print("  3. dc_dt       = grad . ray_dir                  [scalar]")
+    print("  4. c_start     = max(base_color + dc_dt * t_min, 0)  [vec3]")
+    print("     c_end       = max(base_color + dc_dt * t_max, 0)  [vec3]")
 
     print("\nBackward (given dL/d(c_start), dL/d(c_end)):")
     print("")
-    print("  Step 6 backward (max clamp):")
+    print("  Step 4 backward (max clamp / ReLU):")
     print("    d_c_start_raw = dL/d(c_start) * (1 if raw > 0 else 0)  [per channel]")
     print("    d_c_end_raw   = dL/d(c_end) * (1 if raw > 0 else 0)")
     print("")
-    print("  Step 5+4 backward (base_color + dc_dt * t):")
+    print("  Step 3+2 backward (base_color + dc_dt * t):")
     print("    d_base_color = d_c_start_raw + d_c_end_raw")
     print("    d_dc_dt = sum(d_c_start_raw) * t_min + sum(d_c_end_raw) * t_max")
     print("    d_t_min_color = sum(d_c_start_raw) * dc_dt")
     print("    d_t_max_color = sum(d_c_end_raw) * dc_dt")
     print("")
-    print("  Step 4 backward (base = colors + scalar_offset):")
-    print("    d_colors = d_base_color")
-    print("    d_offset_from_base = sum(d_base_color)    [offset is scalar broadcast]")
-    print("    d_grad += (cam - v0) * d_offset_from_base")
-    print("    d_v0   += -grad * d_offset_from_base")
+    print("  Step 2 backward (base_color = colors + scalar offset):")
+    print("    d_colors = d_base_color               [pass-through, leaf param]")
+    print("    d_base_offset_scalar = sum(d_base_color)")
+    print("    d_grad += (cam - v0) * d_base_offset_scalar")
+    print("    d_v0   += -grad * d_base_offset_scalar")
     print("")
-    print("  Step 5 backward (dc_dt = grad . ray_dir):")
+    print("  Step 3 backward (dc_dt = grad . ray_dir):")
     print("    d_grad += ray_dir * d_dc_dt")
     print("    (ray_dir is not differentiated)")
-    print("")
-    print("  Step 3 backward (softplus):")
-    print("    d_sp_input = d_colors * dsoftplus(sp_input)    [per channel]")
-    print("    dsoftplus(x) = exp(10*x) / (1 + exp(10*x))    [sigmoid with beta=10]")
-    print("")
-    print("  Step 2 backward (bias + offset):")
-    print("    d_sh_result = d_sp_input")
-    print("    d_offset = sum(d_sp_input)       [offset is scalar broadcast]")
-    print("    d_grad += (v0 - centroid) * d_offset")
-    print("    d_v0 += grad * d_offset * 0.75   [d(v0-centroid)/d(v0) = I - I/4 = 3/4 I")
-    print("                                      since centroid = (v0+v1+v2+v3)/4]")
-    print("    d_v1 += -grad * d_offset * 0.25")
-    print("    d_v2 += -grad * d_offset * 0.25")
-    print("    d_v3 += -grad * d_offset * 0.25")
-    print("")
-    print("  Step 1 backward (SH):")
-    print("    d_sh_coeff[k][c] = d_sh_result[c] * Y_k(dir)")
-    print("    (direction is not differentiated -- matches Slang no_diff)")
 
-    # -- Numerical validation: softplus chain --
+    # -- Numerical validation --
     print("\nNumerical validation (color chain without intersection):")
 
-    def softplus_np(x):
-        return np.where(x > 8.0, x, 0.1 * np.log(1.0 + np.exp(10.0 * x)))
-
-    def dsoftplus_np(x):
-        return np.where(x > 8.0, 1.0, np.exp(10.0 * x) / (1.0 + np.exp(10.0 * x)))
-
-    # Fixed ray direction (not differentiated, matching Slang no_diff)
+    # Fixed ray direction (not differentiated)
     fixed_ray_dir = np.array([0.1, 0.2, 1.0])
 
     def color_chain_fwd(x):
-        """x = [sh_eval(3), grad(3), v0(3), cam(3), t_min, t_max, density]
+        """x = [colors(3), grad(3), v0(3), cam(3), t_min, t_max, density]
         Total: 15 elements.  ray_dir is a constant (not differentiated).
         """
-        sh_eval = x[0:3]
+        colors = x[0:3]
         grad = x[3:6]
         v0 = x[6:9]
         cam_v = x[9:12]
@@ -634,19 +608,9 @@ def section4_color_chain():
         t_max = x[13]
         density = x[14]
 
-        # Centroid (we only use v0 for simplicity; centroid = v0 for this test)
-        centroid = v0  # simplified: single-vertex tet
-
-        # softplus input
-        offset = np.dot(grad, v0 - centroid)  # = 0 for single vertex
-        sp_input = sh_eval + 0.5 + offset
-        colors = softplus_np(sp_input)
-
-        # base color at camera
+        # Color chain (simplified: no SH, no softplus)
         base_offset = np.dot(grad, cam_v - v0)
         base_color = colors + base_offset  # scalar broadcast
-
-        # dc/dt
         dc_dt = np.dot(grad, ray_dir)
 
         # entry/exit colors
@@ -667,8 +631,8 @@ def section4_color_chain():
         return np.array([C[0], C[1], C[2], alpha])
 
     def color_chain_bwd(x, dL_dout):
-        """Analytical backward through the full color chain."""
-        sh_eval = x[0:3]
+        """Analytical backward through the simplified color chain."""
+        colors = x[0:3]
         grad = x[3:6]
         v0 = x[6:9]
         cam_v = x[9:12]
@@ -677,12 +641,7 @@ def section4_color_chain():
         t_max = x[13]
         density = x[14]
 
-        centroid = v0
-
         # Forward replay
-        offset = np.dot(grad, v0 - centroid)
-        sp_input = sh_eval + 0.5 + offset
-        colors = softplus_np(sp_input)
         base_offset = np.dot(grad, cam_v - v0)
         base_color = colors + base_offset
         dc_dt = np.dot(grad, ray_dir)
@@ -711,7 +670,7 @@ def section4_color_chain():
         d_od = (np.dot(dL_dC, c_end * dw0_dod + c_start * dw1_dod)
                 + dL_dalpha * alpha_t)
 
-        # -- Backward through max clamp --
+        # -- Backward through max clamp (ReLU) --
         d_c_start_raw = d_c_start * (c_start_raw > 0).astype(float)
         d_c_end_raw = d_c_end * (c_end_raw > 0).astype(float)
 
@@ -731,33 +690,19 @@ def section4_color_chain():
         d_t_max = d_t_max_color + d_t_max_dist
 
         # -- Backward through base_color = colors + grad.(cam - v0) --
-        d_colors = d_base_color.copy()
-        d_base_offset = np.sum(d_base_color)
-        d_grad = (cam_v - v0) * d_base_offset
-        d_v0_from_base = -grad * d_base_offset
+        d_colors = d_base_color.copy()  # pass-through (leaf param, no softplus)
+        d_base_offset_scalar = np.sum(d_base_color)
+        d_grad = (cam_v - v0) * d_base_offset_scalar
+        d_v0 = -grad * d_base_offset_scalar
 
         # -- Backward through dc_dt = grad . ray_dir --
         d_grad += ray_dir * d_dc_dt
-        # d_ray_dir not differentiated
 
-        # -- Backward through softplus --
-        d_sp_input = d_colors * dsoftplus_np(sp_input)
-
-        # -- Backward through sp_input = sh_eval + 0.5 + offset --
-        d_sh_eval = d_sp_input.copy()
-        d_offset_sp = np.sum(d_sp_input)
-        # offset = grad . (v0 - centroid) = 0 for this test, but derivs still apply:
-        d_grad += (v0 - centroid) * d_offset_sp
-        d_v0_from_offset = grad * d_offset_sp  # d(v0-centroid)/d(v0) = I when centroid=v0 -> 0
-        # Actually when centroid = v0, offset = 0 and d(offset)/d(v0) = d(grad.(v0-v0))/d(v0) = 0
-        # For this simplified test, centroid = v0 exactly, so no v0 gradient from offset
-        d_v0 = d_v0_from_base
-
-        # d_cam not differentiated (camera is fixed)
-        d_cam = grad * d_base_offset
+        # d_cam (for testing — camera is a variable in this test)
+        d_cam = grad * d_base_offset_scalar
 
         return np.array([
-            d_sh_eval[0], d_sh_eval[1], d_sh_eval[2],
+            d_colors[0], d_colors[1], d_colors[2],
             d_grad[0], d_grad[1], d_grad[2],
             d_v0[0], d_v0[1], d_v0[2],
             d_cam[0], d_cam[1], d_cam[2],
@@ -767,10 +712,10 @@ def section4_color_chain():
     np.random.seed(789)
     all_pass = True
     for trial in range(5):
-        # Use large positive sh_eval so colors are well above 0 (avoid max clamp boundary)
-        # Keep gradients very small so base_color + dc_dt * t stays positive for all t
+        # Use positive colors to stay above ReLU boundary
+        # Keep gradients very small so base_color + dc_dt * t stays positive
         x0 = np.concatenate([
-            np.random.rand(3) * 0.2 + 1.0,    # sh_eval (large -> softplus well above 0)
+            np.random.rand(3) * 0.5 + 0.5,    # colors (positive, well above 0)
             np.random.randn(3) * 0.005,        # grad (tiny -> color always positive)
             np.random.randn(3) * 0.3,          # v0
             np.array([0.0, 0.0, -2.0]),        # cam
@@ -791,52 +736,15 @@ def section4_color_chain():
 
 
 # ============================================================================
-# Section 5: Full chain composition test
+# Section 5: Full chain composition test (simplified: no SH, no softplus)
 # ============================================================================
 
 def section5_full_chain():
     print("\n" + "=" * 70)
-    print("SECTION 5: Full chain composition test")
+    print("SECTION 5: Full chain composition test (simplified color model)")
     print("=" * 70)
     print("\nEnd-to-end: single tet, single pixel, full parameter gradients")
-
-    # SH basis functions (degree 0-2 for testing)
-    C0 = 0.28209479177387814
-    C1 = 0.4886025119029199
-    C2_0 = 1.0925484305920792
-    C2_1 = 1.0925484305920792
-    C2_2 = 0.31539156525252005
-    C2_3 = 1.0925484305920792
-    C2_4 = 0.5462742152960396
-
-    def eval_sh_basis(d, degree=2):
-        """Return array of SH basis values at direction d."""
-        x, y, z = d
-        basis = [C0]
-        if degree >= 1:
-            basis += [-C1*y, C1*z, -C1*x]
-        if degree >= 2:
-            basis += [
-                C2_0*x*y, C2_1*y*z,
-                C2_2*(2*z*z - x*x - y*y),
-                C2_3*x*z, C2_4*(x*x - y*y)
-            ]
-        return np.array(basis)
-
-    def eval_sh(d, sh_coeffs, degree=2):
-        """Evaluate SH for 3 channels. sh_coeffs: [n_basis * 3]"""
-        basis = eval_sh_basis(d, degree)
-        n = len(basis)
-        result = np.zeros(3)
-        for c in range(3):
-            result[c] = np.dot(basis, sh_coeffs[c*n:(c+1)*n])
-        return result
-
-    def softplus_np(x):
-        return np.where(x > 8.0, x, 0.1 * np.log(1.0 + np.exp(10.0 * x)))
-
-    def dsoftplus_np(x):
-        return np.where(x > 8.0, 1.0, np.exp(10.0 * x) / (1.0 + np.exp(10.0 * x)))
+    print("  params = [colors(3), density(1), color_grads(3), vertices(12)]")
 
     def cross3(a, b):
         return np.array([
@@ -848,38 +756,18 @@ def section5_full_chain():
     # Face winding: [[0,2,1],[1,2,3],[0,3,2],[3,0,1]]
     FACES = [[0,2,1],[1,2,3],[0,3,2],[3,0,1]]
 
-    def full_forward(params, cam, ray_dir, fixed_sh_dir=None):
+    def full_forward(params, cam, ray_dir):
         """Full forward pass for a single tet and single ray.
 
-        params = [sh_coeffs(n_basis*3), density(1), color_grads(3), vertices(12)]
-        Returns: (C_premultiplied_rgb(3), od(1)) = 4 values
-
-        If fixed_sh_dir is given, uses it instead of computing from centroid.
-        This matches the 'no_diff' treatment of SH direction in the backward pass.
+        params = [colors(3), density(1), color_grads(3), vertices(12)]
+        Returns: (C_premultiplied_rgb(3), alpha(1)) = 4 values
         """
-        sh_degree = 2
-        n_basis = (sh_degree + 1) ** 2  # 9
+        colors = params[0:3]
+        density = params[3]
+        grad = params[4:7]
+        verts = params[7:].reshape(4, 3)
 
-        sh_coeffs = params[0:n_basis*3]       # 27
-        density = params[n_basis*3]            # 1
-        grad = params[n_basis*3+1:n_basis*3+4] # 3
-        verts = params[n_basis*3+4:].reshape(4, 3)  # 12
-
-        # SH evaluation — direction is no_diff (not differentiated through vertices)
-        centroid = np.mean(verts, axis=0)
-        if fixed_sh_dir is not None:
-            sh_dir = fixed_sh_dir
-        else:
-            sh_dir = centroid - cam
-            sh_dir = sh_dir / (np.linalg.norm(sh_dir) + 1e-12)
-        sh_result = eval_sh(sh_dir, sh_coeffs, sh_degree)
-
-        # Softplus
-        offset_val = np.dot(grad, verts[0] - centroid)
-        sp_input = sh_result + 0.5 + offset_val
-        colors = softplus_np(sp_input)
-
-        # Base color and dc/dt
+        # Color chain (simplified: no SH, no softplus)
         base_offset = np.dot(grad, cam - verts[0])
         base_color = colors + base_offset  # scalar broadcast
         dc_dt = np.dot(grad, ray_dir)
@@ -928,30 +816,14 @@ def section5_full_chain():
         alpha = 1.0 - alpha_t
         return np.array([C[0], C[1], C[2], alpha])
 
-    def full_backward(params, cam, ray_dir, dL_dout, fixed_sh_dir=None):
+    def full_backward(params, cam, ray_dir, dL_dout):
         """Full analytical backward. Returns gradient w.r.t. params."""
-        sh_degree = 2
-        n_basis = (sh_degree + 1) ** 2
-
-        sh_coeffs = params[0:n_basis*3]
-        density = params[n_basis*3]
-        grad = params[n_basis*3+1:n_basis*3+4]
-        verts = params[n_basis*3+4:].reshape(4, 3)
+        colors = params[0:3]
+        density = params[3]
+        grad = params[4:7]
+        verts = params[7:].reshape(4, 3)
 
         # -- Forward replay --
-        centroid = np.mean(verts, axis=0)
-        if fixed_sh_dir is not None:
-            sh_dir = fixed_sh_dir
-        else:
-            sh_dir = centroid - cam
-            sh_dir = sh_dir / (np.linalg.norm(sh_dir) + 1e-12)
-        sh_result = eval_sh(sh_dir, sh_coeffs, sh_degree)
-        basis_vals = eval_sh_basis(sh_dir, sh_degree)
-
-        offset_val = np.dot(grad, verts[0] - centroid)
-        sp_input = sh_result + 0.5 + offset_val
-        colors = softplus_np(sp_input)
-
         base_offset = np.dot(grad, cam - verts[0])
         base_color = colors + base_offset
         dc_dt = np.dot(grad, ray_dir)
@@ -959,8 +831,6 @@ def section5_full_chain():
         # Intersection
         t_enters = []
         t_exits = []
-        enter_faces = []
-        exit_faces = []
         for fi, face in enumerate(FACES):
             va = verts[face[0]]
             vb = verts[face[1]]
@@ -1033,7 +903,7 @@ def section5_full_chain():
         d_t_max += np.sum(d_c_end_raw) * dc_dt
 
         # -- Backward through base_color = colors + grad.(cam - v0) --
-        d_colors = d_base_color.copy()
+        d_colors = d_base_color.copy()  # pass-through (leaf param, no softplus)
         d_base_offset_scalar = np.sum(d_base_color)
         d_grad = (cam - verts[0]) * d_base_offset_scalar
         d_v0_from_base = -grad * d_base_offset_scalar
@@ -1041,35 +911,8 @@ def section5_full_chain():
         # -- Backward through dc_dt = grad . ray_dir --
         d_grad = d_grad + ray_dir * d_dc_dt
 
-        # -- Backward through softplus --
-        d_sp_input = d_colors * dsoftplus_np(sp_input)
-
-        # -- Backward through sp_input = sh_result + 0.5 + offset --
-        d_sh_result = d_sp_input.copy()
-        d_offset_scalar = np.sum(d_sp_input)
-
-        # offset = grad . (v0 - centroid)
-        # d_grad from offset
-        d_grad = d_grad + (verts[0] - centroid) * d_offset_scalar
-        # d_v0 from offset: d(grad.(v0 - centroid))/d(v0) = grad * (1 - 1/4) = grad * 3/4
-        d_v0_from_offset = grad * d_offset_scalar * 0.75
-        # d_v{1,2,3} from offset: -grad/4 each
-        d_verts_from_offset = np.zeros((4, 3))
-        d_verts_from_offset[0] = d_v0_from_offset
-        d_verts_from_offset[1] = -grad * d_offset_scalar * 0.25
-        d_verts_from_offset[2] = -grad * d_offset_scalar * 0.25
-        d_verts_from_offset[3] = -grad * d_offset_scalar * 0.25
-
-        # -- Backward through SH evaluation --
-        # dL/d(sh_coeff[k][c]) = d_sh_result[c] * basis_vals[k]
-        d_sh_coeffs = np.zeros(n_basis * 3)
-        for c in range(3):
-            for k in range(n_basis):
-                d_sh_coeffs[c * n_basis + k] = d_sh_result[c] * basis_vals[k]
-
         # -- Backward through intersection (t_min and t_max) --
-        # For the face determining t_min:
-        d_verts_from_intersect = np.zeros((4, 3))
+        d_verts = np.zeros((4, 3))
 
         for t_val, d_t, face_idx in [(t_min, d_t_min, min_face_idx),
                                       (t_max, d_t_max, max_face_idx)]:
@@ -1088,20 +931,19 @@ def section5_full_chain():
             # dt/d(vc) = ((va - hit) x (va - vb)) / den
             dt_dvc = cross3(va - hit, va - vb) / den
 
-            d_verts_from_intersect[face[0]] += d_t * dt_dva
-            d_verts_from_intersect[face[1]] += d_t * dt_dvb
-            d_verts_from_intersect[face[2]] += d_t * dt_dvc
+            d_verts[face[0]] += d_t * dt_dva
+            d_verts[face[1]] += d_t * dt_dvb
+            d_verts[face[2]] += d_t * dt_dvc
 
         # Combine vertex gradients
-        d_verts = d_verts_from_intersect + d_verts_from_offset
         d_verts[0] += d_v0_from_base
 
         # Assemble output
         d_params = np.zeros_like(params)
-        d_params[0:n_basis*3] = d_sh_coeffs
-        d_params[n_basis*3] = d_density
-        d_params[n_basis*3+1:n_basis*3+4] = d_grad
-        d_params[n_basis*3+4:] = d_verts.flatten()
+        d_params[0:3] = d_colors
+        d_params[3] = d_density
+        d_params[4:7] = d_grad
+        d_params[7:] = d_verts.flatten()
 
         return d_params
 
@@ -1165,12 +1007,7 @@ def section5_full_chain():
         v2 = np.array([-1.0, -1.732, -0.5]) + np.random.randn(3) * 0.15
         v3 = np.array([0.0, 0.0, 2.5]) + np.random.randn(3) * 0.15
 
-        sh_degree = 2
-        n_basis = 9
-        sh_coeffs = np.random.rand(n_basis * 3) * 0.2 + 0.2
-        sh_coeffs[0] = 1.5
-        sh_coeffs[n_basis] = 1.5
-        sh_coeffs[2*n_basis] = 1.5
+        colors_v = np.random.rand(3) * 0.5 + 0.5  # positive base colors
         density = np.random.rand() * 0.5 + 0.5
         grad_v = np.random.randn(3) * 0.003  # tiny gradient
 
@@ -1181,27 +1018,21 @@ def section5_full_chain():
             continue
 
         params = np.concatenate([
-            sh_coeffs, [density], grad_v,
+            colors_v, [density], grad_v,
             v0, v1, v2, v3
         ])
 
-        # Pre-compute fixed SH direction so it doesn't change during
-        # finite-difference vertex perturbation (SH dir is no_diff)
-        centroid0 = np.mean(verts_arr, axis=0)
-        sh_dir0 = centroid0 - cam_v
-        sh_dir0 = sh_dir0 / (np.linalg.norm(sh_dir0) + 1e-12)
-
-        out = full_forward(params, cam_v, ray_d, fixed_sh_dir=sh_dir0)
+        out = full_forward(params, cam_v, ray_d)
         if np.all(np.abs(out) < 1e-10):
             continue
 
         upstream = np.random.randn(4)
 
-        def fwd_wrapper(p, _sh=sh_dir0, _cam=cam_v, _rd=ray_d):
-            return full_forward(p, _cam, _rd, fixed_sh_dir=_sh)
+        def fwd_wrapper(p, _cam=cam_v, _rd=ray_d):
+            return full_forward(p, _cam, _rd)
 
-        def bwd_wrapper(p, up, _sh=sh_dir0, _cam=cam_v, _rd=ray_d):
-            return full_backward(p, _cam, _rd, up, fixed_sh_dir=_sh)
+        def bwd_wrapper(p, up, _cam=cam_v, _rd=ray_d):
+            return full_backward(p, _cam, _rd, up)
 
         ok = finite_diff_check(
             fwd_wrapper, bwd_wrapper,

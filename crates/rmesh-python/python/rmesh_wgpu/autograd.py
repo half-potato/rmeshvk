@@ -55,22 +55,6 @@ class RMeshForward(torch.autograd.Function):
         d_densities = torch.from_numpy(grads["d_densities"].copy()).to(device)
         d_color_grads = torch.from_numpy(grads["d_color_grads"].copy()).to(device)
 
-        # Diagnostic: log raw VK gradient magnitudes
-        if hasattr(RMeshForward, '_log_counter'):
-            RMeshForward._log_counter += 1
-        else:
-            RMeshForward._log_counter = 0
-        if RMeshForward._log_counter % 50 == 0:
-            nz_bc = d_base_colors[d_base_colors.abs() > 0]
-            nz_dn = d_densities[d_densities.abs() > 0]
-            nz_cg = d_color_grads[d_color_grads.abs() > 0]
-            nz_vt = d_vertices[d_vertices.abs() > 0]
-            print(f"  [VK grads] d_base_colors: std={d_base_colors.std():.6f} max={d_base_colors.abs().max():.6f} nnz={nz_bc.numel()}/{d_base_colors.numel()}")
-            print(f"  [VK grads] d_densities:   std={d_densities.std():.6f} max={d_densities.abs().max():.6f} nnz={nz_dn.numel()}/{d_densities.numel()}")
-            print(f"  [VK grads] d_color_grads: std={d_color_grads.std():.6f} max={d_color_grads.abs().max():.6f} nnz={nz_cg.numel()}/{d_color_grads.numel()}")
-            print(f"  [VK grads] d_vertices:    std={d_vertices.std():.6f} max={d_vertices.abs().max():.6f} nnz={nz_vt.numel()}/{d_vertices.numel()}")
-            print(f"  [VK grads] dl_d_image:    std={grad_output.std():.6f} max={grad_output.abs().max():.6f}")
-
         return (
             None,  # renderer
             None,  # cam_pos

@@ -3,14 +3,14 @@
 //! Implements the same math as the WGSL shaders (forward_compute, forward_vertex,
 //! forward_fragment) in pure Rust with glam. No GPU required.
 
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 use glam::{Mat4, Vec3, Vec4};
 pub use rand::Rng;
 pub use rmesh_data::SceneData;
 
 // Re-export shared camera utilities from rmesh-util
-pub use rmesh_util::camera::{perspective_matrix, look_at, softplus, TET_FACES};
+pub use rmesh_util::camera::{perspective_matrix, look_at, TET_FACES};
 
 // Re-export test utilities from rmesh-util
 pub use rmesh_util::test_util::{build_test_scene, random_single_tet_scene};
@@ -28,28 +28,19 @@ fn phi(x: f32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// CPU compute pass: color eval + color gradient + softplus
+// CPU compute pass: color eval (raw base colors, no activation)
 // ---------------------------------------------------------------------------
 
 /// Evaluate per-tet color (matches forward_compute.wgsl).
 /// Base color is 0.5 (constant bias from the shader).
-fn compute_tet_color(scene: &SceneData, tet_id: usize, _cam_pos: Vec3) -> Vec3 {
-    let verts = load_tet_verts(scene, tet_id);
-    let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
-
+/// No activation — raw base colors are passed through, matching the GPU path.
+/// Per-pixel ReLU clamping (max(0)) is applied later in render_tet_pixel.
+fn compute_tet_color(_scene: &SceneData, _tet_id: usize, _cam_pos: Vec3) -> Vec3 {
     let result_color = Vec3::splat(0.5);
 
-    // Color gradient offset
-    let grad = load_color_grad(scene, tet_id);
-    let offset = grad.dot(verts[0] - centroid);
-    let input_val = result_color + Vec3::splat(offset);
-
-    // Softplus activation
-    Vec3::new(
-        softplus(input_val.x),
-        softplus(input_val.y),
-        softplus(input_val.z),
-    )
+    // In the GPU path, base_colors_buf is passed through directly.
+    // The test uses 0.5 as the base color.
+    result_color
 }
 
 // ---------------------------------------------------------------------------
@@ -76,7 +67,12 @@ fn render_tet_pixel(
         let va = verts[face[0]];
         let vb = verts[face[1]];
         let vc = verts[face[2]];
-        let n = (vc - va).cross(vb - va);
+        let v_opp = verts[face[3]];
+        let mut n = (vc - va).cross(vb - va);
+        // Flip normal to point inward (toward opposite vertex)
+        if n.dot(v_opp - va) < 0.0 {
+            n = -n;
+        }
         numerators[fi] = n.dot(va - cam_pos);
         denominators[fi] = n.dot(raw_ray_dir);
     }
@@ -616,9 +612,231 @@ async fn gpu_raytrace_scene_async(
 }
 
 // ---------------------------------------------------------------------------
+// GPU tiled forward pipeline runner (headless)
+// ---------------------------------------------------------------------------
+
+/// Run the GPU tiled forward pipeline and read back the color image.
+/// Returns None if no GPU adapter is available.
+///
+/// This uses the scan-based tile pipeline (same as the Python/training path):
+///   forward_compute → scan tile pipeline → radix_sort → tile_ranges → forward_tiled
+pub fn gpu_tiled_render_scene(
+    scene: &SceneData,
+    cam_pos: Vec3,
+    vp: Mat4,
+    inv_vp: Mat4,
+    w: u32,
+    h: u32,
+) -> Option<Vec<[f32; 4]>> {
+    pollster::block_on(gpu_tiled_render_scene_async(scene, cam_pos, vp, inv_vp, w, h))
+}
+
+async fn gpu_tiled_render_scene_async(
+    scene: &SceneData,
+    cam_pos: Vec3,
+    vp: Mat4,
+    inv_vp: Mat4,
+    w: u32,
+    h: u32,
+) -> Option<Vec<[f32; 4]>> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .ok()?;
+
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::SUBGROUP,
+                required_limits: wgpu::Limits {
+                    max_storage_buffers_per_shader_stage: 16,
+                    max_storage_buffer_binding_size: 1 << 30,
+                    max_buffer_size: 1 << 30,
+                    ..wgpu::Limits::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()?;
+
+    // Must be 16 to match forward_compute.wgsl (hardcoded tile_size=16.0)
+    // and forward_tiled_compute.wgsl (hardcoded 16×16 pixel tiles).
+    let tile_size = 16u32;
+
+    // Forward compute setup
+    let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
+    let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
+        rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
+
+    let uniforms = rmesh_render::make_uniforms(
+        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, 0u32,
+    );
+    queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+
+    // Run forward compute
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    rmesh_render::record_forward_compute(
+        &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // Tile pipeline setup
+    let tile_pipelines = rmesh_tile::TilePipelines::new(&device);
+    let radix_pipelines = rmesh_sort::RadixSortPipelines::new(&device);
+    let tile_buffers = rmesh_tile::TileBuffers::new(&device, scene.tet_count, w, h, tile_size);
+    let radix_state = rmesh_sort::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, 32);
+    radix_state.upload_configs(&queue);
+
+    let scan_pipelines = rmesh_tile::ScanPipelines::new(&device);
+    let scan_buffers = rmesh_tile::ScanBuffers::new(&device, scene.tet_count);
+
+    let tile_uni = rmesh_util::shared::TileUniforms {
+        screen_width: w,
+        screen_height: h,
+        tile_size,
+        tiles_x: tile_buffers.tiles_x,
+        tiles_y: tile_buffers.tiles_y,
+        num_tiles: tile_buffers.num_tiles,
+        visible_tet_count: 0,
+        _pad: [0; 5],
+    };
+    queue.write_buffer(&tile_buffers.tile_uniforms, 0, bytemuck::bytes_of(&tile_uni));
+
+    // Create bind groups
+    let prepare_dispatch_bg = rmesh_tile::create_prepare_dispatch_bind_group(
+        &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
+    );
+    let rts_bg = rmesh_tile::create_rts_bind_group(
+        &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
+    );
+    let tile_fill_bg = rmesh_tile::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
+    let tile_gen_scan_bg = rmesh_tile::create_tile_gen_scan_bind_group(
+        &device, &scan_pipelines, &tile_buffers,
+        &buffers.uniforms, &buffers.vertices, &buffers.indices,
+        &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
+        &scan_buffers, &radix_state.num_keys_buf,
+    );
+
+    let tile_ranges_bg_a = rmesh_tile::create_tile_ranges_bind_group_with_keys(
+        &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+    );
+    let tile_ranges_bg_b = rmesh_tile::create_tile_ranges_bind_group_with_keys(
+        &device, &tile_pipelines, &radix_state.keys_b,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+    );
+
+    // Forward tiled pipeline
+    let fwd_tiled = rmesh_render::ForwardTiledPipeline::new(&device, w, h);
+    let fwd_tiled_bg_a = rmesh_render::create_forward_tiled_bind_group(
+        &device, &fwd_tiled, &buffers.uniforms,
+        &buffers.vertices, &buffers.indices, &material.colors,
+        &buffers.densities, &material.color_grads,
+        &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+    );
+    let fwd_tiled_bg_b = rmesh_render::create_forward_tiled_bind_group(
+        &device, &fwd_tiled, &buffers.uniforms,
+        &buffers.vertices, &buffers.indices, &material.colors,
+        &buffers.densities, &material.color_grads,
+        &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+    );
+
+    // Dispatch tiled forward pipeline
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    encoder.clear_buffer(&fwd_tiled.rendered_image, 0, None);
+    encoder.clear_buffer(&tile_buffers.tile_ranges, 0, None);
+
+    // 1. Scan-based tile pipeline
+    rmesh_tile::record_scan_tile_pipeline(
+        &mut encoder, &scan_pipelines, &tile_pipelines,
+        &prepare_dispatch_bg, &rts_bg,
+        &tile_fill_bg, &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
+    );
+
+    // 2. Radix sort
+    let result_in_b = rmesh_sort::record_radix_sort(
+        &mut encoder, &device, &radix_pipelines, &radix_state,
+        &tile_buffers.tile_sort_keys, &tile_buffers.tile_sort_values,
+    );
+
+    // 3. Tile ranges
+    {
+        let ranges_bg = if result_in_b { &tile_ranges_bg_b } else { &tile_ranges_bg_a };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tile_ranges"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&tile_pipelines.tile_ranges_pipeline);
+        pass.set_bind_group(0, ranges_bg, &[]);
+        let wgs = (tile_buffers.max_pairs_pow2 + 255) / 256;
+        pass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
+    }
+
+    // 4. Forward tiled
+    {
+        let fwd_bg = if result_in_b { &fwd_tiled_bg_b } else { &fwd_tiled_bg_a };
+        rmesh_render::record_forward_tiled(&mut encoder, &fwd_tiled, fwd_bg, tile_buffers.num_tiles);
+    }
+
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // Read back rendered image
+    let pixel_count = (w * h) as usize;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: (pixel_count as u64) * 4 * 4,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    encoder.copy_buffer_to_buffer(&fwd_tiled.rendered_image, 0, &readback, 0, readback.size());
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let slice = readback.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap();
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    receiver.recv().unwrap().ok()?;
+
+    let data = slice.get_mapped_range();
+    let floats: &[f32] = bytemuck::cast_slice(&data);
+    let mut image = vec![[0.0f32; 4]; pixel_count];
+    for i in 0..pixel_count {
+        image[i] = [floats[i * 4], floats[i * 4 + 1], floats[i * 4 + 2], floats[i * 4 + 3]];
+    }
+    drop(data);
+    readback.unmap();
+
+    Some(image)
+}
+
+// ---------------------------------------------------------------------------
 // Test scene builders
 // ---------------------------------------------------------------------------
 
+/// Build a deterministic single-tet scene with known geometry.
+/// Regular tet with vertices at (±0.5, ±0.5, ±0.5), density=3.0, zero color_grads.
+/// This produces analytically predictable output.
+pub fn known_single_tet_scene() -> SceneData {
+    let vertices = vec![
+        0.5, 0.5, 0.5,    // v0
+        -0.5, -0.5, 0.5,  // v1
+        -0.5, 0.5, -0.5,  // v2
+        0.5, -0.5, -0.5,  // v3
+    ];
+    let indices = vec![0u32, 1, 2, 3];
+    let densities = vec![3.0f32];
+    let color_grads = vec![0.0f32; 3];
+    build_test_scene(vertices, indices, densities, color_grads)
+}
 
 /// Comparison helper: check if two images match within tolerance.
 /// Returns (max_abs_diff, mean_abs_diff, num_pixels_compared).

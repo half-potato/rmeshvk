@@ -56,12 +56,12 @@ struct TileUniforms {
 @group(0) @binding(8) var<storage, read> tile_uniforms: TileUniforms;
 @group(0) @binding(9) var<storage, read_write> rendered_image: array<f32>;
 
-// Face winding (inward normals)
-const FACES: array<vec3<u32>, 4> = array<vec3<u32>, 4>(
-    vec3<u32>(0u, 2u, 1u),
-    vec3<u32>(1u, 2u, 3u),
-    vec3<u32>(0u, 3u, 2u),
-    vec3<u32>(3u, 0u, 1u),
+// Face (a, b, c, opposite_vertex) — opposite used to flip normal inward
+const FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
+    vec4<u32>(0u, 2u, 1u, 3u),
+    vec4<u32>(1u, 2u, 3u, 0u),
+    vec4<u32>(0u, 3u, 2u, 1u),
+    vec4<u32>(3u, 0u, 1u, 2u),
 );
 
 // Workgroup shared memory
@@ -214,6 +214,18 @@ fn main(
                         xl_f = min(xl_f, x); xr_f = max(xr_f, x);
                     }
                 }
+
+                // Include vertices within this pixel row. Without this,
+                // the top/bottom apex of the projected tet drops an entire
+                // row because the half-open edge test misses all edges
+                // emanating from a vertex exactly at yc.
+                for (var v = 0u; v < 4u; v++) {
+                    let vy = proj[v].y;
+                    if (vy >= yc - 0.5 && vy < yc + 0.5) {
+                        xl_f = min(xl_f, proj[v].x);
+                        xr_f = max(xr_f, proj[v].x);
+                    }
+                }
             }
 
             // Convert float range to integer pixel range within [0, 15]
@@ -296,7 +308,12 @@ fn main(
                 let va = verts[f[0]];
                 let vb = verts[f[1]];
                 let vc = verts[f[2]];
-                let n = cross(vc - va, vb - va);
+                var n = cross(vc - va, vb - va);
+                // Flip normal to point inward (toward opposite vertex)
+                let v_opp = verts[f[3]];
+                if (dot(n, v_opp - va) < 0.0) {
+                    n = -n;
+                }
                 let num = dot(n, va - cam);
                 let den = dot(n, ray_dir);
 

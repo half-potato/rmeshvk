@@ -41,12 +41,12 @@ struct Uniforms {
 
 const TINY_VAL: f32 = 1e-20;
 
-// Face winding
-const FACES: array<vec3<u32>, 4> = array<vec3<u32>, 4>(
-    vec3<u32>(0u, 2u, 1u),
-    vec3<u32>(1u, 2u, 3u),
-    vec3<u32>(0u, 3u, 2u),
-    vec3<u32>(3u, 0u, 1u),
+// Face (a, b, c, opposite_vertex) — opposite used to flip normal inward
+const FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
+    vec4<u32>(0u, 2u, 1u, 3u),
+    vec4<u32>(1u, 2u, 3u, 0u),
+    vec4<u32>(0u, 3u, 2u, 1u),
+    vec4<u32>(3u, 0u, 1u, 2u),
 );
 
 fn phi(x: f32) -> f32 {
@@ -112,7 +112,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         dl_d_image[pixel_idx * 4u + 1u],
         dl_d_image[pixel_idx * 4u + 2u],
     );
-    var d_log_t = dl_d_image[pixel_idx * 4u + 3u];
+    var d_log_t = -dl_d_image[pixel_idx * 4u + 3u] * (1.0 - final_a);
 
     // 3. Compute ray from pixel coordinates via inverse VP
     let ndc_x = (2.0 * (f32(px) + 0.5) / uniforms.screen_width) - 1.0;
@@ -162,7 +162,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let va = verts[f[0]];
             let vb = verts[f[1]];
             let vc = verts[f[2]];
-            let n = cross(vc - va, vb - va);
+            var n = cross(vc - va, vb - va);
+            // Flip normal to point inward (toward opposite vertex)
+            let v_opp = verts[f[3]];
+            if (dot(n, v_opp - va) < 0.0) {
+                n = -n;
+            }
 
             let num = dot(n, va - cam);
             let den = dot(n, ray_dir);
@@ -256,27 +261,14 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // dc_dt = grad . ray_dir
         d_grad += ray_dir * d_dc_dt;
 
-        // 4i. Backward: softplus
-        let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
-
-        let offset_val = dot(grad, verts[0] - centroid);
-        let sp_input = vec3<f32>(0.5 + offset_val);
-
-        let d_sp_input = vec3<f32>(
-            d_base_color.x * dsoftplus(sp_input.x),
-            d_base_color.y * dsoftplus(sp_input.y),
-            d_base_color.z * dsoftplus(sp_input.z),
-        );
-
-        // 4j. sp_input = 0.5 + offset
-        let d_offset_scalar = d_sp_input.x + d_sp_input.y + d_sp_input.z;
-
-        d_grad += (verts[0] - centroid) * d_offset_scalar;
-        let d_v0_from_offset = grad * d_offset_scalar * 0.75;
-        let d_vother_from_offset = -grad * d_offset_scalar * 0.25;
-
-        // 4l. Intersection gradients (dt/d(vertices))
+        // 4i. Intersection gradients (dt/d(vertices))
+        // NOTE: explicit zero-init required — WGSL var inside a loop may not
+        // be re-zero-initialized on each iteration in some runtimes (naga/wgpu).
         var d_vert_i: array<vec3<f32>, 4>;
+        d_vert_i[0] = vec3<f32>(0.0);
+        d_vert_i[1] = vec3<f32>(0.0);
+        d_vert_i[2] = vec3<f32>(0.0);
+        d_vert_i[3] = vec3<f32>(0.0);
 
         // t_min face
         {
@@ -312,11 +304,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             d_vert_i[f[2]] += dt_dvc * d_t_max;
         }
 
-        // 4m. Combine vertex gradients and scatter
-        d_vert_i[0] += d_v0_from_base + d_v0_from_offset;
-        d_vert_i[1] += d_vother_from_offset;
-        d_vert_i[2] += d_vother_from_offset;
-        d_vert_i[3] += d_vother_from_offset;
+        // 4j. Combine vertex gradients and scatter
+        d_vert_i[0] += d_v0_from_base;
 
         let vert_indices = array<u32, 4>(ti0, ti1, ti2, ti3);
         for (var vi = 0u; vi < 4u; vi++) {

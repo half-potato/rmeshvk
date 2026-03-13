@@ -47,8 +47,8 @@ def make_single_tet_scene(seed=42):
     else:
         indices = np.array([0, 1, 2, 3], dtype=np.uint32)
 
-    # SH degree 0: 1 coefficient per color channel = 3 total
-    sh_coeffs = (rng.rand(3).astype(np.float32) * 2.0 - 1.0)
+    # Base colors: 3 values (one per channel)
+    base_colors = (rng.rand(3).astype(np.float32) * 2.0 - 1.0)
     densities = np.array([rng.rand() * 5.0 + 0.5], dtype=np.float32)
     color_grads = ((rng.rand(3).astype(np.float32) - 0.5) * 0.2)
 
@@ -59,7 +59,7 @@ def make_single_tet_scene(seed=42):
     return {
         "vertices": verts.ravel(),
         "indices": indices,
-        "sh_coeffs": sh_coeffs,
+        "base_colors": base_colors,
         "densities": densities,
         "color_grads": color_grads,
         "circumdata": circumdata,
@@ -137,11 +137,10 @@ def test_autograd_finite_diff():
     renderer = RMeshRenderer(
         scene["vertices"],
         scene["indices"],
-        scene["sh_coeffs"],
+        scene["base_colors"],
         scene["densities"],
         scene["color_grads"],
         scene["circumdata"],
-        0,  # sh_degree
         W, H,
     )
 
@@ -150,7 +149,7 @@ def test_autograd_finite_diff():
     vp = torch.tensor(vp_np, dtype=torch.float32)
     inv_vp = torch.tensor(inv_vp_np, dtype=torch.float32)
     vertices = torch.tensor(scene["vertices"], dtype=torch.float32, requires_grad=True)
-    sh_coeffs = torch.tensor(scene["sh_coeffs"], dtype=torch.float32, requires_grad=True)
+    base_colors = torch.tensor(scene["base_colors"], dtype=torch.float32, requires_grad=True)
     densities = torch.tensor(scene["densities"], dtype=torch.float32, requires_grad=True)
     color_grads = torch.tensor(scene["color_grads"], dtype=torch.float32, requires_grad=True)
 
@@ -158,7 +157,7 @@ def test_autograd_finite_diff():
     gt_image = np.zeros((H, W, 3), dtype=np.float32)
 
     # --- Analytical gradients via autograd ---
-    image = RMeshForward.apply(renderer, cam_pos, vp, inv_vp, vertices, sh_coeffs, densities, color_grads)
+    image = RMeshForward.apply(renderer, cam_pos, vp, inv_vp, vertices, base_colors, densities, color_grads)
     # L2 loss on RGB channels only
     image_rgb = image[:, :, :3]
     gt_tensor = torch.tensor(gt_image, dtype=torch.float32)
@@ -166,7 +165,7 @@ def test_autograd_finite_diff():
     loss.backward()
 
     analytical_grads = {
-        "sh_coeffs": sh_coeffs.grad.numpy().copy(),
+        "base_colors": base_colors.grad.numpy().copy(),
         "densities": densities.grad.numpy().copy(),
         "color_grads": color_grads.grad.numpy().copy(),
         "vertices": vertices.grad.numpy().copy(),
@@ -179,7 +178,7 @@ def test_autograd_finite_diff():
     # --- Numerical gradients via finite differences ---
     eps = 1e-3
     param_groups = [
-        ("sh_coeffs", scene["sh_coeffs"].copy()),
+        ("base_colors", scene["base_colors"].copy()),
         ("densities", scene["densities"].copy()),
         ("color_grads", scene["color_grads"].copy()),
         ("vertices", scene["vertices"].copy()),
@@ -197,7 +196,7 @@ def test_autograd_finite_diff():
             params_plus[i] += eps
             renderer.update_params(
                 scene["vertices"] if group_name != "vertices" else params_plus,
-                scene["sh_coeffs"] if group_name != "sh_coeffs" else params_plus,
+                scene["base_colors"] if group_name != "base_colors" else params_plus,
                 scene["densities"] if group_name != "densities" else params_plus,
                 scene["color_grads"] if group_name != "color_grads" else params_plus,
             )
@@ -208,7 +207,7 @@ def test_autograd_finite_diff():
             params_minus[i] -= eps
             renderer.update_params(
                 scene["vertices"] if group_name != "vertices" else params_minus,
-                scene["sh_coeffs"] if group_name != "sh_coeffs" else params_minus,
+                scene["base_colors"] if group_name != "base_colors" else params_minus,
                 scene["densities"] if group_name != "densities" else params_minus,
                 scene["color_grads"] if group_name != "color_grads" else params_minus,
             )
@@ -218,7 +217,7 @@ def test_autograd_finite_diff():
 
         # Restore original params
         renderer.update_params(
-            scene["vertices"], scene["sh_coeffs"],
+            scene["vertices"], scene["base_colors"],
             scene["densities"], scene["color_grads"],
         )
 

@@ -4,8 +4,9 @@
 
 use glam::{Mat4, Vec3, Vec4};
 
-/// Tet face winding (matches WGSL shaders: forward_tiled, backward_tiled).
-pub const TET_FACES: [[usize; 3]; 4] = [[0, 2, 1], [1, 2, 3], [0, 3, 2], [3, 0, 1]];
+/// Tet face winding: (a, b, c, opposite_vertex).
+/// Matches WGSL FACES constant in forward_tiled, backward_tiled, etc.
+pub const TET_FACES: [[usize; 4]; 4] = [[0, 2, 1, 3], [1, 2, 3, 0], [0, 3, 2, 1], [3, 0, 1, 2]];
 
 /// Perspective projection matrix. wgpu depth [0,1], LH clip space.
 pub fn perspective_matrix(fov_y_rad: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
@@ -82,7 +83,12 @@ pub fn ray_tet_intersect(origin: Vec3, dir: Vec3, verts: &[Vec3; 4]) -> Option<(
         let va = verts[face[0]];
         let vb = verts[face[1]];
         let vc = verts[face[2]];
-        let n = (vc - va).cross(vb - va);
+        let v_opp = verts[face[3]];
+        let mut n = (vc - va).cross(vb - va);
+        // Flip normal to point inward (toward opposite vertex)
+        if n.dot(v_opp - va) < 0.0 {
+            n = -n;
+        }
         let num = n.dot(va - origin);
         let den = n.dot(dir) / d;
 

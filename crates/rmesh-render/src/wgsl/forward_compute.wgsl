@@ -217,9 +217,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     }
 
     // --- 4. Color evaluation ---
-    // Write raw pre-softplus base colors to colors_buf.
-    // Softplus is applied per-pixel in forward_tiled_compute.wgsl to match
-    // the Slang renderer's per-pixel activation model.
+    // Pass through raw base colors to colors_buf.
+    // The tiled shader applies per-pixel ReLU clamping (max(0)) after
+    // adding the view-dependent gradient offset.
     colors[tet_id * 3u] = base_colors_buf[tet_id * 3u];
     colors[tet_id * 3u + 1u] = base_colors_buf[tet_id * 3u + 1u];
     colors[tet_id * 3u + 2u] = base_colors_buf[tet_id * 3u + 2u];

@@ -3,6 +3,8 @@
 //! Verifies that the CPU reference renderer produces sensible gradients
 //! (finite difference check). When a GPU backward pass is available,
 //! this also compares GPU gradients against finite differences.
+//!
+//! Run: `cargo test -p rmesh-render --test gradient_test -- --nocapture`
 
 mod common;
 

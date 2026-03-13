@@ -93,13 +93,17 @@ pub struct TileBuffers {
 impl TileBuffers {
     /// Allocate tile buffers.
     ///
-    /// Sort buffer size is `next_power_of_two(tet_count * 16)` (at least `num_tiles`).
+    /// Sort buffer size is `next_power_of_two(tet_count * num_tiles)` (each tet can
+    /// touch every tile in the worst case), capped to avoid excessive allocation.
     pub fn new(device: &wgpu::Device, tet_count: u32, width: u32, height: u32, tile_size: u32) -> Self {
         let tiles_x = (width + tile_size - 1) / tile_size;
         let tiles_y = (height + tile_size - 1) / tile_size;
         let num_tiles = tiles_x * tiles_y;
 
-        let max_pairs_pow2 = ((tet_count * 4).max(num_tiles) as u64).next_power_of_two() as u32;
+        // Each tet can touch up to num_tiles tiles. Use tet_count * num_tiles as the
+        // upper bound, but cap per-tet estimate at 256 to avoid huge allocations.
+        let tiles_per_tet = (num_tiles as u64).min(256);
+        let max_pairs_pow2 = ((tet_count as u64 * tiles_per_tet).max(num_tiles as u64)).next_power_of_two() as u32;
 
         let tile_sort_keys = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tile_sort_keys"),

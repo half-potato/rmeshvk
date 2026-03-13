@@ -8,6 +8,8 @@
 //!
 //! Each test creates a GPU device with SUBGROUP feature, dispatches a single
 //! kernel, reads back the result, and validates correctness.
+//!
+//! Run: `cargo test -p rmesh-render --test kernel_tests -- --nocapture`
 
 mod common;
 

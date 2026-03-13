@@ -19,3 +19,5 @@ rand_chacha = "0.9"
 pollster = { workspace = true }
 half = { workspace = true }
 rmesh-util = { path = "../rmesh-util", features = ["test-util"] }
+rmesh-sort = { path = "../rmesh-sort" }
+rmesh-tile = { path = "../rmesh-tile" }

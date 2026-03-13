@@ -39,12 +39,12 @@ struct VertexOutput {
 @group(0) @binding(5) var<storage, read> color_grads: array<f32>;
 @group(0) @binding(6) var<storage, read> sorted_indices: array<u32>;
 
-// Face winding: 4 faces × 3 vertex indices each
-const TET_FACES: array<vec3<u32>, 4> = array<vec3<u32>, 4>(
-    vec3<u32>(0u, 2u, 1u),
-    vec3<u32>(1u, 2u, 3u),
-    vec3<u32>(0u, 3u, 2u),
-    vec3<u32>(3u, 0u, 1u),
+// Face (a, b, c, opposite_vertex) — opposite used to flip normal inward
+const TET_FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
+    vec4<u32>(0u, 2u, 1u, 3u),
+    vec4<u32>(1u, 2u, 3u, 0u),
+    vec4<u32>(0u, 3u, 2u, 1u),
+    vec4<u32>(3u, 0u, 1u, 2u),
 );
 
 // 12 entries: face index for each of the 12 vertices (4 faces × 3 verts)
@@ -121,7 +121,12 @@ fn main(@builtin(instance_index) instance_idx: u32, @builtin(vertex_index) vert_
         let va = verts[f[0]];
         let vb = verts[f[1]];
         let vc = verts[f[2]];
-        let n = cross(vc - va, vb - va);
+        var n = cross(vc - va, vb - va);
+        // Flip normal to point inward (toward opposite vertex)
+        let v_opp = verts[f[3]];
+        if (dot(n, v_opp - va) < 0.0) {
+            n = -n;
+        }
 
         numerators[i] = dot(n, va - cam);
         denominators[i] = dot(n, ray_dir);
