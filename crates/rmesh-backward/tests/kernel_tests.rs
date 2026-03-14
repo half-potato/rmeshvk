@@ -1453,20 +1453,26 @@ fn test_single_tet_loss_decreases() {
 
         queue.submit(std::iter::once(encoder.finish()));
 
-        // Read back loss
-        let loss_val: Vec<f32> = read_buffer(&device, &queue, &loss_buffers.loss_value, 1);
-        losses.push(loss_val[0]);
+        // Compute loss on CPU from rendered image (loss_value buffer no longer populated by shader)
+        let rendered: Vec<f32> = read_buffer(&device, &queue, &fwd_tiled.rendered_image, n_pixels * 4);
+        let cpu_loss: f32 = rendered.chunks(4).zip(gt_data.chunks(3)).map(|(r, g)| {
+            let dr = r[0] - g[0];
+            let dg = r[1] - g[1];
+            let db = r[2] - g[2];
+            (dr * dr + dg * dg + db * db) / n_pixels as f32
+        }).sum();
+        losses.push(cpu_loss);
 
         if step == 1 {
             // Read gradients and params on first step for diagnostics
             let d_dens: Vec<f32> = read_buffer(&device, &queue, &grad_buffers.d_densities, scene.tet_count as usize);
             let d_cg: Vec<f32> = read_buffer(&device, &queue, &mat_grad_buffers.d_color_grads, (scene.tet_count * 3) as usize);
             let dens_vals: Vec<f32> = read_buffer(&device, &queue, &buffers.densities, scene.tet_count as usize);
-            eprintln!("  step {step}: loss = {:.8}", loss_val[0]);
+            eprintln!("  step {step}: loss = {cpu_loss:.8}");
             eprintln!("  gradients: d_dens={d_dens:?}, d_cg={d_cg:?}");
             eprintln!("  params after Adam: dens={dens_vals:?}");
         } else if step % 50 == 0 {
-            eprintln!("  step {step}: loss = {:.8}", loss_val[0]);
+            eprintln!("  step {step}: loss = {cpu_loss:.8}");
         }
     }
 

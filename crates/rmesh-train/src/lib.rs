@@ -117,7 +117,6 @@ impl LossPipeline {
                     storage_entry(1, true),  // rendered
                     storage_entry(2, true),  // ground_truth
                     storage_entry(3, false), // dl_d_image
-                    storage_entry(4, false), // loss_value
                 ],
             });
 
@@ -168,10 +167,6 @@ pub fn create_loss_bind_group(
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: loss_buffers.dl_d_image.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: loss_buffers.loss_value.as_entire_binding(),
             },
         ],
     })

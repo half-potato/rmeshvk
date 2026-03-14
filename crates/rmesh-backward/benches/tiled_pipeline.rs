@@ -722,6 +722,152 @@ fn bench_forward(c: &mut Criterion) {
     print_forward_timestamp_breakdown(&state);
 }
 
+/// Run a single backward pass with GPU timestamps on each pass.
+fn print_backward_timestamp_breakdown(s: &BenchState) {
+    let mut ts = TimestampRecorder::new(&s.device, &s.queue, 20);
+
+    let mut encoder = s
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+    // Forward compute (no timestamp — creates its own passes)
+    rmesh_render::record_forward_compute(
+        &mut encoder,
+        &s.fwd_pipelines,
+        &s.buffers,
+        &s.compute_bg,
+        s.tet_count,
+        &s.queue,
+    );
+
+    // Clears
+    encoder.clear_buffer(&s.fwd_tiled.rendered_image, 0, None);
+    encoder.clear_buffer(&s.tile_buffers.tile_ranges, 0, None);
+    encoder.clear_buffer(&s.grad_buffers.d_vertices, 0, None);
+    encoder.clear_buffer(&s.grad_buffers.d_densities, 0, None);
+    encoder.clear_buffer(&s.mat_grad_buffers.d_color_grads, 0, None);
+    encoder.clear_buffer(&s.mat_grad_buffers.d_base_colors, 0, None);
+    encoder.clear_buffer(&s.loss_buffers.loss_value, 0, None);
+
+    // Scan tile pipeline (record without timestamps — it's fast)
+    rmesh_backward::record_scan_tile_pipeline(
+        &mut encoder,
+        &s.scan_pipelines,
+        &s.tile_pipelines,
+        &s.prepare_dispatch_bg,
+        &s.rts_bg,
+        &s.tile_fill_bg,
+        &s.tile_gen_scan_bg,
+        &s.scan_buffers,
+        &s.tile_buffers,
+    );
+
+    // Radix sort
+    let result_in_b = rmesh_backward::record_radix_sort(
+        &mut encoder,
+        &s.device,
+        &s.radix_pipelines,
+        &s.radix_state,
+        &s.tile_buffers.tile_sort_keys,
+        &s.tile_buffers.tile_sort_values,
+    );
+
+    // Tile ranges
+    {
+        let ranges_bg = if result_in_b {
+            &s.tile_ranges_bg_b
+        } else {
+            &s.tile_ranges_bg_a
+        };
+        let (b, e) = ts.allocate("tile_ranges");
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tile_ranges"),
+            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                query_set: ts.query_set(),
+                beginning_of_pass_write_index: Some(b),
+                end_of_pass_write_index: Some(e),
+            }),
+        });
+        pass.set_pipeline(&s.tile_pipelines.tile_ranges_pipeline);
+        pass.set_bind_group(0, ranges_bg, &[]);
+        let wgs = (s.tile_buffers.max_pairs_pow2 + 255) / 256;
+        pass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
+    }
+
+    // Forward tiled
+    {
+        let fwd_bg = if result_in_b {
+            &s.fwd_tiled_bg_b
+        } else {
+            &s.fwd_tiled_bg_a
+        };
+        let (b, e) = ts.allocate("forward_tiled");
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("forward_tiled"),
+            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                query_set: ts.query_set(),
+                beginning_of_pass_write_index: Some(b),
+                end_of_pass_write_index: Some(e),
+            }),
+        });
+        pass.set_pipeline(s.fwd_tiled.pipeline());
+        pass.set_bind_group(0, fwd_bg, &[]);
+        let (x, y) = rmesh_tile::dispatch_2d(s.tile_buffers.num_tiles);
+        pass.dispatch_workgroups(x, y, 1);
+    }
+
+    // Loss
+    {
+        let (b, e) = ts.allocate("loss");
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("loss"),
+            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                query_set: ts.query_set(),
+                beginning_of_pass_write_index: Some(b),
+                end_of_pass_write_index: Some(e),
+            }),
+        });
+        pass.set_pipeline(&s.loss_pipeline.pipeline);
+        pass.set_bind_group(0, &s.loss_bg, &[]);
+        pass.dispatch_workgroups((W + 15) / 16, (H + 15) / 16, 1);
+    }
+
+    // Backward tiled
+    {
+        let bwd_bg0 = if result_in_b {
+            &s.bwd_bg0_b
+        } else {
+            &s.bwd_bg0_a
+        };
+        let (b, e) = ts.allocate("backward_tiled");
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("backward_tiled"),
+            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                query_set: ts.query_set(),
+                beginning_of_pass_write_index: Some(b),
+                end_of_pass_write_index: Some(e),
+            }),
+        });
+        pass.set_pipeline(&s.bwd_tiled_pipelines.pipeline);
+        pass.set_bind_group(0, bwd_bg0, &[]);
+        pass.set_bind_group(1, &s.bwd_bg1, &[]);
+        let num_tiles = s.tile_buffers.num_tiles;
+        pass.dispatch_workgroups(
+            num_tiles.min(65535),
+            ((num_tiles + 65534) / 65535).max(1),
+            1,
+        );
+    }
+
+    ts.resolve(&mut encoder);
+    s.queue.submit(std::iter::once(encoder.finish()));
+    let _ = s.device.poll(wgpu::PollType::wait_indefinitely());
+
+    let results = ts.read_results(&s.device, &s.queue);
+    eprintln!("\n=== GPU Timestamp Breakdown (Backward) ===");
+    print_timestamp_table(&results);
+}
+
 fn bench_backward(c: &mut Criterion) {
     let state = match create_bench_state() {
         Some(s) => s,
@@ -737,6 +883,9 @@ fn bench_backward(c: &mut Criterion) {
     c.bench_function("backward_tiled_2M", |b| {
         b.iter(|| run_backward(&state));
     });
+
+    // GPU timestamp breakdown (single run after criterion)
+    print_backward_timestamp_breakdown(&state);
 }
 
 criterion_group! {
