@@ -102,8 +102,15 @@ impl TileBuffers {
 
         // Each tet can touch up to num_tiles tiles. Use tet_count * num_tiles as the
         // upper bound, but cap per-tet estimate at 256 to avoid huge allocations.
+        // After next_power_of_two, cap at 64M pairs (256 MB per sort buffer) to
+        // prevent u32 overflow for large scenes (>8.4M tets). The tile_gen_scan
+        // shader already guards writes via max_write, so excess pairs are simply
+        // not generated.
+        const MAX_TILE_PAIRS: u64 = 1 << 26; // 64M pairs
         let tiles_per_tet = (num_tiles as u64).min(256);
-        let max_pairs_pow2 = ((tet_count as u64 * tiles_per_tet).max(num_tiles as u64)).next_power_of_two() as u32;
+        let max_pairs_pow2 = ((tet_count as u64 * tiles_per_tet).max(num_tiles as u64))
+            .next_power_of_two()
+            .min(MAX_TILE_PAIRS) as u32;
 
         let tile_sort_keys = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tile_sort_keys"),

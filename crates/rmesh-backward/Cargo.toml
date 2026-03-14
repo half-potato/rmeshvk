@@ -18,6 +18,11 @@ pollster = { workspace = true }
 glam = { workspace = true }
 rand = "0.9"
 rand_chacha = "0.9"
+criterion = { version = "0.5", features = ["html_reports"] }
 rmesh-data = { path = "../rmesh-data" }
 rmesh-train = { path = "../rmesh-train" }
 rmesh-util = { path = "../rmesh-util", features = ["test-util"] }
+
+[[bench]]
+name = "tiled_pipeline"
+harness = false
