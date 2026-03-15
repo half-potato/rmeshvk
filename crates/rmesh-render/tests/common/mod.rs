@@ -1,6 +1,6 @@
 //! CPU reference renderer for testing GPU pipeline correctness.
 //!
-//! Implements the same math as the WGSL shaders (forward_compute, forward_vertex,
+//! Implements the same math as the WGSL shaders (project_compute, forward_vertex,
 //! forward_fragment) in pure Rust with glam. No GPU required.
 
 #![allow(dead_code, unused_imports)]
@@ -31,7 +31,7 @@ fn phi(x: f32) -> f32 {
 // CPU compute pass: color eval (raw base colors, no activation)
 // ---------------------------------------------------------------------------
 
-/// Evaluate per-tet color (matches forward_compute.wgsl).
+/// Evaluate per-tet color (matches project_compute.wgsl).
 /// Base color is 0.5 (constant bias from the shader).
 /// No activation — raw base colors are passed through, matching the GPU path.
 /// Per-pixel ReLU clamping (max(0)) is applied later in render_tet_pixel.
@@ -161,7 +161,7 @@ fn load_color_grad(scene: &SceneData, tet_id: usize) -> Vec3 {
 }
 
 // ---------------------------------------------------------------------------
-// Sorting (CPU back-to-front, matches forward_compute.wgsl depth key)
+// Sorting (CPU back-to-front, matches project_compute.wgsl depth key)
 // ---------------------------------------------------------------------------
 
 /// Sort tet indices back-to-front using circumsphere depth key.
@@ -572,7 +572,7 @@ async fn gpu_raytrace_scene_async(
     encoder.clear_buffer(&rt_pipeline.rendered_image, 0, None);
 
     // Forward compute (color eval → colors_buf)
-    rmesh_render::record_forward_compute(
+    rmesh_render::record_project_compute(
         &mut encoder, &pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
     );
 
@@ -619,7 +619,7 @@ async fn gpu_raytrace_scene_async(
 /// Returns None if no GPU adapter is available.
 ///
 /// This uses the scan-based tile pipeline (same as the Python/training path):
-///   forward_compute → scan tile pipeline → radix_sort → tile_ranges → forward_tiled
+///   project_compute → scan tile pipeline → radix_sort → tile_ranges → rasterize_compute
 pub fn gpu_tiled_render_scene(
     scene: &SceneData,
     cam_pos: Vec3,
@@ -665,8 +665,8 @@ async fn gpu_tiled_render_scene_async(
         .await
         .ok()?;
 
-    // Must be 16 to match forward_compute.wgsl (hardcoded tile_size=16.0)
-    // and forward_tiled_compute.wgsl (hardcoded 16×16 pixel tiles).
+    // Must be 16 to match project_compute.wgsl (hardcoded tile_size=16.0)
+    // and rasterize_compute.wgsl (hardcoded 16×16 pixel tiles).
     let tile_size = 16u32;
 
     // Forward compute setup
@@ -681,7 +681,7 @@ async fn gpu_tiled_render_scene_async(
 
     // Run forward compute
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    rmesh_render::record_forward_compute(
+    rmesh_render::record_project_compute(
         &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
     );
     queue.submit(std::iter::once(encoder.finish()));
@@ -733,15 +733,15 @@ async fn gpu_tiled_render_scene_async(
     );
 
     // Forward tiled pipeline
-    let fwd_tiled = rmesh_render::ForwardTiledPipeline::new(&device, w, h);
-    let fwd_tiled_bg_a = rmesh_render::create_forward_tiled_bind_group(
-        &device, &fwd_tiled, &buffers.uniforms,
+    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, w, h);
+    let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
+        &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
         &buffers.densities, &material.color_grads,
         &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
-    let fwd_tiled_bg_b = rmesh_render::create_forward_tiled_bind_group(
-        &device, &fwd_tiled, &buffers.uniforms,
+    let rasterize_bg_b = rmesh_render::create_rasterize_bind_group(
+        &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
         &buffers.densities, &material.color_grads,
         &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
@@ -749,7 +749,7 @@ async fn gpu_tiled_render_scene_async(
 
     // Dispatch tiled forward pipeline
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.clear_buffer(&fwd_tiled.rendered_image, 0, None);
+    encoder.clear_buffer(&rasterize.rendered_image, 0, None);
     encoder.clear_buffer(&tile_buffers.tile_ranges, 0, None);
 
     // 1. Scan-based tile pipeline
@@ -779,8 +779,8 @@ async fn gpu_tiled_render_scene_async(
 
     // 4. Forward tiled
     {
-        let fwd_bg = if result_in_b { &fwd_tiled_bg_b } else { &fwd_tiled_bg_a };
-        rmesh_render::record_forward_tiled(&mut encoder, &fwd_tiled, fwd_bg, tile_buffers.num_tiles);
+        let fwd_bg = if result_in_b { &rasterize_bg_b } else { &rasterize_bg_a };
+        rmesh_render::record_rasterize_compute(&mut encoder, &rasterize, fwd_bg, tile_buffers.num_tiles);
     }
 
     queue.submit(std::iter::once(encoder.finish()));
@@ -795,7 +795,7 @@ async fn gpu_tiled_render_scene_async(
     });
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.copy_buffer_to_buffer(&fwd_tiled.rendered_image, 0, &readback, 0, readback.size());
+    encoder.copy_buffer_to_buffer(&rasterize.rendered_image, 0, &readback, 0, readback.size());
     queue.submit(std::iter::once(encoder.finish()));
 
     let slice = readback.slice(..);

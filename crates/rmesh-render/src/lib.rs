@@ -27,12 +27,12 @@ pub use rmesh_tile::{
 };
 
 // WGSL shader sources, embedded from crate-local files.
-const FORWARD_COMPUTE_WGSL: &str = include_str!("wgsl/forward_compute.wgsl");
+const PROJECT_COMPUTE_WGSL: &str = include_str!("wgsl/project_compute.wgsl");
 const FORWARD_VERTEX_WGSL: &str = include_str!("wgsl/forward_vertex.wgsl");
 const FORWARD_FRAGMENT_WGSL: &str = include_str!("wgsl/forward_fragment.wgsl");
 const TEX_TO_BUFFER_WGSL: &str = include_str!("wgsl/tex_to_buffer.wgsl");
 const RAYTRACE_COMPUTE_WGSL: &str = include_str!("wgsl/raytrace_compute.wgsl");
-const FORWARD_TILED_WGSL: &str = include_str!("wgsl/forward_tiled_compute.wgsl");
+const RASTERIZE_COMPUTE_WGSL: &str = include_str!("wgsl/rasterize_compute.wgsl");
 
 // ---------------------------------------------------------------------------
 // GPU Buffers
@@ -68,7 +68,7 @@ pub struct MaterialBuffers {
     pub base_colors: wgpu::Buffer,
     /// Per-tet color gradient [M x 3] f32
     pub color_grads: wgpu::Buffer,
-    /// Evaluated per-tet color [M x 3] f32 (written by forward_compute)
+    /// Evaluated per-tet color [M x 3] f32 (written by project_compute)
     pub colors: wgpu::Buffer,
 }
 
@@ -277,12 +277,12 @@ impl ForwardPipelines {
                 immediate_size: 0,
             });
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("forward_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(FORWARD_COMPUTE_WGSL.into()),
+            label: Some("project_compute.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(PROJECT_COMPUTE_WGSL.into()),
         });
         let compute_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("forward_compute_pipeline"),
+                label: Some("project_compute_pipeline"),
                 layout: Some(&compute_pipeline_layout),
                 module: &compute_shader,
                 entry_point: Some("main"),
@@ -619,7 +619,7 @@ pub fn record_tex_to_buffer(
 
 /// Create the compute bind group (12 bindings).
 ///
-/// Binding order matches `forward_compute.wgsl`:
+/// Binding order matches `project_compute.wgsl`:
 ///   0: uniforms, 1: vertices, 2: indices, 3: densities,
 ///   4: color_grads, 5: circumdata,
 ///   6: colors, 7: sort_keys, 8: sort_values, 9: indirect_args,
@@ -697,7 +697,7 @@ fn buf_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 ///
 /// Use this with the scan-based tile pipeline which reads compact_tet_ids
 /// directly instead of relying on sorted sort_values.
-pub fn record_forward_compute(
+pub fn record_project_compute(
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &ForwardPipelines,
     buffers: &SceneBuffers,
@@ -718,7 +718,7 @@ pub fn record_forward_compute(
 
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("forward_compute"),
+            label: Some("project_compute"),
             timestamp_writes: None,
         });
         cpass.set_pipeline(&pipelines.compute_pipeline);
@@ -739,7 +739,7 @@ pub fn record_forward_compute(
 /// Stages:
 ///   1. Reset indirect args (vertex_count=12, instance_count=0)
 ///   2. Compute pass (SH eval + cull + depth keys)
-pub fn record_forward_compute_and_sort(
+pub fn record_project_compute_and_sort(
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &ForwardPipelines,
     buffers: &SceneBuffers,
@@ -759,7 +759,7 @@ pub fn record_forward_compute_and_sort(
     // ----- 2. Compute pass -----
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("forward_compute"),
+            label: Some("project_compute"),
             timestamp_writes: None,
         });
         cpass.set_pipeline(&pipelines.compute_pipeline);
@@ -807,7 +807,7 @@ pub fn record_forward_pass(
     // ----- 2. Compute pass -----
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("forward_compute"),
+            label: Some("project_compute"),
             timestamp_writes: None,
         });
         cpass.set_pipeline(&pipelines.compute_pipeline);
@@ -1351,7 +1351,7 @@ pub fn record_raytrace(
 ///
 /// Requires `wgpu::Features::SUBGROUPS` on the device.
 /// Renders directly to an f32 storage buffer (no texture intermediate).
-pub struct ForwardTiledPipeline {
+pub struct RasterizeComputePipeline {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     /// The output storage buffer: [W x H x 4] f32
@@ -1360,12 +1360,12 @@ pub struct ForwardTiledPipeline {
     pub height: u32,
 }
 
-impl ForwardTiledPipeline {
+impl RasterizeComputePipeline {
     /// Create the forward tiled pipeline and allocate the rendered_image buffer.
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("forward_tiled_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(FORWARD_TILED_WGSL.into()),
+            label: Some("rasterize_compute.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(RASTERIZE_COMPUTE_WGSL.into()),
         });
 
         // 10 bindings: uniforms, vertices, indices, colors, densities, color_grads,
@@ -1379,18 +1379,18 @@ impl ForwardTiledPipeline {
 
         let bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("forward_tiled_bgl"),
+                label: Some("rasterize_compute_bgl"),
                 entries: &entries,
             });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("forward_tiled_pl"),
+            label: Some("rasterize_compute_pl"),
             bind_group_layouts: &[&bind_group_layout],
             immediate_size: 0,
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("forward_tiled_pipeline"),
+            label: Some("rasterize_compute_pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some("main"),
@@ -1399,7 +1399,7 @@ impl ForwardTiledPipeline {
         });
 
         let rendered_image = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("fwd_tiled_rendered_image"),
+            label: Some("rasterize_rendered_image"),
             size: (width as u64) * (height as u64) * 4 * 4, // RGBA f32
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
@@ -1429,13 +1429,13 @@ impl ForwardTiledPipeline {
 
 /// Create the forward tiled bind group.
 ///
-/// Binding order matches `forward_tiled_compute.wgsl`:
+/// Binding order matches `rasterize_compute.wgsl`:
 ///   0: uniforms, 1: vertices, 2: indices, 3: colors,
 ///   4: densities, 5: color_grads, 6: tile_sort_values,
 ///   7: tile_ranges, 8: tile_uniforms, 9: rendered_image
-pub fn create_forward_tiled_bind_group(
+pub fn create_rasterize_bind_group(
     device: &wgpu::Device,
-    fwd_tiled: &ForwardTiledPipeline,
+    rasterize: &RasterizeComputePipeline,
     uniforms: &wgpu::Buffer,
     vertices: &wgpu::Buffer,
     indices: &wgpu::Buffer,
@@ -1447,8 +1447,8 @@ pub fn create_forward_tiled_bind_group(
     tile_uniforms: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("forward_tiled_bg"),
-        layout: fwd_tiled.bind_group_layout(),
+        label: Some("rasterize_compute_bg"),
+        layout: rasterize.bind_group_layout(),
         entries: &[
             buf_entry(0, uniforms),
             buf_entry(1, vertices),
@@ -1459,7 +1459,7 @@ pub fn create_forward_tiled_bind_group(
             buf_entry(6, tile_sort_values),
             buf_entry(7, tile_ranges),
             buf_entry(8, tile_uniforms),
-            buf_entry(9, &fwd_tiled.rendered_image),
+            buf_entry(9, &rasterize.rendered_image),
         ],
     })
 }
@@ -1467,17 +1467,17 @@ pub fn create_forward_tiled_bind_group(
 /// Record the forward tiled compute pass dispatch.
 ///
 /// Dispatches one workgroup per tile (32 threads each).
-pub fn record_forward_tiled(
+pub fn record_rasterize_compute(
     encoder: &mut wgpu::CommandEncoder,
-    fwd_tiled: &ForwardTiledPipeline,
+    rasterize: &RasterizeComputePipeline,
     bind_group: &wgpu::BindGroup,
     num_tiles: u32,
 ) {
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("forward_tiled"),
+        label: Some("rasterize_compute"),
         timestamp_writes: None,
     });
-    pass.set_pipeline(fwd_tiled.pipeline());
+    pass.set_pipeline(rasterize.pipeline());
     pass.set_bind_group(0, bind_group, &[]);
     let (x, y) = dispatch_2d(num_tiles);
     pass.dispatch_workgroups(x, y, 1);

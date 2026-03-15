@@ -1,9 +1,9 @@
 //! Per-kernel unit tests for the forward rendering pipeline.
 //!
 //! Tests each shader/kernel in isolation:
-//!   - forward_compute.wgsl: color eval, cull, depth key generation
+//!   - project_compute.wgsl: color eval, cull, depth key generation
 //!   - radix sort (5-pass): tet depth sorting
-//!   - forward_tiled_compute.wgsl: subgroup-based tiled forward rendering
+//!   - rasterize_compute.wgsl: subgroup-based tiled forward rendering
 //!   - tex_to_buffer.wgsl: texture → storage buffer conversion
 //!
 //! Each test creates a GPU device with SUBGROUP feature, dispatches a single
@@ -33,7 +33,7 @@ fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat4) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: forward_compute.wgsl (color eval + cull + depth keys)
+// Test: project_compute.wgsl (color eval + cull + depth keys)
 // ---------------------------------------------------------------------------
 
 /// Dispatches only the forward compute kernel (no sort, no render).
@@ -41,11 +41,11 @@ fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat4) {
 ///   - Sets instance_count > 0 in indirect args (tet is visible)
 ///   - Does not crash or produce GPU errors
 #[test]
-fn test_forward_compute_kernel() {
+fn test_project_compute_kernel() {
     let (device, queue) = match create_test_device() {
         Some(dq) => dq,
         None => {
-            eprintln!("Skipping test_forward_compute_kernel (no GPU)");
+            eprintln!("Skipping test_project_compute_kernel (no GPU)");
             return;
         }
     };
@@ -86,7 +86,7 @@ fn test_forward_compute_kernel() {
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("forward_compute"),
+            label: Some("project_compute"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&pipelines.compute_pipeline);
@@ -99,7 +99,7 @@ fn test_forward_compute_kernel() {
     // Read back indirect args to verify instance_count > 0
     let args: Vec<u32> = read_buffer(&device, &queue, &buffers.indirect_args, 4);
     let instance_count = args[1];
-    eprintln!("forward_compute: instance_count = {instance_count}");
+    eprintln!("project_compute: instance_count = {instance_count}");
     assert!(
         instance_count > 0,
         "Tet should be visible but instance_count=0"
@@ -107,7 +107,7 @@ fn test_forward_compute_kernel() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: forward_tiled_compute.wgsl (subgroup shader compilation)
+// Test: rasterize_compute.wgsl (subgroup shader compilation)
 // ---------------------------------------------------------------------------
 
 /// Validates that the forward tiled compute pipeline (which requires
@@ -117,22 +117,22 @@ fn test_forward_compute_kernel() {
 /// is properly hooked up. If subgroups aren't supported, pipeline
 /// creation will fail.
 #[test]
-fn test_forward_tiled_pipeline_creation() {
+fn test_rasterize_pipeline_creation() {
     let (device, _queue) = match create_test_device() {
         Some(dq) => dq,
         None => {
-            eprintln!("Skipping test_forward_tiled_pipeline_creation (no GPU)");
+            eprintln!("Skipping test_rasterize_pipeline_creation (no GPU)");
             return;
         }
     };
 
     // This will panic if the shader fails to compile (e.g., subgroups not supported)
-    let pipeline = rmesh_render::ForwardTiledPipeline::new(&device, W, H);
+    let pipeline = rmesh_render::RasterizeComputePipeline::new(&device, W, H);
 
     // Verify the output buffer was created with correct size
     assert_eq!(pipeline.width, W);
     assert_eq!(pipeline.height, H);
-    eprintln!("forward_tiled_compute.wgsl compiled successfully with subgroup support");
+    eprintln!("rasterize_compute.wgsl compiled successfully with subgroup support");
 }
 
 // ---------------------------------------------------------------------------

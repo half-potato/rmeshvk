@@ -33,7 +33,7 @@ pub fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> Mat4 {
     )
 }
 
-/// World → NDC. Returns (ndc_xyz, clip_w). Matches forward_compute.wgsl `project_to_ndc`.
+/// World → NDC. Returns (ndc_xyz, clip_w). Matches project_compute.wgsl `project_to_ndc`.
 pub fn project_to_ndc(pos: Vec3, vp: Mat4) -> (Vec3, f32) {
     let clip = vp * Vec4::new(pos.x, pos.y, pos.z, 1.0);
     let inv_w = 1.0 / (clip.w + 1e-6);
@@ -47,14 +47,14 @@ pub fn ndc_to_pixel(ndc_x: f32, ndc_y: f32, w: f32, h: f32) -> (f32, f32) {
     (px, py)
 }
 
-/// Pixel center → NDC. Matches forward_tiled_compute.wgsl ray construction.
+/// Pixel center → NDC. Matches rasterize_compute.wgsl ray construction.
 pub fn pixel_to_ndc(px: f32, py: f32, w: f32, h: f32) -> (f32, f32) {
     let ndc_x = (2.0 * px + 1.0) / w - 1.0;
     let ndc_y = 1.0 - (2.0 * py + 1.0) / h;
     (ndc_x, ndc_y)
 }
 
-/// Pixel → world-space ray (origin, direction). Matches forward_tiled_compute.wgsl.
+/// Pixel → world-space ray (origin, direction). Matches rasterize_compute.wgsl.
 pub fn pixel_ray(inv_vp: Mat4, cam_pos: Vec3, px: f32, py: f32, w: f32, h: f32) -> (Vec3, Vec3) {
     let (ndc_x, ndc_y) = pixel_to_ndc(px, py, w, h);
 

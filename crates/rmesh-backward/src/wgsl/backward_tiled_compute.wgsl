@@ -1,6 +1,6 @@
 // Compute-based backward tiled renderer: 1 warp (32 threads) per 16×16 tile.
 //
-// Same scanline-fill thread model as forward_tiled_compute.wgsl.
+// Same scanline-fill thread model as rasterize_compute.wgsl.
 // Back-to-front state undoing in shared memory, gradient reduction via warp shuffle.
 //
 // One workgroup per tile. Dispatch: (num_tiles, 1, 1).

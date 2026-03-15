@@ -146,7 +146,7 @@ fn eval_tet_rt(
         return result;
     }
 
-    // Volume integral (same as eval_tet in forward_tiled_compute.wgsl)
+    // Volume integral (same as eval_tet in rasterize_compute.wgsl)
     let density_raw = densities[tet_id];
     let colors_tet = vec3<f32>(colors_buf[tet_id * 3u], colors_buf[tet_id * 3u + 1u], colors_buf[tet_id * 3u + 2u]);
     let grad = vec3<f32>(color_grads_buf[tet_id * 3u], color_grads_buf[tet_id * 3u + 1u], color_grads_buf[tet_id * 3u + 2u]);

@@ -55,9 +55,9 @@ struct BenchState {
     tile_ranges_bg_a: wgpu::BindGroup,
     tile_ranges_bg_b: wgpu::BindGroup,
     // Forward tiled
-    fwd_tiled: rmesh_render::ForwardTiledPipeline,
-    fwd_tiled_bg_a: wgpu::BindGroup,
-    fwd_tiled_bg_b: wgpu::BindGroup,
+    rasterize: rmesh_render::RasterizeComputePipeline,
+    rasterize_bg_a: wgpu::BindGroup,
+    rasterize_bg_b: wgpu::BindGroup,
     // Loss
     loss_pipeline: LossPipeline,
     loss_buffers: LossBuffers,
@@ -182,10 +182,10 @@ fn create_bench_state() -> Option<BenchState> {
     );
 
     // Forward tiled
-    let fwd_tiled = rmesh_render::ForwardTiledPipeline::new(&device, W, H);
-    let fwd_tiled_bg_a = rmesh_render::create_forward_tiled_bind_group(
+    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H);
+    let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
         &device,
-        &fwd_tiled,
+        &rasterize,
         &buffers.uniforms,
         &buffers.vertices,
         &buffers.indices,
@@ -196,9 +196,9 @@ fn create_bench_state() -> Option<BenchState> {
         &tile_buffers.tile_ranges,
         &tile_buffers.tile_uniforms,
     );
-    let fwd_tiled_bg_b = rmesh_render::create_forward_tiled_bind_group(
+    let rasterize_bg_b = rmesh_render::create_rasterize_bind_group(
         &device,
-        &fwd_tiled,
+        &rasterize,
         &buffers.uniforms,
         &buffers.vertices,
         &buffers.indices,
@@ -235,7 +235,7 @@ fn create_bench_state() -> Option<BenchState> {
         &device,
         &loss_pipeline,
         &loss_buffers,
-        &fwd_tiled.rendered_image,
+        &rasterize.rendered_image,
     );
 
     // Backward tiled
@@ -249,7 +249,7 @@ fn create_bench_state() -> Option<BenchState> {
         &bwd_tiled_pipelines,
         &buffers.uniforms,
         &loss_buffers.dl_d_image,
-        &fwd_tiled.rendered_image,
+        &rasterize.rendered_image,
         &buffers.vertices,
         &buffers.indices,
         &buffers.densities,
@@ -268,7 +268,7 @@ fn create_bench_state() -> Option<BenchState> {
         &bwd_tiled_pipelines,
         &buffers.uniforms,
         &loss_buffers.dl_d_image,
-        &fwd_tiled.rendered_image,
+        &rasterize.rendered_image,
         &buffers.vertices,
         &buffers.indices,
         &buffers.densities,
@@ -303,9 +303,9 @@ fn create_bench_state() -> Option<BenchState> {
         tile_gen_scan_bg,
         tile_ranges_bg_a,
         tile_ranges_bg_b,
-        fwd_tiled,
-        fwd_tiled_bg_a,
-        fwd_tiled_bg_b,
+        rasterize,
+        rasterize_bg_a,
+        rasterize_bg_b,
         loss_pipeline,
         loss_buffers,
         loss_bg,
@@ -325,7 +325,7 @@ fn run_forward(s: &BenchState) {
         .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
     // Forward compute (visibility, tile counting)
-    rmesh_render::record_forward_compute(
+    rmesh_render::record_project_compute(
         &mut encoder,
         &s.fwd_pipelines,
         &s.buffers,
@@ -335,7 +335,7 @@ fn run_forward(s: &BenchState) {
     );
 
     // Clear tile ranges + rendered image
-    encoder.clear_buffer(&s.fwd_tiled.rendered_image, 0, None);
+    encoder.clear_buffer(&s.rasterize.rendered_image, 0, None);
     encoder.clear_buffer(&s.tile_buffers.tile_ranges, 0, None);
 
     // Scan-based tile pipeline (prepare_dispatch → RTS → tile_fill → tile_gen)
@@ -381,13 +381,13 @@ fn run_forward(s: &BenchState) {
     // Forward tiled rendering
     {
         let fwd_bg = if result_in_b {
-            &s.fwd_tiled_bg_b
+            &s.rasterize_bg_b
         } else {
-            &s.fwd_tiled_bg_a
+            &s.rasterize_bg_a
         };
-        rmesh_render::record_forward_tiled(
+        rmesh_render::record_rasterize_compute(
             &mut encoder,
-            &s.fwd_tiled,
+            &s.rasterize,
             fwd_bg,
             s.tile_buffers.num_tiles,
         );
@@ -404,7 +404,7 @@ fn run_backward(s: &BenchState) {
         .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
     // Forward compute
-    rmesh_render::record_forward_compute(
+    rmesh_render::record_project_compute(
         &mut encoder,
         &s.fwd_pipelines,
         &s.buffers,
@@ -414,7 +414,7 @@ fn run_backward(s: &BenchState) {
     );
 
     // Clear buffers
-    encoder.clear_buffer(&s.fwd_tiled.rendered_image, 0, None);
+    encoder.clear_buffer(&s.rasterize.rendered_image, 0, None);
     encoder.clear_buffer(&s.tile_buffers.tile_ranges, 0, None);
     encoder.clear_buffer(&s.grad_buffers.d_vertices, 0, None);
     encoder.clear_buffer(&s.grad_buffers.d_densities, 0, None);
@@ -465,13 +465,13 @@ fn run_backward(s: &BenchState) {
     // Forward tiled rendering
     {
         let fwd_bg = if result_in_b {
-            &s.fwd_tiled_bg_b
+            &s.rasterize_bg_b
         } else {
-            &s.fwd_tiled_bg_a
+            &s.rasterize_bg_a
         };
-        rmesh_render::record_forward_tiled(
+        rmesh_render::record_rasterize_compute(
             &mut encoder,
-            &s.fwd_tiled,
+            &s.rasterize,
             fwd_bg,
             s.tile_buffers.num_tiles,
         );
@@ -514,13 +514,13 @@ fn print_forward_timestamp_breakdown(s: &BenchState) {
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-    // We can't use record_forward_compute directly since it creates its own
+    // We can't use record_project_compute directly since it creates its own
     // passes without timestamp writes. Instead, replicate the logic with
     // timestamps on the passes we can instrument.
 
     // For the scan pipeline and later stages, we instrument each pass.
-    // First, run forward_compute without timestamps (it's a single pass).
-    rmesh_render::record_forward_compute(
+    // First, run project_compute without timestamps (it's a single pass).
+    rmesh_render::record_project_compute(
         &mut encoder,
         &s.fwd_pipelines,
         &s.buffers,
@@ -529,7 +529,7 @@ fn print_forward_timestamp_breakdown(s: &BenchState) {
         &s.queue,
     );
 
-    encoder.clear_buffer(&s.fwd_tiled.rendered_image, 0, None);
+    encoder.clear_buffer(&s.rasterize.rendered_image, 0, None);
     encoder.clear_buffer(&s.tile_buffers.tile_ranges, 0, None);
 
     // Scan tile pipeline — instrument each sub-pass
@@ -657,20 +657,20 @@ fn print_forward_timestamp_breakdown(s: &BenchState) {
     // Forward tiled
     {
         let fwd_bg = if result_in_b {
-            &s.fwd_tiled_bg_b
+            &s.rasterize_bg_b
         } else {
-            &s.fwd_tiled_bg_a
+            &s.rasterize_bg_a
         };
-        let (b, e) = ts.allocate("forward_tiled");
+        let (b, e) = ts.allocate("rasterize_compute");
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("forward_tiled"),
+            label: Some("rasterize_compute"),
             timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
                 query_set: ts.query_set(),
                 beginning_of_pass_write_index: Some(b),
                 end_of_pass_write_index: Some(e),
             }),
         });
-        pass.set_pipeline(s.fwd_tiled.pipeline());
+        pass.set_pipeline(s.rasterize.pipeline());
         pass.set_bind_group(0, fwd_bg, &[]);
         let (x, y) = rmesh_tile::dispatch_2d(s.tile_buffers.num_tiles);
         pass.dispatch_workgroups(x, y, 1);
@@ -683,6 +683,49 @@ fn print_forward_timestamp_breakdown(s: &BenchState) {
     let results = ts.read_results(&s.device, &s.queue);
     eprintln!("\n=== GPU Timestamp Breakdown (Forward) ===");
     print_timestamp_table(&results);
+}
+
+/// Run only the forward compute shader (projection, culling, tile counting).
+fn run_project_compute(s: &BenchState) {
+    let mut encoder = s
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+    rmesh_render::record_project_compute(
+        &mut encoder,
+        &s.fwd_pipelines,
+        &s.buffers,
+        &s.compute_bg,
+        s.tet_count,
+        &s.queue,
+    );
+
+    s.queue.submit(std::iter::once(encoder.finish()));
+    let _ = s.device.poll(wgpu::PollType::wait_indefinitely());
+}
+
+/// Run only the forward tiled rendering kernel (assumes tile data is populated).
+fn run_rasterize_only(s: &BenchState, result_in_b: bool) {
+    let mut encoder = s
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+    encoder.clear_buffer(&s.rasterize.rendered_image, 0, None);
+
+    let fwd_bg = if result_in_b {
+        &s.rasterize_bg_b
+    } else {
+        &s.rasterize_bg_a
+    };
+    rmesh_render::record_rasterize_compute(
+        &mut encoder,
+        &s.rasterize,
+        fwd_bg,
+        s.tile_buffers.num_tiles,
+    );
+
+    s.queue.submit(std::iter::once(encoder.finish()));
+    let _ = s.device.poll(wgpu::PollType::wait_indefinitely());
 }
 
 fn bench_forward(c: &mut Criterion) {
@@ -702,11 +745,39 @@ fn bench_forward(c: &mut Criterion) {
         state.tile_buffers.max_pairs_pow2
     );
 
-    // Warmup: run one forward pass before benchmarking
+    // Warmup: run one full forward pass to populate tile data
     run_forward(&state);
 
-    c.bench_function("forward_tiled_2M", |b| {
+    // Full forward pipeline (compute + scan + sort + tile_ranges + tiled rendering)
+    c.bench_function("forward_rasterize_2M", |b| {
         b.iter(|| run_forward(&state));
+    });
+
+    // Forward compute only (projection, culling, tile counting)
+    c.bench_function("project_compute_2M", |b| {
+        b.iter(|| run_project_compute(&state));
+    });
+
+    // Forward tiled rendering only (tile data already populated from warmup)
+    // Determine which buffer the sort result lands in via a dry run
+    let result_in_b = {
+        let mut encoder = state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let r = rmesh_backward::record_radix_sort(
+            &mut encoder,
+            &state.device,
+            &state.radix_pipelines,
+            &state.radix_state,
+            &state.tile_buffers.tile_sort_keys,
+            &state.tile_buffers.tile_sort_values,
+        );
+        state.queue.submit(std::iter::once(encoder.finish()));
+        let _ = state.device.poll(wgpu::PollType::wait_indefinitely());
+        r
+    };
+    c.bench_function("rasterize_compute_2M", |b| {
+        b.iter(|| run_rasterize_only(&state, result_in_b));
     });
 
     // GPU timestamp breakdown (single run after criterion)
@@ -722,7 +793,7 @@ fn print_backward_timestamp_breakdown(s: &BenchState) {
         .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
     // Forward compute (no timestamp — creates its own passes)
-    rmesh_render::record_forward_compute(
+    rmesh_render::record_project_compute(
         &mut encoder,
         &s.fwd_pipelines,
         &s.buffers,
@@ -732,7 +803,7 @@ fn print_backward_timestamp_breakdown(s: &BenchState) {
     );
 
     // Clears
-    encoder.clear_buffer(&s.fwd_tiled.rendered_image, 0, None);
+    encoder.clear_buffer(&s.rasterize.rendered_image, 0, None);
     encoder.clear_buffer(&s.tile_buffers.tile_ranges, 0, None);
     encoder.clear_buffer(&s.grad_buffers.d_vertices, 0, None);
     encoder.clear_buffer(&s.grad_buffers.d_densities, 0, None);
@@ -788,20 +859,20 @@ fn print_backward_timestamp_breakdown(s: &BenchState) {
     // Forward tiled
     {
         let fwd_bg = if result_in_b {
-            &s.fwd_tiled_bg_b
+            &s.rasterize_bg_b
         } else {
-            &s.fwd_tiled_bg_a
+            &s.rasterize_bg_a
         };
-        let (b, e) = ts.allocate("forward_tiled");
+        let (b, e) = ts.allocate("rasterize_compute");
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("forward_tiled"),
+            label: Some("rasterize_compute"),
             timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
                 query_set: ts.query_set(),
                 beginning_of_pass_write_index: Some(b),
                 end_of_pass_write_index: Some(e),
             }),
         });
-        pass.set_pipeline(s.fwd_tiled.pipeline());
+        pass.set_pipeline(s.rasterize.pipeline());
         pass.set_bind_group(0, fwd_bg, &[]);
         let (x, y) = rmesh_tile::dispatch_2d(s.tile_buffers.num_tiles);
         pass.dispatch_workgroups(x, y, 1);

@@ -1,4 +1,4 @@
-// Compute-based forward tiled renderer: 1 warp (32 threads) per 16×16 tile.
+// Rasterize compute shader: 1 warp (32 threads) per 16×16 tile.
 //
 // Uses workgroup shared memory for per-pixel state. For each tet assigned to
 // this tile, a scanline fill determines which of the 256 pixels are covered,
@@ -73,11 +73,6 @@ var<workgroup> sm_prefix: array<u32, 17>;          // prefix sum of row widths
 fn phi(x: f32) -> f32 {
     if (abs(x) < 1e-6) { return 1.0 - x * 0.5; }
     return (1.0 - exp(-x)) / x;
-}
-
-fn softplus(x: f32) -> f32 {
-    if (x > 8.0) { return x; }
-    return 0.1 * log(1.0 + exp(10.0 * x));
 }
 
 fn load_f32x3_v(idx: u32) -> vec3<f32> {
@@ -256,18 +251,18 @@ fn main(
         }
         workgroupBarrier();
 
-        let total = sm_prefix[16u];
-        if (total == 0u) {
-            // No pixels covered — skip to next tet (barrier already done)
-            continue;
-        }
-
-        // Load tet attributes
+        // Load tet attributes (per-tet, not per-pixel — hoisted above pixel loop)
         let density_raw = densities[tet_id];
         let colors_tet = vec3<f32>(colors_buf[tet_id * 3u], colors_buf[tet_id * 3u + 1u], colors_buf[tet_id * 3u + 2u]);
         let grad_vec = vec3<f32>(color_grads_buf[tet_id * 3u], color_grads_buf[tet_id * 3u + 1u], color_grads_buf[tet_id * 3u + 2u]);
         var verts: array<vec3<f32>, 4>;
         verts[0] = v0; verts[1] = v1; verts[2] = v2; verts[3] = v3;
+
+        let total = sm_prefix[16u];
+        if (total == 0u) {
+            // No pixels covered — skip to next tet (barrier already done)
+            continue;
+        }
 
         // Process covered pixels (each thread handles indices: lane, lane+32, ...)
         for (var idx = lane; idx < total; idx += 32u) {

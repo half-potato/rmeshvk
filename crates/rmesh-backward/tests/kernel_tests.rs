@@ -7,7 +7,7 @@
 //!   - tile_ranges_compute.wgsl: per-tile range computation
 //!   - loss_compute.wgsl: L1/L2 loss + per-pixel gradient
 //!   - adam_compute.wgsl: Adam optimizer step
-//!   - forward_tiled_compute.wgsl: subgroup-based tiled forward (end-to-end)
+//!   - rasterize_compute.wgsl: subgroup-based tiled forward (end-to-end)
 //!   - backward_tiled_compute.wgsl: subgroup-based tiled backward (end-to-end)
 //!
 //! Each test creates a GPU device with the SUBGROUP feature enabled.
@@ -530,10 +530,10 @@ fn test_tile_fill_kernel() {
 // ===========================================================================
 
 /// Runs the full scan-based tiled forward pipeline:
-///   forward_compute → scan tile pipeline → radix_sort → tile_ranges → forward_tiled
+///   project_compute → scan tile pipeline → radix_sort → tile_ranges → rasterize_compute
 ///
 /// Uses the same scan-based tile pipeline as the Python bindings.
-/// The forward_tiled_compute.wgsl shader uses `enable subgroups;` and
+/// The rasterize_compute.wgsl shader uses `enable subgroups;` and
 /// subgroupShuffle operations. If subgroup support is broken, this test
 /// will fail during pipeline creation or produce incorrect output.
 #[test]
@@ -552,7 +552,7 @@ fn test_tiled_forward_e2e() {
 
     let mut rng = ChaCha8Rng::seed_from_u64(SEED);
     // Use larger tet (0.6) with closer camera (1.0) to guarantee visibility
-    // after circumsphere culling in forward_compute.
+    // after circumsphere culling in project_compute.
     let scene = random_single_tet_scene(&mut rng, 0.6);
 
     let verts_arr = [
@@ -576,14 +576,14 @@ fn test_tiled_forward_e2e() {
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    rmesh_render::record_forward_compute(
+    rmesh_render::record_project_compute(
         &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
     );
     queue.submit(std::iter::once(encoder.finish()));
 
     // --- Set up tiled pipeline (scan-based, same as Python path) ---
     // tile_size must be 16 to match the hardcoded 16-pixel tiles in
-    // forward_compute.wgsl and forward_tiled_compute.wgsl.
+    // project_compute.wgsl and rasterize_compute.wgsl.
     let tile_size = 16u32;
     let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
     let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device);
@@ -634,15 +634,15 @@ fn test_tiled_forward_e2e() {
     );
 
     // Create forward tiled pipeline (SUBGROUP)
-    let fwd_tiled = rmesh_render::ForwardTiledPipeline::new(&device, W, H);
-    let fwd_tiled_bg_a = rmesh_render::create_forward_tiled_bind_group(
-        &device, &fwd_tiled, &buffers.uniforms,
+    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H);
+    let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
+        &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
         &buffers.densities, &material.color_grads,
         &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
-    let fwd_tiled_bg_b = rmesh_render::create_forward_tiled_bind_group(
-        &device, &fwd_tiled, &buffers.uniforms,
+    let rasterize_bg_b = rmesh_render::create_rasterize_bind_group(
+        &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
         &buffers.densities, &material.color_grads,
         &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
@@ -650,7 +650,7 @@ fn test_tiled_forward_e2e() {
 
     // --- Dispatch scan-based tiled forward pipeline ---
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.clear_buffer(&fwd_tiled.rendered_image, 0, None);
+    encoder.clear_buffer(&rasterize.rendered_image, 0, None);
     encoder.clear_buffer(&tile_buffers.tile_ranges, 0, None);
 
     // 1. Scan-based tile pipeline
@@ -680,15 +680,15 @@ fn test_tiled_forward_e2e() {
 
     // 4. Forward tiled
     {
-        let fwd_bg = if result_in_b { &fwd_tiled_bg_b } else { &fwd_tiled_bg_a };
-        rmesh_render::record_forward_tiled(&mut encoder, &fwd_tiled, fwd_bg, tile_buffers.num_tiles);
+        let fwd_bg = if result_in_b { &rasterize_bg_b } else { &rasterize_bg_a };
+        rmesh_render::record_rasterize_compute(&mut encoder, &rasterize, fwd_bg, tile_buffers.num_tiles);
     }
 
     queue.submit(std::iter::once(encoder.finish()));
 
     // Read back rendered image
     let pixel_count = (W * H) as usize;
-    let image: Vec<f32> = read_buffer(&device, &queue, &fwd_tiled.rendered_image, pixel_count * 4);
+    let image: Vec<f32> = read_buffer(&device, &queue, &rasterize.rendered_image, pixel_count * 4);
 
     // Check that we got non-zero output (tet should be visible)
     let total_alpha: f32 = image.iter().skip(3).step_by(4).sum();
@@ -713,8 +713,8 @@ fn test_tiled_forward_e2e() {
 // Test: multi-tet finite-difference gradient verification
 // ===========================================================================
 
-/// Runs the full tiled pipeline (forward_compute → tile_fill → tile_gen →
-/// radix_sort → tile_ranges → forward_tiled → loss → backward_tiled) on a
+/// Runs the full tiled pipeline (project_compute → tile_fill → tile_gen →
+/// radix_sort → tile_ranges → rasterize_compute → loss → backward_tiled) on a
 /// two-tet scene (5 vertices, 2 tets sharing a face), then verifies every
 /// analytical gradient against a numerical finite-difference estimate.
 ///
@@ -743,8 +743,8 @@ fn test_multi_tet_gradient_finite_diff() {
     let target = Vec3::new(0.5, 0.4, 0.0);
     let (vp, inv_vp) = setup_camera(eye, target);
 
-    // Must match the hardcoded tile pixel size in forward_compute.wgsl (line 144)
-    // and forward_tiled_compute.wgsl (line 106).
+    // Must match the hardcoded tile pixel size in project_compute.wgsl (line 144)
+    // and rasterize_compute.wgsl (line 106).
     let tile_size = 16u32;
     let n_pixels = (W * H) as usize;
 
@@ -770,7 +770,7 @@ fn test_multi_tet_gradient_finite_diff() {
         queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        rmesh_render::record_forward_compute(
+        rmesh_render::record_project_compute(
             &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene_data.tet_count, &queue,
         );
         queue.submit(std::iter::once(encoder.finish()));
@@ -816,22 +816,22 @@ fn test_multi_tet_gradient_finite_diff() {
             &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
         );
 
-        let fwd_tiled = rmesh_render::ForwardTiledPipeline::new(&device, W, H);
-        let fwd_tiled_bg_a = rmesh_render::create_forward_tiled_bind_group(
-            &device, &fwd_tiled, &buffers.uniforms,
+        let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H);
+        let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
+            &device, &rasterize, &buffers.uniforms,
             &buffers.vertices, &buffers.indices, &material.colors,
             &buffers.densities, &material.color_grads,
             &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
         );
-        let fwd_tiled_bg_b = rmesh_render::create_forward_tiled_bind_group(
-            &device, &fwd_tiled, &buffers.uniforms,
+        let rasterize_bg_b = rmesh_render::create_rasterize_bind_group(
+            &device, &rasterize, &buffers.uniforms,
             &buffers.vertices, &buffers.indices, &material.colors,
             &buffers.densities, &material.color_grads,
             &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
         );
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        encoder.clear_buffer(&fwd_tiled.rendered_image, 0, None);
+        encoder.clear_buffer(&rasterize.rendered_image, 0, None);
         encoder.clear_buffer(&tile_buffers.tile_ranges, 0, None);
 
         rmesh_backward::record_scan_tile_pipeline(
@@ -853,14 +853,14 @@ fn test_multi_tet_gradient_finite_diff() {
             pass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
         }
         {
-            let fwd_bg = if result_in_b { &fwd_tiled_bg_b } else { &fwd_tiled_bg_a };
-            rmesh_render::record_forward_tiled(&mut encoder, &fwd_tiled, fwd_bg, tile_buffers.num_tiles);
+            let fwd_bg = if result_in_b { &rasterize_bg_b } else { &rasterize_bg_a };
+            rmesh_render::record_rasterize_compute(&mut encoder, &rasterize, fwd_bg, tile_buffers.num_tiles);
         }
 
         queue.submit(std::iter::once(encoder.finish()));
 
         // Compute L2 loss on CPU in f64 (avoids GPU atomic CAS non-determinism)
-        let rendered: Vec<f32> = read_buffer(&device, &queue, &fwd_tiled.rendered_image, n_pixels * 4);
+        let rendered: Vec<f32> = read_buffer(&device, &queue, &rasterize.rendered_image, n_pixels * 4);
         let mut loss_sum = 0.0f64;
         for i in 0..n_pixels {
             for c in 0..3usize {
@@ -884,7 +884,7 @@ fn test_multi_tet_gradient_finite_diff() {
         queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        rmesh_render::record_forward_compute(
+        rmesh_render::record_project_compute(
             &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene_data.tet_count, &queue,
         );
         queue.submit(std::iter::once(encoder.finish()));
@@ -930,22 +930,22 @@ fn test_multi_tet_gradient_finite_diff() {
             &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
         );
 
-        let fwd_tiled = rmesh_render::ForwardTiledPipeline::new(&device, W, H);
-        let fwd_tiled_bg_a = rmesh_render::create_forward_tiled_bind_group(
-            &device, &fwd_tiled, &buffers.uniforms,
+        let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H);
+        let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
+            &device, &rasterize, &buffers.uniforms,
             &buffers.vertices, &buffers.indices, &material.colors,
             &buffers.densities, &material.color_grads,
             &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
         );
-        let fwd_tiled_bg_b = rmesh_render::create_forward_tiled_bind_group(
-            &device, &fwd_tiled, &buffers.uniforms,
+        let rasterize_bg_b = rmesh_render::create_rasterize_bind_group(
+            &device, &rasterize, &buffers.uniforms,
             &buffers.vertices, &buffers.indices, &material.colors,
             &buffers.densities, &material.color_grads,
             &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
         );
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        encoder.clear_buffer(&fwd_tiled.rendered_image, 0, None);
+        encoder.clear_buffer(&rasterize.rendered_image, 0, None);
         encoder.clear_buffer(&tile_buffers.tile_ranges, 0, None);
 
         rmesh_backward::record_scan_tile_pipeline(
@@ -967,8 +967,8 @@ fn test_multi_tet_gradient_finite_diff() {
             pass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
         }
         {
-            let fwd_bg = if result_in_b { &fwd_tiled_bg_b } else { &fwd_tiled_bg_a };
-            rmesh_render::record_forward_tiled(&mut encoder, &fwd_tiled, fwd_bg, tile_buffers.num_tiles);
+            let fwd_bg = if result_in_b { &rasterize_bg_b } else { &rasterize_bg_a };
+            rmesh_render::record_rasterize_compute(&mut encoder, &rasterize, fwd_bg, tile_buffers.num_tiles);
         }
 
         queue.submit(std::iter::once(encoder.finish()));
@@ -984,7 +984,7 @@ fn test_multi_tet_gradient_finite_diff() {
         queue.write_buffer(&loss_buffers.loss_uniforms, 0, bytemuck::bytes_of(&loss_uni));
         queue.write_buffer(&loss_buffers.loss_value, 0, &[0u8; 4]);
 
-        let loss_bg = create_loss_bind_group(&device, &loss_pipeline, &loss_buffers, &fwd_tiled.rendered_image);
+        let loss_bg = create_loss_bind_group(&device, &loss_pipeline, &loss_buffers, &rasterize.rendered_image);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         record_loss_pass(&mut encoder, &loss_pipeline, &loss_bg, W, H);
@@ -1014,7 +1014,7 @@ fn test_multi_tet_gradient_finite_diff() {
         let bwd_tiled_pipelines = rmesh_backward::BackwardTiledPipelines::new(&device);
         let (bwd_bg0, bwd_bg1) = rmesh_backward::create_backward_tiled_bind_groups(
             &device, &bwd_tiled_pipelines,
-            &buffers.uniforms, &loss_buffers.dl_d_image, &fwd_tiled.rendered_image,
+            &buffers.uniforms, &loss_buffers.dl_d_image, &rasterize.rendered_image,
             &buffers.vertices, &buffers.indices,
             &buffers.densities, &material.color_grads,
             &material.colors, tile_sort_values_sorted,
@@ -1253,15 +1253,15 @@ fn test_single_tet_loss_decreases() {
     );
 
     // Forward tiled
-    let fwd_tiled = rmesh_render::ForwardTiledPipeline::new(&device, W, H);
-    let fwd_tiled_bg_a = rmesh_render::create_forward_tiled_bind_group(
-        &device, &fwd_tiled, &buffers.uniforms,
+    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H);
+    let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
+        &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
         &buffers.densities, &material.color_grads,
         &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
-    let fwd_tiled_bg_b = rmesh_render::create_forward_tiled_bind_group(
-        &device, &fwd_tiled, &buffers.uniforms,
+    let rasterize_bg_b = rmesh_render::create_rasterize_bind_group(
+        &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
         &buffers.densities, &material.color_grads,
         &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
@@ -1282,7 +1282,7 @@ fn test_single_tet_loss_decreases() {
     queue.write_buffer(&loss_buffers.loss_uniforms, 0, bytemuck::bytes_of(&loss_uni));
 
     let loss_bg = create_loss_bind_group(
-        &device, &loss_pipeline, &loss_buffers, &fwd_tiled.rendered_image,
+        &device, &loss_pipeline, &loss_buffers, &rasterize.rendered_image,
     );
 
     let grad_buffers = rmesh_backward::GradientBuffers::new(
@@ -1295,7 +1295,7 @@ fn test_single_tet_loss_decreases() {
     let bwd_tiled_pipelines = rmesh_backward::BackwardTiledPipelines::new(&device);
     let (bwd_bg0_a, bwd_bg1) = rmesh_backward::create_backward_tiled_bind_groups(
         &device, &bwd_tiled_pipelines,
-        &buffers.uniforms, &loss_buffers.dl_d_image, &fwd_tiled.rendered_image,
+        &buffers.uniforms, &loss_buffers.dl_d_image, &rasterize.rendered_image,
         &buffers.vertices, &buffers.indices,
         &buffers.densities, &material.color_grads,
         &material.colors, &tile_buffers.tile_sort_values,
@@ -1306,7 +1306,7 @@ fn test_single_tet_loss_decreases() {
     );
     let (bwd_bg0_b, _) = rmesh_backward::create_backward_tiled_bind_groups(
         &device, &bwd_tiled_pipelines,
-        &buffers.uniforms, &loss_buffers.dl_d_image, &fwd_tiled.rendered_image,
+        &buffers.uniforms, &loss_buffers.dl_d_image, &rasterize.rendered_image,
         &buffers.vertices, &buffers.indices,
         &buffers.densities, &material.color_grads,
         &material.colors, &radix_state.values_b,
@@ -1379,10 +1379,10 @@ fn test_single_tet_loss_decreases() {
         encoder.clear_buffer(&mat_grad_buffers.d_color_grads, 0, None);
         encoder.clear_buffer(&loss_buffers.loss_value, 0, None);
         encoder.clear_buffer(&tile_buffers.tile_ranges, 0, None);
-        encoder.clear_buffer(&fwd_tiled.rendered_image, 0, None);
+        encoder.clear_buffer(&rasterize.rendered_image, 0, None);
 
         // Forward compute
-        rmesh_render::record_forward_compute(
+        rmesh_render::record_project_compute(
             &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
         );
 
@@ -1413,8 +1413,8 @@ fn test_single_tet_loss_decreases() {
 
         // Forward tiled
         {
-            let fwd_bg = if result_in_b { &fwd_tiled_bg_b } else { &fwd_tiled_bg_a };
-            rmesh_render::record_forward_tiled(&mut encoder, &fwd_tiled, fwd_bg, tile_buffers.num_tiles);
+            let fwd_bg = if result_in_b { &rasterize_bg_b } else { &rasterize_bg_a };
+            rmesh_render::record_rasterize_compute(&mut encoder, &rasterize, fwd_bg, tile_buffers.num_tiles);
         }
 
         // Loss
@@ -1447,7 +1447,7 @@ fn test_single_tet_loss_decreases() {
         queue.submit(std::iter::once(encoder.finish()));
 
         // Compute loss on CPU from rendered image (loss_value buffer no longer populated by shader)
-        let rendered: Vec<f32> = read_buffer(&device, &queue, &fwd_tiled.rendered_image, n_pixels * 4);
+        let rendered: Vec<f32> = read_buffer(&device, &queue, &rasterize.rendered_image, n_pixels * 4);
         let cpu_loss: f32 = rendered.chunks(4).zip(gt_data.chunks(3)).map(|(r, g)| {
             let dr = r[0] - g[0];
             let dg = r[1] - g[1];
@@ -1604,7 +1604,7 @@ fn test_camera_cpu_projection() {
     );
 }
 
-/// Test 2: GPU visibility — forward_compute produces visible tet.
+/// Test 2: GPU visibility — project_compute produces visible tet.
 /// - indirect_args[1] (instance_count) == 1
 /// - tiles_touched[0] > 0
 #[test]
@@ -1639,7 +1639,7 @@ fn test_camera_gpu_visibility() {
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    rmesh_render::record_forward_compute(
+    rmesh_render::record_project_compute(
         &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
     );
     queue.submit(std::iter::once(encoder.finish()));
@@ -1697,7 +1697,7 @@ fn test_camera_tiled_forward_deterministic() {
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    rmesh_render::record_forward_compute(
+    rmesh_render::record_project_compute(
         &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
     );
     queue.submit(std::iter::once(encoder.finish()));
@@ -1752,15 +1752,15 @@ fn test_camera_tiled_forward_deterministic() {
     );
 
     // Forward tiled pipeline
-    let fwd_tiled = rmesh_render::ForwardTiledPipeline::new(&device, W, H);
-    let fwd_tiled_bg_a = rmesh_render::create_forward_tiled_bind_group(
-        &device, &fwd_tiled, &buffers.uniforms,
+    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H);
+    let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
+        &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
         &buffers.densities, &material.color_grads,
         &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
-    let fwd_tiled_bg_b = rmesh_render::create_forward_tiled_bind_group(
-        &device, &fwd_tiled, &buffers.uniforms,
+    let rasterize_bg_b = rmesh_render::create_rasterize_bind_group(
+        &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
         &buffers.densities, &material.color_grads,
         &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
@@ -1768,7 +1768,7 @@ fn test_camera_tiled_forward_deterministic() {
 
     // --- Dispatch ---
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.clear_buffer(&fwd_tiled.rendered_image, 0, None);
+    encoder.clear_buffer(&rasterize.rendered_image, 0, None);
     encoder.clear_buffer(&tile_buffers.tile_ranges, 0, None);
 
     // 1. Scan-based tile pipeline
@@ -1798,15 +1798,15 @@ fn test_camera_tiled_forward_deterministic() {
 
     // 4. Forward tiled
     {
-        let fwd_bg = if result_in_b { &fwd_tiled_bg_b } else { &fwd_tiled_bg_a };
-        rmesh_render::record_forward_tiled(&mut encoder, &fwd_tiled, fwd_bg, tile_buffers.num_tiles);
+        let fwd_bg = if result_in_b { &rasterize_bg_b } else { &rasterize_bg_a };
+        rmesh_render::record_rasterize_compute(&mut encoder, &rasterize, fwd_bg, tile_buffers.num_tiles);
     }
 
     queue.submit(std::iter::once(encoder.finish()));
 
     // Read back rendered image
     let pixel_count = (W * H) as usize;
-    let image: Vec<f32> = read_buffer(&device, &queue, &fwd_tiled.rendered_image, pixel_count * 4);
+    let image: Vec<f32> = read_buffer(&device, &queue, &rasterize.rendered_image, pixel_count * 4);
 
     let total_alpha: f32 = image.iter().skip(3).step_by(4).sum();
     eprintln!(

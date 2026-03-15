@@ -22,10 +22,10 @@ use rmesh_backward::{
 };
 use rmesh_render::{
     build_boundary_bvh, compute_tet_neighbors, create_compute_bind_group,
-    create_forward_tiled_bind_group, create_raytrace_bind_group, create_render_bind_group,
-    find_containing_tet, make_uniforms, record_forward_compute, record_forward_pass,
-    record_forward_tiled, record_raytrace, record_tex_to_buffer, ForwardPipelines,
-    ForwardTiledPipeline, MaterialBuffers, RayTraceBuffers, RayTracePipeline, RenderTargets,
+    create_rasterize_bind_group, create_raytrace_bind_group, create_render_bind_group,
+    find_containing_tet, make_uniforms, record_project_compute, record_forward_pass,
+    record_rasterize_compute, record_raytrace, record_tex_to_buffer, ForwardPipelines,
+    RasterizeComputePipeline, MaterialBuffers, RayTraceBuffers, RayTracePipeline, RenderTargets,
     SceneBuffers, TexToBufferPipeline,
 };
 use rmesh_train::{
@@ -139,15 +139,15 @@ struct RMeshRenderer {
     // B-buffer bind groups (sort result in alternate buffers)
     tile_ranges_bg_b: wgpu::BindGroup,
     // Forward tiled compute pipeline (subgroup-based, 4x4 tiles)
-    fwd_tiled: ForwardTiledPipeline,
-    fwd_tiled_bg: wgpu::BindGroup,
-    fwd_tiled_bg_b: wgpu::BindGroup,
+    rasterize: RasterizeComputePipeline,
+    rasterize_bg: wgpu::BindGroup,
+    rasterize_bg_b: wgpu::BindGroup,
     // Bind groups
     compute_bg: wgpu::BindGroup,
     render_bg: wgpu::BindGroup,
-    // Loss bind group using fwd_tiled.rendered_image (for train_step)
+    // Loss bind group using rasterize.rendered_image (for train_step)
     loss_bg_tiled: wgpu::BindGroup,
-    // Backward tiled bind groups using fwd_tiled.rendered_image (A and B variants)
+    // Backward tiled bind groups using rasterize.rendered_image (A and B variants)
     bwd_tiled_bg0_tiled: wgpu::BindGroup,
     bwd_tiled_bg0_tiled_b: wgpu::BindGroup,
     bwd_tiled_bg1: wgpu::BindGroup,
@@ -357,7 +357,7 @@ impl RMeshRenderer {
         let tile_fill_bg = create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
 
         // Forward tiled compute pipeline (4x4 tiles with subgroups)
-        let fwd_tiled = ForwardTiledPipeline::new(&device, width, height);
+        let rasterize = RasterizeComputePipeline::new(&device, width, height);
 
         // A-buffer bind groups (sort result in primary tile_sort_keys/values)
         // Use num_keys_buf as tile_pair_count since scan pipeline writes total_pairs there
@@ -380,9 +380,9 @@ impl RMeshRenderer {
         );
 
         // Forward tiled bind groups (A and B buffer variants)
-        let fwd_tiled_bg = create_forward_tiled_bind_group(
+        let rasterize_bg = create_rasterize_bind_group(
             &device,
-            &fwd_tiled,
+            &rasterize,
             &scene_buffers.uniforms,
             &scene_buffers.vertices,
             &scene_buffers.indices,
@@ -393,9 +393,9 @@ impl RMeshRenderer {
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
         );
-        let fwd_tiled_bg_b = create_forward_tiled_bind_group(
+        let rasterize_bg_b = create_rasterize_bind_group(
             &device,
-            &fwd_tiled,
+            &rasterize,
             &scene_buffers.uniforms,
             &scene_buffers.vertices,
             &scene_buffers.indices,
@@ -407,21 +407,21 @@ impl RMeshRenderer {
             &tile_buffers.tile_uniforms,
         );
 
-        // Loss bind group using fwd_tiled.rendered_image (for train_step tiled path)
+        // Loss bind group using rasterize.rendered_image (for train_step tiled path)
         let loss_bg_tiled = create_loss_bind_group(
             &device,
             &loss_pipeline,
             &loss_buffers,
-            &fwd_tiled.rendered_image,
+            &rasterize.rendered_image,
         );
 
-        // Backward tiled bind groups using fwd_tiled.rendered_image (for train_step)
+        // Backward tiled bind groups using rasterize.rendered_image (for train_step)
         let (bwd_tiled_bg0_tiled, bwd_tiled_bg1) = create_backward_tiled_bind_groups(
             &device,
             &bwd_tiled_pipelines,
             &scene_buffers.uniforms,
             &loss_buffers.dl_d_image,
-            &fwd_tiled.rendered_image,
+            &rasterize.rendered_image,
             &scene_buffers.vertices,
             &scene_buffers.indices,
             &scene_buffers.densities,
@@ -440,7 +440,7 @@ impl RMeshRenderer {
             &bwd_tiled_pipelines,
             &scene_buffers.uniforms,
             &loss_buffers.dl_d_image,
-            &fwd_tiled.rendered_image,
+            &rasterize.rendered_image,
             &scene_buffers.vertices,
             &scene_buffers.indices,
             &scene_buffers.densities,
@@ -514,9 +514,9 @@ impl RMeshRenderer {
             tile_fill_bg,
             tile_ranges_bg,
             tile_ranges_bg_b,
-            fwd_tiled,
-            fwd_tiled_bg,
-            fwd_tiled_bg_b,
+            rasterize,
+            rasterize_bg,
+            rasterize_bg_b,
             compute_bg,
             render_bg,
             loss_bg_tiled,
@@ -683,15 +683,15 @@ impl RMeshRenderer {
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("forward_tiled"),
+                    label: Some("rasterize_compute"),
                 });
 
             // Clear tile buffers + forward output
             encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
-            encoder.clear_buffer(&self.fwd_tiled.rendered_image, 0, None);
+            encoder.clear_buffer(&self.rasterize.rendered_image, 0, None);
 
             // Forward compute (SH eval + cull + tiles_touched + compact_tet_ids, no sort)
-            record_forward_compute(
+            record_project_compute(
                 &mut encoder,
                 &self.fwd_pipelines,
                 &self.scene_buffers,
@@ -724,9 +724,9 @@ impl RMeshRenderer {
             );
 
             let (ranges_bg, fwd_bg) = if result_in_b {
-                (&self.tile_ranges_bg_b, &self.fwd_tiled_bg_b)
+                (&self.tile_ranges_bg_b, &self.rasterize_bg_b)
             } else {
-                (&self.tile_ranges_bg, &self.fwd_tiled_bg)
+                (&self.tile_ranges_bg, &self.rasterize_bg)
             };
 
             // Tile ranges
@@ -746,9 +746,9 @@ impl RMeshRenderer {
             }
 
             // Forward tiled compute
-            record_forward_tiled(
+            record_rasterize_compute(
                 &mut encoder,
-                &self.fwd_tiled,
+                &self.rasterize,
                 fwd_bg,
                 self.tile_buffers.num_tiles,
             );
@@ -757,7 +757,7 @@ impl RMeshRenderer {
         }
 
         // Read back rendered image
-        let data = read_buffer_f32(&self.device, &self.queue, &self.fwd_tiled.rendered_image);
+        let data = read_buffer_f32(&self.device, &self.queue, &self.rasterize.rendered_image);
 
         let array = Array3::from_shape_vec(
             (self.height as usize, self.width as usize, 4),
@@ -835,7 +835,7 @@ impl RMeshRenderer {
             encoder.clear_buffer(&self.rt_pipeline.rendered_image, 0, None);
 
             // Forward compute (SH eval → colors_buf)
-            record_forward_compute(
+            record_project_compute(
                 &mut encoder,
                 &self.fwd_pipelines,
                 &self.scene_buffers,
@@ -1026,7 +1026,7 @@ impl RMeshRenderer {
             &self.tile_buffers.tile_sort_values,
         );
 
-        // Use _tiled bind groups that reference fwd_tiled.rendered_image
+        // Use _tiled bind groups that reference rasterize.rendered_image
         // (backward() is called after forward_tiled() in the autograd path)
         let (ranges_bg, bwd_bg0) = if result_in_b {
             (&self.tile_ranges_bg_b, &self.bwd_tiled_bg0_tiled_b)
@@ -1198,10 +1198,10 @@ impl RMeshRenderer {
         encoder.clear_buffer(&self.mat_grad_buffers.d_color_grads, 0, None);
         encoder.clear_buffer(&self.loss_buffers.loss_value, 0, None);
         encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
-        encoder.clear_buffer(&self.fwd_tiled.rendered_image, 0, None);
+        encoder.clear_buffer(&self.rasterize.rendered_image, 0, None);
 
         // Forward compute (SH eval + cull + tiles_touched + compact_tet_ids, no sort)
-        record_forward_compute(
+        record_project_compute(
             &mut encoder,
             &self.fwd_pipelines,
             &self.scene_buffers,
@@ -1235,9 +1235,9 @@ impl RMeshRenderer {
         );
 
         let (ranges_bg, fwd_bg, bwd_bg0) = if result_in_b {
-            (&self.tile_ranges_bg_b, &self.fwd_tiled_bg_b, &self.bwd_tiled_bg0_tiled_b)
+            (&self.tile_ranges_bg_b, &self.rasterize_bg_b, &self.bwd_tiled_bg0_tiled_b)
         } else {
-            (&self.tile_ranges_bg, &self.fwd_tiled_bg, &self.bwd_tiled_bg0_tiled)
+            (&self.tile_ranges_bg, &self.rasterize_bg, &self.bwd_tiled_bg0_tiled)
         };
 
         // Tile ranges
@@ -1257,14 +1257,14 @@ impl RMeshRenderer {
         }
 
         // Forward tiled compute
-        record_forward_tiled(
+        record_rasterize_compute(
             &mut encoder,
-            &self.fwd_tiled,
+            &self.rasterize,
             fwd_bg,
             self.tile_buffers.num_tiles,
         );
 
-        // Loss compute (reads from fwd_tiled.rendered_image via loss_bg_tiled)
+        // Loss compute (reads from rasterize.rendered_image via loss_bg_tiled)
         rmesh_train::record_loss_pass(
             &mut encoder,
             &self.loss_pipeline,

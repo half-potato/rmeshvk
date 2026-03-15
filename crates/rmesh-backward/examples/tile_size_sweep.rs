@@ -23,8 +23,8 @@ const BENCH_ITERS: u32 = 5;
 const TILE_SIZES: &[u32] = &[8, 12, 16, 20, 24, 32];
 
 // Shader sources (base tile size = 16)
-const FWD_COMPUTE_SRC: &str = include_str!("../../../crates/rmesh-render/src/wgsl/forward_compute.wgsl");
-const FWD_TILED_SRC: &str = include_str!("../../../crates/rmesh-render/src/wgsl/forward_tiled_compute.wgsl");
+const PROJECT_COMPUTE_SRC: &str = include_str!("../../../crates/rmesh-render/src/wgsl/project_compute.wgsl");
+const RASTERIZE_COMPUTE_SRC: &str = include_str!("../../../crates/rmesh-render/src/wgsl/rasterize_compute.wgsl");
 const BWD_TILED_SRC: &str = include_str!("../../../crates/rmesh-backward/src/wgsl/backward_tiled_compute.wgsl");
 
 // ---------------------------------------------------------------------------
@@ -64,8 +64,8 @@ fn patch_tiled_shader(src: &str, ts: u32) -> String {
         .replace(", 15)", &format!(", {ts_m1})"))
 }
 
-/// Patch forward_compute.wgsl tile_size constant.
-fn patch_forward_compute(src: &str, ts: u32) -> String {
+/// Patch project_compute.wgsl tile_size constant.
+fn patch_project_compute(src: &str, ts: u32) -> String {
     src.replace(
         "let tile_size = 16.0;",
         &format!("let tile_size = {ts}.0;"),
@@ -132,7 +132,7 @@ fn fwd_compute_layout(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::Pi
 }
 
 /// Build the forward tiled pipeline layout (10 bindings, 1 group).
-fn fwd_tiled_layout(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
+fn rasterize_layout(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
     let read_only = [true, true, true, true, true, true, true, true, true, false];
     let entries: Vec<wgpu::BindGroupLayoutEntry> = read_only
         .iter()
@@ -140,11 +140,11 @@ fn fwd_tiled_layout(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::Pipe
         .map(|(i, &ro)| rmesh_tile::storage_entry(i as u32, ro))
         .collect();
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("fwd_tiled_bgl"),
+        label: Some("rasterize_bgl"),
         entries: &entries,
     });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("fwd_tiled_pl"),
+        label: Some("rasterize_pl"),
         bind_group_layouts: &[&bgl],
         immediate_size: 0,
     });
@@ -188,7 +188,7 @@ struct TileSizeState {
     tile_size: u32,
     // Patched pipelines
     fwd_compute_pipeline: wgpu::ComputePipeline,
-    fwd_tiled_pipeline: wgpu::ComputePipeline,
+    rasterize_pipeline: wgpu::ComputePipeline,
     bwd_tiled_pipeline: wgpu::ComputePipeline,
     // Tile infrastructure
     tile_buffers: rmesh_backward::TileBuffers,
@@ -199,8 +199,8 @@ struct TileSizeState {
     tile_gen_scan_bg: wgpu::BindGroup,
     tile_ranges_bg_a: wgpu::BindGroup,
     tile_ranges_bg_b: wgpu::BindGroup,
-    fwd_tiled_bg_a: wgpu::BindGroup,
-    fwd_tiled_bg_b: wgpu::BindGroup,
+    rasterize_bg_a: wgpu::BindGroup,
+    rasterize_bg_b: wgpu::BindGroup,
     bwd_bg0_a: wgpu::BindGroup,
     bwd_bg0_b: wgpu::BindGroup,
     bwd_bg1: wgpu::BindGroup,
@@ -331,13 +331,13 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
     let n_pixels = (W as u64) * (H as u64);
 
     // Patch shaders
-    let fwd_compute_src = patch_forward_compute(FWD_COMPUTE_SRC, tile_size);
-    let fwd_tiled_src = patch_tiled_shader(FWD_TILED_SRC, tile_size);
+    let fwd_compute_src = patch_project_compute(PROJECT_COMPUTE_SRC, tile_size);
+    let rasterize_src = patch_tiled_shader(RASTERIZE_COMPUTE_SRC, tile_size);
     let bwd_tiled_src = patch_tiled_shader(BWD_TILED_SRC, tile_size);
 
     // Create pipeline layouts
     let (fwd_compute_bgl, fwd_compute_pl) = fwd_compute_layout(device);
-    let (fwd_tiled_bgl, fwd_tiled_pl) = fwd_tiled_layout(device);
+    let (rasterize_bgl, rasterize_pl) = rasterize_layout(device);
     let (bwd_bgl0, bwd_bgl1, bwd_pl) = bwd_tiled_layout(device);
 
     // Create pipelines from patched sources
@@ -347,11 +347,11 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
         &format!("fwd_compute_ts{tile_size}"),
         &fwd_compute_pl,
     );
-    let fwd_tiled_pipeline = create_compute_pipeline(
+    let rasterize_pipeline = create_compute_pipeline(
         device,
-        &fwd_tiled_src,
-        &format!("fwd_tiled_ts{tile_size}"),
-        &fwd_tiled_pl,
+        &rasterize_src,
+        &format!("rasterize_ts{tile_size}"),
+        &rasterize_pl,
     );
     let bwd_tiled_pipeline = create_compute_pipeline(
         device,
@@ -465,9 +465,9 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
     });
 
     // Forward tiled bind groups (A and B)
-    let fwd_tiled_bg_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("fwd_tiled_bg_a"),
-        layout: &fwd_tiled_bgl,
+    let rasterize_bg_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("rasterize_bg_a"),
+        layout: &rasterize_bgl,
         entries: &[
             buf_entry(0, &sb.uniforms),
             buf_entry(1, &sb.vertices),
@@ -481,9 +481,9 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
             buf_entry(9, &rendered_image),
         ],
     });
-    let fwd_tiled_bg_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("fwd_tiled_bg_b"),
-        layout: &fwd_tiled_bgl,
+    let rasterize_bg_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("rasterize_bg_b"),
+        layout: &rasterize_bgl,
         entries: &[
             buf_entry(0, &sb.uniforms),
             buf_entry(1, &sb.vertices),
@@ -553,7 +553,7 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
     TileSizeState {
         tile_size,
         fwd_compute_pipeline,
-        fwd_tiled_pipeline,
+        rasterize_pipeline,
         bwd_tiled_pipeline,
         tile_buffers,
         radix_state,
@@ -562,8 +562,8 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
         tile_gen_scan_bg,
         tile_ranges_bg_a,
         tile_ranges_bg_b,
-        fwd_tiled_bg_a,
-        fwd_tiled_bg_b,
+        rasterize_bg_a,
+        rasterize_bg_b,
         bwd_bg0_a,
         bwd_bg0_b,
         bwd_bg1,
@@ -617,7 +617,7 @@ fn record_forward_backward(
     // Forward compute (patched for this tile size)
     {
         let tw = recorder.as_mut().map(|r| {
-            let (b, e) = r.allocate("forward_compute");
+            let (b, e) = r.allocate("project_compute");
             wgpu::ComputePassTimestampWrites {
                 query_set: r.query_set(),
                 beginning_of_pass_write_index: Some(b),
@@ -625,7 +625,7 @@ fn record_forward_backward(
             }
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("forward_compute"),
+            label: Some("project_compute"),
             timestamp_writes: tw,
         });
         pass.set_pipeline(&ts.fwd_compute_pipeline);
@@ -698,12 +698,12 @@ fn record_forward_backward(
     // Forward tiled (patched)
     {
         let fwd_bg = if result_in_b {
-            &ts.fwd_tiled_bg_b
+            &ts.rasterize_bg_b
         } else {
-            &ts.fwd_tiled_bg_a
+            &ts.rasterize_bg_a
         };
         let tw = recorder.as_mut().map(|r| {
-            let (b, e) = r.allocate("forward_tiled");
+            let (b, e) = r.allocate("rasterize_compute");
             wgpu::ComputePassTimestampWrites {
                 query_set: r.query_set(),
                 beginning_of_pass_write_index: Some(b),
@@ -711,10 +711,10 @@ fn record_forward_backward(
             }
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("forward_tiled"),
+            label: Some("rasterize_compute"),
             timestamp_writes: tw,
         });
-        pass.set_pipeline(&ts.fwd_tiled_pipeline);
+        pass.set_pipeline(&ts.rasterize_pipeline);
         pass.set_bind_group(0, fwd_bg, &[]);
         let (x, y) = rmesh_tile::dispatch_2d(ts.tile_buffers.num_tiles);
         pass.dispatch_workgroups(x, y, 1);
@@ -834,7 +834,7 @@ fn main() {
             let mut total = 0.0;
             for (name, ms) in &timings {
                 total += ms;
-                if name == "forward_tiled" {
+                if name == "rasterize_compute" {
                     fwd_ms = *ms;
                 } else if name == "backward_tiled" {
                     bwd_ms = *ms;

@@ -1,6 +1,6 @@
 // Prepare indirect dispatch args from visible_tet_count.
 //
-// Reads indirect_args.instance_count (= visible_tet_count set by forward_compute)
+// Reads indirect_args.instance_count (= visible_tet_count set by project_compute)
 // and writes dispatch args for RTS prefix scan and tile gen.
 // Also computes RTS info struct {size, vec_size, thread_blocks}.
 // Eliminates CPU readback of visible_tet_count.

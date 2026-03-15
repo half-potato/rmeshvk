@@ -1,4 +1,4 @@
-// Forward compute shader: per-tet SH evaluation, frustum culling, depth key generation.
+// Project compute shader: per-tet projection, frustum culling, depth key generation, tile counting.
 //
 // Ported from forward_compute.rs (rust-gpu).
 // Key differences from webrm: direct SH coefficients (no PCA), safe math.
@@ -47,13 +47,6 @@ fn project_to_ndc(pos: vec3<f32>, vp: mat4x4<f32>) -> vec4<f32> {
     let clip = vp * vec4<f32>(pos, 1.0);
     let inv_w = 1.0 / (clip.w + 1e-6);
     return vec4<f32>(clip.xyz * inv_w, clip.w);
-}
-
-fn softplus(x: f32) -> f32 {
-    if (x > 8.0) {
-        return x;
-    }
-    return 0.1 * log(1.0 + exp(10.0 * x));
 }
 
 fn load_vertex(idx: u32) -> vec3<f32> {

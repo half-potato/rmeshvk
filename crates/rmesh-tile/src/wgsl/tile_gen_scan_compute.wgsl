@@ -77,7 +77,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         num_keys_out[0] = pair_offsets[vis_idx];
     }
 
-    // Early return for behind-camera tets (tiles_touched=0 from forward_compute)
+    // Early return for behind-camera tets (tiles_touched=0 from project_compute)
     if (max_write == 0u) {
         return;
     }
@@ -104,7 +104,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     let H = f32(tile_uniforms.screen_height);
     let ts = f32(tile_uniforms.tile_size);
 
-    // NDC to pixel coords (epsilon matches forward_compute.wgsl project_to_ndc)
+    // NDC to pixel coords (epsilon matches project_compute.wgsl project_to_ndc)
     let n0 = c0.xyz / (c0.w + 1e-6);
     let n1 = c1.xyz / (c1.w + 1e-6);
     let n2 = c2.xyz / (c2.w + 1e-6);
@@ -143,7 +143,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     let inv_depth = ~bitcast<u32>(depth);
     let depth_bits = inv_depth >> 17u;
 
-    // Conservative scanline tile enumeration (Variant B) — same algorithm as forward_compute
+    // Conservative scanline tile enumeration (Variant B) — same algorithm as project_compute
     let T = ts;
     let ei_arr = array<u32, 6>(0u, 0u, 0u, 1u, 1u, 2u);
     let ej_arr = array<u32, 6>(1u, 2u, 3u, 2u, 3u, 3u);
