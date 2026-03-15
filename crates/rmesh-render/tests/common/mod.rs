@@ -191,24 +191,22 @@ pub fn sort_tets_back_to_front(scene: &SceneData, cam_pos: Vec3) -> Vec<u32> {
 // Camera ray construction
 // ---------------------------------------------------------------------------
 
-/// Compute world-space ray direction for pixel (px, py) matching the vertex shader.
+/// Compute world-space ray direction for pixel (px, py) matching rasterize_compute.wgsl.
 ///
-/// The vertex shader projects world vertices to clip space. The fragment shader
-/// gets `ray_dir = normalize(world_pos - cam)` interpolated across the face.
-///
-/// For CPU reference, we shoot a ray from cam through the pixel center using
-/// the inverse VP matrix to unproject NDC → world.
-pub fn pixel_ray_dir(inv_vp: Mat4, cam_pos: Vec3, px: f32, py: f32, w: f32, h: f32) -> Vec3 {
+/// Uses the same two-point unproject (near + far) as the GPU tiled shader to ensure
+/// identical floating-point behavior at silhouette boundaries.
+pub fn pixel_ray_dir(inv_vp: Mat4, _cam_pos: Vec3, px: f32, py: f32, w: f32, h: f32) -> Vec3 {
     // NDC: x ∈ [-1,1], y ∈ [-1,1] (wgpu: y=-1 at top, y=+1 at bottom)
-    let ndc_x = (2.0 * px + 1.0) / w - 1.0;
-    let ndc_y = 1.0 - (2.0 * py + 1.0) / h; // flip y for wgpu convention
+    let ndc_x = (2.0 * (px + 0.5)) / w - 1.0;
+    let ndc_y = 1.0 - (2.0 * (py + 0.5)) / h;
 
-    // Unproject a point on the near plane
-    let clip_near = Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
-    let world_h = inv_vp * clip_near;
-    let world_pos = world_h.truncate() / world_h.w;
+    // Unproject near and far clip points — matches rasterize_compute.wgsl exactly
+    let near_clip = inv_vp * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+    let far_clip = inv_vp * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+    let near_world = near_clip.truncate() / near_clip.w;
+    let far_world = far_clip.truncate() / far_clip.w;
 
-    (world_pos - cam_pos).normalize()
+    (far_world - near_world).normalize()
 }
 
 // ---------------------------------------------------------------------------

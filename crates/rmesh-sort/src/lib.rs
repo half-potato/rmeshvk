@@ -271,6 +271,10 @@ pub fn record_radix_sort(
     let (count_dx, count_dy) = dispatch_2d(max_num_wgs);
     let (reduce_dx, reduce_dy) = dispatch_2d(num_reduce_wgs);
 
+    // Zero the reduced buffer so the scan shader (which always reads 1024 elements)
+    // doesn't read uninitialized memory when num_reduce_wgs < 1024.
+    encoder.clear_buffer(&state.reduced, 0, None);
+
     for pass in 0..num_passes {
         let even = pass % 2 == 0;
         let (src_keys, src_vals, dst_keys, dst_vals) = if even {

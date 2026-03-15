@@ -223,10 +223,15 @@ fn main(
                 }
             }
 
-            // Convert float range to integer pixel range within [0, 15]
+            // Convert float range to integer pixel range within [0, 15].
+            // Use a small epsilon to conservatively include pixels whose centers
+            // fall exactly on the silhouette boundary.  Without this, floating-point
+            // rounding in the scanline intersection can exclude boundary pixels that
+            // the 3D ray-tet intersection correctly handles.
             if (xl_f <= xr_f) {
-                let xl_i = max(i32(ceil(xl_f - 0.5)), 0);
-                let xr_i = min(i32(floor(xr_f - 0.5)), 15);
+                let eps = 0.001;
+                let xl_i = max(i32(ceil(xl_f - 0.5 - eps)), 0);
+                let xr_i = min(i32(floor(xr_f - 0.5 + eps)), 15);
                 if (xl_i <= xr_i) {
                     sm_xl[lane] = xl_i;
                     sm_xr[lane] = xr_i;
