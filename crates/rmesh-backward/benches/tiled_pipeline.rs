@@ -15,7 +15,7 @@ use rmesh_train::{create_loss_bind_group, record_loss_pass, LossBuffers, LossPip
 
 const W: u32 = 1920;
 const H: u32 = 1080;
-const TILE_SIZE: u32 = 16;
+const TILE_SIZE: u32 = 8;
 const GRID_SIZE: u32 = 126; // ~2M verts, ~10M tets
 
 fn setup_camera() -> (Mat4, Mat4, Vec3) {
