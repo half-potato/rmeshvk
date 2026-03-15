@@ -2424,6 +2424,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "criterion",
+ "env_logger",
  "glam",
  "log",
  "pollster",

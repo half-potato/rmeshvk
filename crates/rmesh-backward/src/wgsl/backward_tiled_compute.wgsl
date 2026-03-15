@@ -54,13 +54,13 @@ struct TileUniforms {
 @group(0) @binding(10) var<storage, read> base_colors_buf: array<f32>;
 
 // Group 1: read-write gradient outputs + tile metadata
-@group(1) @binding(0) var<storage, read_write> d_vertices: array<atomic<u32>>;
-@group(1) @binding(1) var<storage, read_write> d_densities: array<atomic<u32>>;
-@group(1) @binding(2) var<storage, read_write> d_color_grads: array<atomic<u32>>;
+@group(1) @binding(0) var<storage, read_write> d_vertices: array<atomic<f32>>;
+@group(1) @binding(1) var<storage, read_write> d_densities: array<atomic<f32>>;
+@group(1) @binding(2) var<storage, read_write> d_color_grads: array<atomic<f32>>;
 @group(1) @binding(3) var<storage, read> tile_ranges: array<u32>;
 @group(1) @binding(4) var<storage, read> tile_uniforms: TileUniforms;
 @group(1) @binding(5) var<storage, read_write> debug_image: array<f32>;
-@group(1) @binding(6) var<storage, read_write> d_base_colors: array<atomic<u32>>;
+@group(1) @binding(6) var<storage, read_write> d_base_colors: array<atomic<f32>>;
 
 // Face (a, b, c, opposite_vertex) — opposite used to flip normal inward
 const FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
@@ -101,45 +101,21 @@ fn load_f32x3_v(idx: u32) -> vec3<f32> {
     return vec3<f32>(vertices[idx * 3u], vertices[idx * 3u + 1u], vertices[idx * 3u + 2u]);
 }
 
-// Atomic f32 add (CAS pattern)
+// Native float atomicAdd (requires VK_EXT_shader_atomic_float / SHADER_FLOAT32_ATOMIC)
 fn global_cas_add_density(buf_idx: u32, val: f32) {
-    var ob = atomicLoad(&d_densities[buf_idx]);
-    loop {
-        let nv = bitcast<u32>(bitcast<f32>(ob) + val);
-        let r = atomicCompareExchangeWeak(&d_densities[buf_idx], ob, nv);
-        if (r.exchanged) { break; }
-        ob = r.old_value;
-    }
+    atomicAdd(&d_densities[buf_idx], val);
 }
 
 fn global_cas_add_vertex(buf_idx: u32, val: f32) {
-    var ob = atomicLoad(&d_vertices[buf_idx]);
-    loop {
-        let nv = bitcast<u32>(bitcast<f32>(ob) + val);
-        let r = atomicCompareExchangeWeak(&d_vertices[buf_idx], ob, nv);
-        if (r.exchanged) { break; }
-        ob = r.old_value;
-    }
+    atomicAdd(&d_vertices[buf_idx], val);
 }
 
 fn global_cas_add_color_grad(buf_idx: u32, val: f32) {
-    var ob = atomicLoad(&d_color_grads[buf_idx]);
-    loop {
-        let nv = bitcast<u32>(bitcast<f32>(ob) + val);
-        let r = atomicCompareExchangeWeak(&d_color_grads[buf_idx], ob, nv);
-        if (r.exchanged) { break; }
-        ob = r.old_value;
-    }
+    atomicAdd(&d_color_grads[buf_idx], val);
 }
 
 fn global_cas_add_base_color(buf_idx: u32, val: f32) {
-    var ob = atomicLoad(&d_base_colors[buf_idx]);
-    loop {
-        let nv = bitcast<u32>(bitcast<f32>(ob) + val);
-        let r = atomicCompareExchangeWeak(&d_base_colors[buf_idx], ob, nv);
-        if (r.exchanged) { break; }
-        ob = r.old_value;
-    }
+    atomicAdd(&d_base_colors[buf_idx], val);
 }
 
 // Full warp reduction: sum across 32 lanes via butterfly XOR pattern.

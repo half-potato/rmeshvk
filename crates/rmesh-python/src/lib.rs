@@ -247,7 +247,7 @@ impl RMeshRenderer {
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("rmesh_renderer"),
-                required_features: wgpu::Features::SUBGROUP,
+                required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
                 required_limits: wgpu::Limits {
                     max_storage_buffers_per_shader_stage: 16,
                     max_storage_buffer_binding_size: 1 << 30, // 1 GiB

@@ -367,7 +367,7 @@ async fn gpu_render_scene_async(
     let (device, queue) = adapter
         .request_device(
             &wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::SUBGROUP,
+                required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
                 required_limits: wgpu::Limits {
                     max_storage_buffers_per_shader_stage: 16,
                     max_storage_buffer_binding_size: 1 << 30,
@@ -652,7 +652,7 @@ async fn gpu_tiled_render_scene_async(
     let (device, queue) = adapter
         .request_device(
             &wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::SUBGROUP,
+                required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
                 required_limits: wgpu::Limits {
                     max_storage_buffers_per_shader_stage: 16,
                     max_storage_buffer_binding_size: 1 << 30,

@@ -35,9 +35,9 @@ struct Uniforms {
 @group(0) @binding(9) var<storage, read> sorted_indices: array<u32>;
 
 // Group 1: read-write gradient outputs
-@group(1) @binding(0) var<storage, read_write> d_vertices: array<atomic<u32>>;
-@group(1) @binding(1) var<storage, read_write> d_densities: array<atomic<u32>>;
-@group(1) @binding(2) var<storage, read_write> d_color_grads: array<atomic<u32>>;
+@group(1) @binding(0) var<storage, read_write> d_vertices: array<atomic<f32>>;
+@group(1) @binding(1) var<storage, read_write> d_densities: array<atomic<f32>>;
+@group(1) @binding(2) var<storage, read_write> d_color_grads: array<atomic<f32>>;
 
 const TINY_VAL: f32 = 1e-20;
 
@@ -314,37 +314,17 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             for (var ax = 0u; ax < 3u; ax++) {
                 let comp = select(select(dv.z, dv.y, ax == 1u), dv.x, ax == 0u);
                 let gi = vidx * 3u + ax;
-                var ob_v = atomicLoad(&d_vertices[gi]);
-                loop {
-                    let nv_v = bitcast<u32>(bitcast<f32>(ob_v) + comp);
-                    let r_v = atomicCompareExchangeWeak(&d_vertices[gi], ob_v, nv_v);
-                    if (r_v.exchanged) { break; }
-                    ob_v = r_v.old_value;
-                }
+                atomicAdd(&d_vertices[gi], comp);
             }
         }
 
-        {
-            var ob_d = atomicLoad(&d_densities[tet_id]);
-            loop {
-                let nv_d = bitcast<u32>(bitcast<f32>(ob_d) + d_density_local);
-                let r_d = atomicCompareExchangeWeak(&d_densities[tet_id], ob_d, nv_d);
-                if (r_d.exchanged) { break; }
-                ob_d = r_d.old_value;
-            }
-        }
+        atomicAdd(&d_densities[tet_id], d_density_local);
 
         let dg = d_grad;
         for (var gi2 = 0u; gi2 < 3u; gi2++) {
             let gc = select(select(dg.z, dg.y, gi2 == 1u), dg.x, gi2 == 0u);
             let gidx = tet_id * 3u + gi2;
-            var ob_g = atomicLoad(&d_color_grads[gidx]);
-            loop {
-                let nv_g = bitcast<u32>(bitcast<f32>(ob_g) + gc);
-                let r_g = atomicCompareExchangeWeak(&d_color_grads[gidx], ob_g, nv_g);
-                if (r_g.exchanged) { break; }
-                ob_g = r_g.old_value;
-            }
+            atomicAdd(&d_color_grads[gidx], gc);
         }
 
         // 4n. Update pixel state for next iteration

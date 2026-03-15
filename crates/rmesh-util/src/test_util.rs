@@ -56,7 +56,7 @@ pub fn create_test_device(config: TestDeviceConfig) -> Option<(wgpu::Device, wgp
 
         adapter
             .request_device(&wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::SUBGROUP | config.extra_features,
+                required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC | config.extra_features,
                 required_limits: wgpu::Limits {
                     max_storage_buffers_per_shader_stage: 16,
                     max_storage_buffer_binding_size: 1 << 30,
@@ -326,7 +326,7 @@ pub fn grid_tet_scene(grid_size: u32) -> SceneData {
 /// Create a GPU device with SUBGROUP + TIMESTAMP_QUERY features.
 pub fn create_timestamp_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     create_test_device(TestDeviceConfig {
-        extra_features: wgpu::Features::TIMESTAMP_QUERY,
+        extra_features: wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::SHADER_FLOAT32_ATOMIC,
         ..Default::default()
     })
 }

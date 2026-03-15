@@ -86,7 +86,7 @@ fn main() -> Result<()> {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("rmesh train"),
-                    required_features: wgpu::Features::SUBGROUP,
+                    required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
                     required_limits: wgpu::Limits::default(),
                     ..Default::default()
                 },
