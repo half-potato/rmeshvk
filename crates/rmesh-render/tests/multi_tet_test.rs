@@ -19,13 +19,13 @@ const H: u32 = 64;
 /// Outside views typically show mean_diff < 0.001.
 const ATOL: f32 = 0.02;
 
-fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat4) {
+fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat3, [f32; 4]) {
     let aspect = W as f32 / H as f32;
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, target, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let inv_vp = vp.inverse();
-    (vp, inv_vp)
+    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
+    (vp, c2w, intrinsics)
 }
 
 /// Two tetrahedra sharing a face (5 unique vertices).
@@ -104,13 +104,13 @@ fn test_two_tet_center_view() {
 
     let eye = Vec3::new(0.5, 0.4, 0.1); // inside one of the tets, off the shared face
     let target = eye + Vec3::new(1.0, 0.0, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, target);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
-    let cpu_image = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+    let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
     let total_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
     assert!(total_alpha > 0.01, "CPU image is all-zero");
 
-    if let Some(gpu_image) = gpu_render_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(gpu_image) = gpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
         eprintln!("two_tet_center: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
         // Very relaxed tolerance: camera inside multi-tet scene causes major
@@ -136,11 +136,11 @@ fn test_two_tet_outside_view() {
     // up=(0,0,1) creates degenerate look_at when forward ∥ up.
     let eye = Vec3::new(3.0, 0.4, 1.0);
     let target = Vec3::new(0.5, 0.4, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, target);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
-    let cpu_image = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+    let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
 
-    if let Some(gpu_image) = gpu_render_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(gpu_image) = gpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
         eprintln!("two_tet_outside: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
         assert!(
@@ -166,10 +166,10 @@ fn test_four_tet_multi_angle() {
     ];
 
     for (i, (eye, target)) in viewpoints.iter().enumerate() {
-        let (vp, inv_vp) = setup_camera(*eye, *target);
-        let cpu_image = cpu_render_scene(&scene, *eye, vp, inv_vp, W, H);
+        let (vp, c2w, intrinsics) = setup_camera(*eye, *target);
+        let cpu_image = cpu_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H);
 
-        if let Some(gpu_image) = gpu_render_scene(&scene, *eye, vp, inv_vp, W, H) {
+        if let Some(gpu_image) = gpu_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H) {
             let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
             eprintln!("four_tet angle {i}: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
             assert!(

@@ -44,10 +44,10 @@ fn safe_clip_v4f(v: vec4<f32>, minv: f32, maxv: f32) -> vec4<f32> {
 // --- End safe math utilities ---
 
 // phi(x) = (1 - exp(-x)) / x
-// Numerically stable: if |x| < 1e-6, use Taylor expansion phi ~ 1 - x/2
+// Taylor with 4 terms for |x| < 0.02 avoids catastrophic cancellation.
 fn phi(x: f32) -> f32 {
-    if (abs(x) < 1e-6) {
-        return 1.0 - x * 0.5;
+    if (abs(x) < 0.02) {
+        return 1.0 + x * (-0.5 + x * (1.0/6.0 + x * (-1.0/24.0)));
     }
     return (1.0 - exp(-x)) / x;
 }

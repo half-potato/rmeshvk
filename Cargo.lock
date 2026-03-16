@@ -2505,6 +2505,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmesh-error"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "rmesh-tile",
+ "wgpu",
+]
+
+[[package]]
 name = "rmesh-python"
 version = "0.1.0"
 dependencies = [
@@ -2517,6 +2526,7 @@ dependencies = [
  "pyo3",
  "rmesh-backward",
  "rmesh-data",
+ "rmesh-error",
  "rmesh-render",
  "rmesh-train",
  "rmesh-util",
@@ -2603,6 +2613,8 @@ dependencies = [
  "pollster",
  "rmesh-data",
  "rmesh-render",
+ "rmesh-sort",
+ "rmesh-util",
  "wgpu",
  "winit",
 ]

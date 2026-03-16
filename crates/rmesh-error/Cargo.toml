@@ -1,0 +1,9 @@
+[package]
+name = "rmesh-error"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rmesh-tile = { path = "../rmesh-tile" }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }

@@ -20,13 +20,13 @@ const H: u32 = 64;
 /// more due to near-plane clipping on GPU that CPU ray casting doesn't have.
 const ATOL: f32 = 0.02;
 
-fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat4) {
+fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat3, [f32; 4]) {
     let aspect = W as f32 / H as f32;
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, target, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let inv_vp = vp.inverse();
-    (vp, inv_vp)
+    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
+    (vp, c2w, intrinsics)
 }
 
 /// Camera at the centroid of the tet, looking outward with random rotation.
@@ -48,9 +48,9 @@ fn test_center_view() {
         // Camera at centroid, look along +X
         let eye = centroid;
         let target = centroid + Vec3::new(1.0, 0.0, 0.0);
-        let (vp, inv_vp) = setup_camera(eye, target);
+        let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
-        let cpu_image = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+        let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
 
         // Check CPU image isn't all zero (tet should be visible from inside)
         let total_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
@@ -60,7 +60,7 @@ fn test_center_view() {
         );
 
         // GPU comparison (skip if no adapter)
-        if let Some(gpu_image) = gpu_render_scene(&scene, eye, vp, inv_vp, W, H) {
+        if let Some(gpu_image) = gpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
             let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
             eprintln!(
                 "center_view radius={radius}: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}"
@@ -98,11 +98,11 @@ fn test_face_view() {
 
         let eye = face_center + face_normal * offset;
         let target = centroid;
-        let (vp, inv_vp) = setup_camera(eye, target);
+        let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
-        let cpu_image = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+        let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
 
-        if let Some(gpu_image) = gpu_render_scene(&scene, eye, vp, inv_vp, W, H) {
+        if let Some(gpu_image) = gpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
             let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
             eprintln!(
                 "face_view offset={offset}: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}"
@@ -128,14 +128,14 @@ fn test_raytrace_single_tet_outside() {
     let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
 
     let eye = centroid + Vec3::new(2.0, 0.0, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, centroid);
+    let (vp, c2w, intrinsics) = setup_camera(eye, centroid);
 
-    let cpu_image = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+    let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
 
     let total_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
     assert!(total_alpha > 0.1, "CPU image is all-zero");
 
-    if let Some(rt_image) = gpu_raytrace_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(rt_image) = gpu_raytrace_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let (max_diff, mean_diff, _) = compare_images(&cpu_image, &rt_image);
         eprintln!(
             "raytrace outside: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}"
@@ -161,14 +161,14 @@ fn test_raytrace_single_tet_inside() {
 
     let eye = centroid;
     let target = centroid + Vec3::new(1.0, 0.0, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, target);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
-    let cpu_image = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+    let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
 
     let total_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
     assert!(total_alpha > 0.01, "CPU image is all-zero");
 
-    if let Some(rt_image) = gpu_raytrace_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(rt_image) = gpu_raytrace_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let (max_diff, mean_diff, _) = compare_images(&cpu_image, &rt_image);
         eprintln!(
             "raytrace inside: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}"
@@ -195,9 +195,9 @@ fn test_cpu_reference_sanity() {
     let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
 
     let eye = centroid + Vec3::new(2.0, 0.0, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, centroid);
+    let (vp, c2w, intrinsics) = setup_camera(eye, centroid);
 
-    let image = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+    let image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
 
     // All alpha values should be in [0, 1]
     for (i, pixel) in image.iter().enumerate() {

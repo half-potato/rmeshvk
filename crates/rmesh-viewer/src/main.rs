@@ -5,6 +5,8 @@
 //!
 //! Controls:
 //!   Left-drag: Orbit
+//!   Middle-drag: Pan
+//!   Right-drag (vertical): Zoom
 //!   Scroll: Zoom
 //!   Escape: Quit
 
@@ -19,9 +21,15 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use rmesh_render::{
-    create_compute_bind_group, create_render_bind_group, ForwardPipelines, MaterialBuffers,
-    RenderTargets, SceneBuffers, Uniforms,
+    create_compute_bind_group, create_render_bind_group,
+    create_render_bind_group_with_sort_values, BlitPipeline, ForwardPipelines, MaterialBuffers,
+    RenderTargets, SceneBuffers, Uniforms, create_blit_bind_group, record_blit,
 };
+
+/// SH degree-0 normalization constant.
+const C0: f32 = 0.28209479;
+/// SH degree-1 normalization constant.
+const C1: f32 = 0.48860251;
 
 /// Orbit camera matching the webrm Camera class.
 struct Camera {
@@ -87,6 +95,23 @@ impl Camera {
     fn zoom(&mut self, delta: f32) {
         self.orbit_distance = (self.orbit_distance + delta * 0.01).max(0.1);
     }
+
+    fn pan(&mut self, dx: f32, dy: f32) {
+        let sensitivity = 0.002 * self.orbit_distance;
+        let yaw = self.orbit_yaw;
+        let pitch = self.orbit_pitch;
+
+        // Right vector (perpendicular to forward in XY plane)
+        let right = Vec3::new(-yaw.sin(), yaw.cos(), 0.0);
+        // Up vector (perpendicular to forward and right)
+        let up = Vec3::new(
+            -pitch.sin() * yaw.cos(),
+            -pitch.sin() * yaw.sin(),
+            pitch.cos(),
+        );
+
+        self.orbit_target += sensitivity * (-dx * right + dy * up);
+    }
 }
 
 struct GpuState {
@@ -95,11 +120,16 @@ struct GpuState {
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
     pipelines: ForwardPipelines,
+    blit_pipeline: BlitPipeline,
+    sort_pipelines: rmesh_sort::RadixSortPipelines,
+    sort_state: rmesh_sort::RadixSortState,
     buffers: SceneBuffers,
     material_buffers: MaterialBuffers,
     targets: RenderTargets,
     compute_bg: wgpu::BindGroup,
     render_bg: wgpu::BindGroup,
+    render_bg_b: wgpu::BindGroup,
+    blit_bg: wgpu::BindGroup,
     tet_count: u32,
 }
 
@@ -108,12 +138,15 @@ struct App {
     gpu: Option<GpuState>,
     camera: Camera,
     scene_data: rmesh_data::SceneData,
-    mouse_pressed: bool,
+    sh_coeffs: rmesh_data::ShCoeffs,
+    left_pressed: bool,
+    middle_pressed: bool,
+    right_pressed: bool,
     last_mouse: (f64, f64),
 }
 
 impl App {
-    fn new(scene: rmesh_data::SceneData) -> Self {
+    fn new(scene: rmesh_data::SceneData, sh: rmesh_data::ShCoeffs) -> Self {
         let pos = Vec3::new(scene.start_pose[0], scene.start_pose[1], scene.start_pose[2]);
         let cam_pos = if pos.length() < 0.001 {
             Vec3::new(0.0, 3.0, -2.0)
@@ -126,9 +159,66 @@ impl App {
             gpu: None,
             camera: Camera::new(cam_pos),
             scene_data: scene,
-            mouse_pressed: false,
+            sh_coeffs: sh,
+            left_pressed: false,
+            middle_pressed: false,
+            right_pressed: false,
             last_mouse: (0.0, 0.0),
         }
+    }
+
+    /// Evaluate SH coefficients to base colors for the current camera position.
+    fn evaluate_sh_colors(&self) -> Vec<f32> {
+        let t_count = self.scene_data.tet_count as usize;
+        let mut base_colors = vec![0.0f32; t_count * 3];
+        let degree = self.sh_coeffs.degree;
+        let stride = self.sh_coeffs.stride() as usize;
+        let cam_pos = self.camera.position;
+
+        for t in 0..t_count {
+            let sh_base = t * stride;
+            if sh_base + 2 >= self.sh_coeffs.coeffs.len() {
+                // Fallback: gray
+                base_colors[t * 3] = 0.5;
+                base_colors[t * 3 + 1] = 0.5;
+                base_colors[t * 3 + 2] = 0.5;
+                continue;
+            }
+
+            // DC component (degree 0)
+            let mut r = C0 * self.sh_coeffs.coeffs[sh_base];
+            let mut g = C0 * self.sh_coeffs.coeffs[sh_base + 1];
+            let mut b = C0 * self.sh_coeffs.coeffs[sh_base + 2];
+
+            if degree >= 1 && stride >= 12 {
+                // Compute direction from circumcenter to camera
+                let cx = self.scene_data.circumdata[t * 4];
+                let cy = self.scene_data.circumdata[t * 4 + 1];
+                let cz = self.scene_data.circumdata[t * 4 + 2];
+                let dir = (cam_pos - Vec3::new(cx, cy, cz)).normalize_or_zero();
+                let x = dir.x;
+                let y = dir.y;
+                let z = dir.z;
+
+                // SH degree 1: coeffs layout is [dc_r, dc_g, dc_b, y_r, y_g, y_b, z_r, z_g, z_b, x_r, x_g, x_b]
+                r += C1 * (y * self.sh_coeffs.coeffs[sh_base + 3]
+                    + z * self.sh_coeffs.coeffs[sh_base + 6]
+                    + x * self.sh_coeffs.coeffs[sh_base + 9]);
+                g += C1 * (y * self.sh_coeffs.coeffs[sh_base + 4]
+                    + z * self.sh_coeffs.coeffs[sh_base + 7]
+                    + x * self.sh_coeffs.coeffs[sh_base + 10]);
+                b += C1 * (y * self.sh_coeffs.coeffs[sh_base + 5]
+                    + z * self.sh_coeffs.coeffs[sh_base + 8]
+                    + x * self.sh_coeffs.coeffs[sh_base + 11]);
+            }
+
+            // Add 0.5 bias (SH DC is centered around 0, base_colors go through softplus in shader)
+            base_colors[t * 3] = r + 0.5;
+            base_colors[t * 3 + 1] = g + 0.5;
+            base_colors[t * 3 + 2] = b + 0.5;
+        }
+
+        base_colors
     }
 
     fn init_gpu(&mut self, window: Arc<Window>) {
@@ -156,7 +246,8 @@ impl App {
                 .request_device(
                     &wgpu::DeviceDescriptor {
                         label: Some("rmesh device"),
-                        required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
+                        required_features: wgpu::Features::SUBGROUP
+                            | wgpu::Features::SHADER_FLOAT32_ATOMIC,
                         required_limits: wgpu::Limits::default(),
                         ..Default::default()
                     },
@@ -190,18 +281,38 @@ impl App {
         let color_format = wgpu::TextureFormat::Rgba16Float;
 
         let pipelines = ForwardPipelines::new(&device, color_format);
+        let blit_pipeline = BlitPipeline::new(&device, surface_format);
+
         let buffers = SceneBuffers::upload(&device, &queue, &self.scene_data);
-        let default_base_colors = vec![0.5f32; self.scene_data.tet_count as usize * 3];
+
+        // Evaluate SH colors instead of flat gray
+        let base_colors = self.evaluate_sh_colors();
         let material = MaterialBuffers::upload(
             &device,
-            &default_base_colors,
+            &base_colors,
             &self.scene_data.color_grads,
             self.scene_data.tet_count,
         );
+
         let targets = RenderTargets::new(&device, size.width.max(1), size.height.max(1));
+
+        // Radix sort state
+        let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device);
+        let n_pow2 = (self.scene_data.tet_count as u32).next_power_of_two();
+        let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32);
+        sort_state.upload_configs(&queue);
 
         let compute_bg = create_compute_bind_group(&device, &pipelines, &buffers, &material);
         let render_bg = create_render_bind_group(&device, &pipelines, &buffers, &material);
+        let render_bg_b = create_render_bind_group_with_sort_values(
+            &device,
+            &pipelines,
+            &buffers,
+            &material,
+            &sort_state.values_b,
+        );
+
+        let blit_bg = create_blit_bind_group(&device, &blit_pipeline, &targets.color_view);
 
         self.gpu = Some(GpuState {
             device,
@@ -209,11 +320,16 @@ impl App {
             surface,
             surface_config,
             pipelines,
+            blit_pipeline,
+            sort_pipelines,
+            sort_state,
             buffers,
             material_buffers: material,
             targets,
             compute_bg,
             render_bg,
+            render_bg_b,
+            blit_bg,
             tet_count: self.scene_data.tet_count,
         });
     }
@@ -247,10 +363,23 @@ impl App {
         let view_mat = self.camera.view_matrix();
         let proj_mat = self.camera.projection_matrix(aspect);
         let vp = proj_mat * view_mat;
-        let inv_vp = vp.inverse();
+
+        // Extract c2w rotation from inverse view matrix
+        // RH convention: camera axes are x=right, y=up, z=backward
+        // Pinhole convention: x=right, y=DOWN, z=FORWARD
+        let inv_view = view_mat.inverse();
+        let cam_right = inv_view.col(0).truncate();
+        let cam_up = inv_view.col(1).truncate();
+        let cam_back = inv_view.col(2).truncate();
+        let c2w = glam::Mat3::from_cols(cam_right, -cam_up, -cam_back);
+
+        // Intrinsics from FOV
+        let f_val = 1.0 / (self.camera.fov_y / 2.0).tan();
+        let fx = f_val * h as f32 / 2.0;
+        let fy = f_val * h as f32 / 2.0;
+        let intrinsics = [fx, fy, w as f32 / 2.0, h as f32 / 2.0];
 
         let vp_cols = vp.to_cols_array_2d();
-        let inv_cols = inv_vp.to_cols_array_2d();
         let pos = self.camera.position.to_array();
 
         let uniforms = Uniforms {
@@ -258,10 +387,10 @@ impl App {
             vp_col1: vp_cols[1],
             vp_col2: vp_cols[2],
             vp_col3: vp_cols[3],
-            inv_vp_col0: inv_cols[0],
-            inv_vp_col1: inv_cols[1],
-            inv_vp_col2: inv_cols[2],
-            inv_vp_col3: inv_cols[3],
+            c2w_col0: [c2w.col(0).x, c2w.col(0).y, c2w.col(0).z, 0.0],
+            c2w_col1: [c2w.col(1).x, c2w.col(1).y, c2w.col(1).z, 0.0],
+            c2w_col2: [c2w.col(2).x, c2w.col(2).y, c2w.col(2).z, 0.0],
+            intrinsics,
             cam_pos_pad: [pos[0], pos[1], pos[2], 0.0],
             screen_width: w as f32,
             screen_height: h as f32,
@@ -276,43 +405,38 @@ impl App {
         gpu.queue
             .write_buffer(&gpu.buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
+        // Upload view-dependent SH colors
+        let base_colors = self.evaluate_sh_colors();
+        gpu.queue.write_buffer(
+            &gpu.material_buffers.base_colors,
+            0,
+            bytemuck::cast_slice(&base_colors),
+        );
+
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("forward pass"),
             });
 
-        rmesh_render::record_forward_pass(
+        // Sorted forward pass: compute → radix sort → HW render
+        rmesh_render::record_sorted_forward_pass(
             &mut encoder,
+            &gpu.device,
             &gpu.pipelines,
+            &gpu.sort_pipelines,
+            &gpu.sort_state,
             &gpu.buffers,
             &gpu.targets,
             &gpu.compute_bg,
             &gpu.render_bg,
+            &gpu.render_bg_b,
             gpu.tet_count,
             &gpu.queue,
         );
 
-        // Blit from render target to swapchain (simple fullscreen copy)
-        // For now, just clear the swapchain and present - the render target
-        // contains the actual rendered image. A proper blit/tonemap pass is needed.
-        {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("present"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
-            // TODO: Draw a fullscreen quad sampling from targets.color_view
-        }
+        // Blit Rgba16Float render target to sRGB swapchain
+        record_blit(&mut encoder, &gpu.blit_pipeline, &gpu.blit_bg, &view);
 
         gpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
@@ -328,6 +452,12 @@ impl App {
             gpu.surface_config.height = new_size.height;
             gpu.surface.configure(&gpu.device, &gpu.surface_config);
             gpu.targets = RenderTargets::new(&gpu.device, new_size.width, new_size.height);
+            // Recreate blit bind group since color_view changed
+            gpu.blit_bg = create_blit_bind_group(
+                &gpu.device,
+                &gpu.blit_pipeline,
+                &gpu.targets.color_view,
+            );
         }
     }
 }
@@ -341,9 +471,10 @@ impl ApplicationHandler for App {
         self.init_gpu(window.clone());
         self.window = Some(window);
         log::info!(
-            "Viewer initialized: {} tets, {} vertices",
+            "Viewer initialized: {} tets, {} vertices (SH degree {})",
             self.scene_data.tet_count,
-            self.scene_data.vertex_count
+            self.scene_data.vertex_count,
+            self.sh_coeffs.degree,
         );
     }
 
@@ -364,20 +495,33 @@ impl ApplicationHandler for App {
                 self.resize(size);
             }
 
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                self.mouse_pressed = state == ElementState::Pressed;
-            }
+            WindowEvent::MouseInput { state, button, .. } => match button {
+                MouseButton::Left => {
+                    self.left_pressed = state == ElementState::Pressed;
+                }
+                MouseButton::Middle => {
+                    self.middle_pressed = state == ElementState::Pressed;
+                }
+                MouseButton::Right => {
+                    self.right_pressed = state == ElementState::Pressed;
+                }
+                _ => {}
+            },
 
             WindowEvent::CursorMoved { position, .. } => {
-                if self.mouse_pressed {
-                    let dx = position.x - self.last_mouse.0;
-                    let dy = position.y - self.last_mouse.1;
+                let dx = position.x - self.last_mouse.0;
+                let dy = position.y - self.last_mouse.1;
+
+                if self.left_pressed {
                     self.camera.orbit(dx as f32, dy as f32);
                 }
+                if self.middle_pressed {
+                    self.camera.pan(dx as f32, dy as f32);
+                }
+                if self.right_pressed {
+                    self.camera.zoom(dy as f32);
+                }
+
                 self.last_mouse = (position.x, position.y);
             }
 
@@ -415,18 +559,19 @@ fn main() -> Result<()> {
 
     let file_data = std::fs::read(&scene_path)
         .with_context(|| format!("Failed to read {}", scene_path.display()))?;
-    let (scene, _sh) = rmesh_data::load_rmesh(&file_data)
+    let (scene, sh) = rmesh_data::load_rmesh(&file_data)
         .or_else(|_| rmesh_data::load_rmesh_raw(&file_data))
         .context("Failed to parse scene file")?;
 
     log::info!(
-        "Scene: {} vertices, {} tets",
+        "Scene: {} vertices, {} tets, SH degree {}",
         scene.vertex_count,
         scene.tet_count,
+        sh.degree,
     );
 
     let event_loop = EventLoop::new().context("Failed to create event loop")?;
-    let mut app = App::new(scene);
+    let mut app = App::new(scene, sh);
     event_loop.run_app(&mut app)?;
 
     Ok(())

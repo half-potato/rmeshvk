@@ -20,13 +20,13 @@ const H: u32 = 16;
 const EPS: f32 = 1e-3;
 const FD_ATOL: f32 = 1e-2;
 
-fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat4) {
+fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat3, [f32; 4]) {
     let aspect = W as f32 / H as f32;
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, target, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let inv_vp = vp.inverse();
-    (vp, inv_vp)
+    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
+    (vp, c2w, intrinsics)
 }
 
 /// Sum all pixel values (all channels including alpha) as a scalar loss.
@@ -35,8 +35,8 @@ fn image_loss(image: &[[f32; 4]]) -> f32 {
 }
 
 /// Render scene and return scalar loss.
-fn render_loss(scene: &SceneData, eye: Vec3, vp: glam::Mat4, inv_vp: glam::Mat4) -> f32 {
-    let image = cpu_render_scene(scene, eye, vp, inv_vp, W, H);
+fn render_loss(scene: &SceneData, eye: Vec3, vp: glam::Mat4, c2w: glam::Mat3, intrinsics: [f32; 4]) -> f32 {
+    let image = cpu_render_scene(scene, eye, vp, c2w, intrinsics, W, H);
     image_loss(&image)
 }
 
@@ -45,16 +45,17 @@ fn finite_diff(
     scene: &SceneData,
     eye: Vec3,
     vp: glam::Mat4,
-    inv_vp: glam::Mat4,
+    c2w: glam::Mat3,
+    intrinsics: [f32; 4],
     mutator: &dyn Fn(&mut SceneData, f32),
 ) -> f32 {
     let mut scene_plus = clone_scene(scene);
     mutator(&mut scene_plus, EPS);
-    let loss_plus = render_loss(&scene_plus, eye, vp, inv_vp);
+    let loss_plus = render_loss(&scene_plus, eye, vp, c2w, intrinsics);
 
     let mut scene_minus = clone_scene(scene);
     mutator(&mut scene_minus, -EPS);
-    let loss_minus = render_loss(&scene_minus, eye, vp, inv_vp);
+    let loss_minus = render_loss(&scene_minus, eye, vp, c2w, intrinsics);
 
     (loss_plus - loss_minus) / (2.0 * EPS)
 }
@@ -81,11 +82,11 @@ fn test_density_gradient() {
     let verts = load_tet_verts(&scene, 0);
     let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
     let eye = centroid + Vec3::new(2.0, 0.0, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, centroid);
+    let (vp, c2w, intrinsics) = setup_camera(eye, centroid);
 
-    let base_loss = render_loss(&scene, eye, vp, inv_vp);
+    let base_loss = render_loss(&scene, eye, vp, c2w, intrinsics);
 
-    let fd = finite_diff(&scene, eye, vp, inv_vp, &|s, eps| {
+    let fd = finite_diff(&scene, eye, vp, c2w, intrinsics, &|s, eps| {
         s.densities[0] += eps;
     });
 
@@ -100,10 +101,10 @@ fn test_density_gradient() {
         let eps2 = EPS * 2.0;
         let mut sp = clone_scene(&scene);
         sp.densities[0] += eps2;
-        let lp = render_loss(&sp, eye, vp, inv_vp);
+        let lp = render_loss(&sp, eye, vp, c2w, intrinsics);
         let mut sm = clone_scene(&scene);
         sm.densities[0] -= eps2;
-        let lm = render_loss(&sm, eye, vp, inv_vp);
+        let lm = render_loss(&sm, eye, vp, c2w, intrinsics);
         (lp - lm) / (2.0 * eps2)
     };
     let diff = (fd - fd2).abs();
@@ -123,10 +124,10 @@ fn test_color_grad_gradient() {
     let verts = load_tet_verts(&scene, 0);
     let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
     let eye = centroid + Vec3::new(2.0, 0.0, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, centroid);
+    let (vp, c2w, intrinsics) = setup_camera(eye, centroid);
 
     for dim in 0..3 {
-        let fd = finite_diff(&scene, eye, vp, inv_vp, &|s, eps| {
+        let fd = finite_diff(&scene, eye, vp, c2w, intrinsics, &|s, eps| {
             s.color_grads[dim] += eps;
         });
 
@@ -134,10 +135,10 @@ fn test_color_grad_gradient() {
             let eps2 = EPS * 2.0;
             let mut sp = clone_scene(&scene);
             sp.color_grads[dim] += eps2;
-            let lp = render_loss(&sp, eye, vp, inv_vp);
+            let lp = render_loss(&sp, eye, vp, c2w, intrinsics);
             let mut sm = clone_scene(&scene);
             sm.color_grads[dim] -= eps2;
-            let lm = render_loss(&sm, eye, vp, inv_vp);
+            let lm = render_loss(&sm, eye, vp, c2w, intrinsics);
             (lp - lm) / (2.0 * eps2)
         };
 
@@ -159,14 +160,14 @@ fn test_vertex_gradient() {
     let verts = load_tet_verts(&scene, 0);
     let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
     let eye = centroid + Vec3::new(2.0, 0.0, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, centroid);
+    let (vp, c2w, intrinsics) = setup_camera(eye, centroid);
 
     // Test a few vertex coordinates (vertex 0 x, vertex 1 y, vertex 2 z)
     let test_indices = [(0, 0), (1, 1), (2, 2), (3, 0)];
 
     for &(vert, coord) in &test_indices {
         let flat_idx = vert * 3 + coord;
-        let fd = finite_diff(&scene, eye, vp, inv_vp, &|s, eps| {
+        let fd = finite_diff(&scene, eye, vp, c2w, intrinsics, &|s, eps| {
             s.vertices[flat_idx] += eps;
             // Recompute circumsphere since vertices changed
             recompute_circumdata(s);
@@ -177,11 +178,11 @@ fn test_vertex_gradient() {
             let mut sp = clone_scene(&scene);
             sp.vertices[flat_idx] += eps2;
             recompute_circumdata(&mut sp);
-            let lp = render_loss(&sp, eye, vp, inv_vp);
+            let lp = render_loss(&sp, eye, vp, c2w, intrinsics);
             let mut sm = clone_scene(&scene);
             sm.vertices[flat_idx] -= eps2;
             recompute_circumdata(&mut sm);
-            let lm = render_loss(&sm, eye, vp, inv_vp);
+            let lm = render_loss(&sm, eye, vp, c2w, intrinsics);
             (lp - lm) / (2.0 * eps2)
         };
 

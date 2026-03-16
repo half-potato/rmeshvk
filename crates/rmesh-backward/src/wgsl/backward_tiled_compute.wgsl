@@ -12,10 +12,10 @@ struct Uniforms {
     vp_col1: vec4<f32>,
     vp_col2: vec4<f32>,
     vp_col3: vec4<f32>,
-    inv_vp_col0: vec4<f32>,
-    inv_vp_col1: vec4<f32>,
-    inv_vp_col2: vec4<f32>,
-    inv_vp_col3: vec4<f32>,
+    c2w_col0: vec4<f32>,
+    c2w_col1: vec4<f32>,
+    c2w_col2: vec4<f32>,
+    intrinsics: vec4<f32>,
     cam_pos_pad: vec4<f32>,
     screen_width: f32,
     screen_height: f32,
@@ -109,12 +109,12 @@ var<workgroup> sm_xr: array<i32, 16>;
 var<workgroup> sm_prefix: array<u32, 17>;
 
 fn phi(x: f32) -> f32 {
-    if (abs(x) < 1e-6) { return 1.0 - x * 0.5; }
+    if (abs(x) < 0.02) { return 1.0 + x * (-0.5 + x * (1.0/6.0 + x * (-1.0/24.0))); }
     return safe_div_f32(1.0 - exp(-x), x);
 }
 
 fn dphi_dx(x: f32) -> f32 {
-    if (abs(x) < 1e-6) { return -0.5 + x / 3.0; }
+    if (abs(x) < 0.02) { return -0.5 + x * (1.0/3.0 + x * (-1.0/8.0 + x * (1.0/30.0))); }
     let ex = exp(-x);
     return safe_div_f32(ex * (x + 1.0) - 1.0, x * x);
 }
@@ -176,7 +176,11 @@ fn main(
 
     let cam = uniforms.cam_pos_pad.xyz;
     let vp = mat4x4<f32>(uniforms.vp_col0, uniforms.vp_col1, uniforms.vp_col2, uniforms.vp_col3);
-    let inv_vp = mat4x4<f32>(uniforms.inv_vp_col0, uniforms.inv_vp_col1, uniforms.inv_vp_col2, uniforms.inv_vp_col3);
+    let c2w = mat3x3<f32>(uniforms.c2w_col0.xyz, uniforms.c2w_col1.xyz, uniforms.c2w_col2.xyz);
+    let fx = uniforms.intrinsics.x;
+    let fy = uniforms.intrinsics.y;
+    let cx_cam = uniforms.intrinsics.z;
+    let cy_cam = uniforms.intrinsics.w;
 
     // Initialize state from rendered_image (final forward state) and dl_d_image
     for (var i = lane; i < TS * TS; i += 32u) {
@@ -278,8 +282,9 @@ fn main(
                       xl_f = min(xl_f, x); xr_f = max(xr_f, x); } }
             }
             if (xl_f <= xr_f) {
-                let xl_i = max(i32(ceil(xl_f - 0.5)), 0);
-                let xr_i = min(i32(floor(xr_f - 0.5)), i32(TS) - 1);
+                let eps = 0.001;
+                let xl_i = max(i32(ceil(xl_f - 0.5 - eps)), 0);
+                let xr_i = min(i32(floor(xr_f - 0.5 + eps)), i32(TS) - 1);
                 if (xl_i <= xr_i) {
                     sm_xl[lane] = xl_i;
                     sm_xr[lane] = xr_i;
@@ -345,14 +350,13 @@ fn main(
 
             let pixel_idx = py * w + px;
 
-            // Compute ray
-            let ndc_x = (2.0 * (f32(px) + 0.5) / W) - 1.0;
-            let ndc_y = 1.0 - (2.0 * (f32(py) + 0.5) / H);
-            let near_clip = inv_vp * vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
-            let far_clip = inv_vp * vec4<f32>(ndc_x, ndc_y, 1.0, 1.0);
-            let near_world = near_clip.xyz / near_clip.w;
-            let far_world = far_clip.xyz / far_clip.w;
-            let ray_dir = normalize(far_world - near_world);
+            // Compute ray direction from camera intrinsics (matches camera.slang get_ray):
+            let dir_cam = normalize(vec3<f32>(
+                (f32(px) + 0.5 - cx_cam) / fx,
+                (f32(py) + 0.5 - cy_cam) / fy,
+                1.0
+            ));
+            let ray_dir = normalize(c2w * dir_cam);
 
             // Ray-tet intersection
             var t_min_val = -3.402823e38;
@@ -400,7 +404,7 @@ fn main(
 
             let dist = t_max_val - t_min_val;
             let od = clamp(density_raw * dist, 1e-8, 88.0);
-            let alpha_t = exp(-od);
+            let alpha_t = safe_exp_f32(-od);
             let phi_val = phi(od);
             let w0 = phi_val - alpha_t;
             let w1 = 1.0 - phi_val;
@@ -455,8 +459,13 @@ fn main(
             let d_od_integral = dot(d_c_premul, c_end * dw0_dod + c_start * dw1_dod);
 
             let d_od = safe_clip_f32(d_od_state + d_od_integral, MIN_VAL, MAX_VAL);
-            let d_density_local = safe_clip_f32(d_od * dist, MIN_VAL, MAX_VAL);
-            let d_dist = safe_clip_f32(d_od * density_raw, MIN_VAL, MAX_VAL);
+            // Respect the clamp(od_raw, 1e-8, 88.0) derivative: when od_raw is
+            // outside [1e-8, 88], the clamp output is constant so d(od)/d(od_raw)=0.
+            let od_raw = density_raw * dist;
+            let od_active = (od_raw >= 1e-8) && (od_raw <= 88.0);
+            let d_od_raw = select(0.0, d_od, od_active);
+            let d_density_local = safe_clip_f32(d_od_raw * dist, MIN_VAL, MAX_VAL);
+            let d_dist = safe_clip_f32(d_od_raw * density_raw, MIN_VAL, MAX_VAL);
             var d_t_min = -d_dist;
             var d_t_max = d_dist;
 

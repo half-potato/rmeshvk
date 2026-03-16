@@ -5,12 +5,12 @@
 
 #![allow(dead_code, unused_imports)]
 
-use glam::{Mat4, Vec3, Vec4};
+use glam::{Mat3, Mat4, Vec3, Vec4};
 pub use rand::Rng;
 pub use rmesh_data::SceneData;
 
 // Re-export shared camera utilities from rmesh-util
-pub use rmesh_util::camera::{perspective_matrix, look_at, TET_FACES};
+pub use rmesh_util::camera::{perspective_matrix, look_at, pixel_ray_intrinsics, TET_FACES};
 
 // Re-export test utilities from rmesh-util
 pub use rmesh_util::test_util::{build_test_scene, random_single_tet_scene};
@@ -20,8 +20,8 @@ pub use rmesh_util::test_util::{build_test_scene, random_single_tet_scene};
 // ---------------------------------------------------------------------------
 
 fn phi(x: f32) -> f32 {
-    if x.abs() < 1e-6 {
-        1.0 - x * 0.5
+    if x.abs() < 0.02 {
+        1.0 + x * (-0.5 + x * (1.0 / 6.0 + x * (-1.0 / 24.0)))
     } else {
         (1.0 - (-x).exp()) / x
     }
@@ -193,20 +193,30 @@ pub fn sort_tets_back_to_front(scene: &SceneData, cam_pos: Vec3) -> Vec<u32> {
 
 /// Compute world-space ray direction for pixel (px, py) matching rasterize_compute.wgsl.
 ///
-/// Uses the same two-point unproject (near + far) as the GPU tiled shader to ensure
-/// identical floating-point behavior at silhouette boundaries.
-pub fn pixel_ray_dir(inv_vp: Mat4, _cam_pos: Vec3, px: f32, py: f32, w: f32, h: f32) -> Vec3 {
-    // NDC: x ∈ [-1,1], y ∈ [-1,1] (wgpu: y=-1 at top, y=+1 at bottom)
-    let ndc_x = (2.0 * (px + 0.5)) / w - 1.0;
-    let ndc_y = 1.0 - (2.0 * (py + 0.5)) / h;
+/// Uses camera intrinsics and c2w rotation (pinhole convention: y-down, z-forward).
+/// Matches the GPU shader's intrinsics-based ray construction.
+pub fn pixel_ray_dir(c2w: Mat3, intrinsics: [f32; 4], cam_pos: Vec3, px: f32, py: f32) -> Vec3 {
+    let (_, dir) = pixel_ray_intrinsics(c2w, intrinsics, cam_pos, px, py);
+    dir
+}
 
-    // Unproject near and far clip points — matches rasterize_compute.wgsl exactly
-    let near_clip = inv_vp * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
-    let far_clip = inv_vp * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
-    let near_world = near_clip.truncate() / near_clip.w;
-    let far_world = far_clip.truncate() / far_clip.w;
+/// Compute c2w rotation and pinhole intrinsics for the test camera.
+///
+/// Uses the same LH look_at convention (up = Vec3::Z) as the test setup_camera functions.
+/// c2w maps from pinhole camera space (x=right, y=down, z=forward) to world space.
+pub fn test_camera_c2w_intrinsics(
+    eye: Vec3, target: Vec3, fov_y: f32, w: f32, h: f32,
+) -> (Mat3, [f32; 4]) {
+    let f = (target - eye).normalize();
+    let r = f.cross(Vec3::Z).normalize();
+    let u = r.cross(f);
+    // Pinhole convention: x=right, y=DOWN, z=forward
+    let c2w = Mat3::from_cols(r, -u, f);
 
-    (far_world - near_world).normalize()
+    let f_val = 1.0 / (fov_y / 2.0).tan();
+    let fx = f_val * h / 2.0;
+    let fy = f_val * h / 2.0;
+    (c2w, [fx, fy, w / 2.0, h / 2.0])
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +229,8 @@ pub fn cpu_render_scene(
     scene: &SceneData,
     cam_pos: Vec3,
     vp: Mat4,
-    inv_vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
     w: u32,
     h: u32,
 ) -> Vec<[f32; 4]> {
@@ -286,7 +297,7 @@ pub fn cpu_render_scene(
 
     for py in 0..h {
         for px in 0..w {
-            let ray_dir = pixel_ray_dir(inv_vp, cam_pos, px as f32, py as f32, w as f32, h as f32);
+            let ray_dir = pixel_ray_dir(c2w, intrinsics, cam_pos, px as f32, py as f32);
             let mut accum_r = 0.0f32;
             let mut accum_g = 0.0f32;
             let mut accum_b = 0.0f32;
@@ -337,18 +348,20 @@ pub fn gpu_render_scene(
     scene: &SceneData,
     cam_pos: Vec3,
     vp: Mat4,
-    inv_vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
     w: u32,
     h: u32,
 ) -> Option<Vec<[f32; 4]>> {
-    pollster::block_on(gpu_render_scene_async(scene, cam_pos, vp, inv_vp, w, h))
+    pollster::block_on(gpu_render_scene_async(scene, cam_pos, vp, c2w, intrinsics, w, h))
 }
 
 async fn gpu_render_scene_async(
     scene: &SceneData,
     cam_pos: Vec3,
     vp: Mat4,
-    inv_vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
     w: u32,
     h: u32,
 ) -> Option<Vec<[f32; 4]>> {
@@ -396,7 +409,8 @@ async fn gpu_render_scene_async(
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
         vp,
-        inv_vp,
+        c2w,
+        intrinsics,
         cam_pos,
         w as f32,
         h as f32,
@@ -506,18 +520,20 @@ pub fn gpu_raytrace_scene(
     scene: &SceneData,
     cam_pos: Vec3,
     vp: Mat4,
-    inv_vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
     w: u32,
     h: u32,
 ) -> Option<Vec<[f32; 4]>> {
-    pollster::block_on(gpu_raytrace_scene_async(scene, cam_pos, vp, inv_vp, w, h))
+    pollster::block_on(gpu_raytrace_scene_async(scene, cam_pos, vp, c2w, intrinsics, w, h))
 }
 
 async fn gpu_raytrace_scene_async(
     scene: &SceneData,
     cam_pos: Vec3,
     vp: Mat4,
-    inv_vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
     w: u32,
     h: u32,
 ) -> Option<Vec<[f32; 4]>> {
@@ -573,7 +589,7 @@ async fn gpu_raytrace_scene_async(
 
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, 0, 12, 0.0,
+        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0, 12, 0.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -638,18 +654,20 @@ pub fn gpu_tiled_render_scene(
     scene: &SceneData,
     cam_pos: Vec3,
     vp: Mat4,
-    inv_vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
     w: u32,
     h: u32,
 ) -> Option<Vec<[f32; 4]>> {
-    pollster::block_on(gpu_tiled_render_scene_async(scene, cam_pos, vp, inv_vp, w, h))
+    pollster::block_on(gpu_tiled_render_scene_async(scene, cam_pos, vp, c2w, intrinsics, w, h))
 }
 
 async fn gpu_tiled_render_scene_async(
     scene: &SceneData,
     cam_pos: Vec3,
     vp: Mat4,
-    inv_vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
     w: u32,
     h: u32,
 ) -> Option<Vec<[f32; 4]>> {
@@ -687,7 +705,7 @@ async fn gpu_tiled_render_scene_async(
         rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0,
+        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 

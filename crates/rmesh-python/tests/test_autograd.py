@@ -71,8 +71,7 @@ def setup_camera(width, height, distance=1.0):
 
     Uses the GS/COLMAP convention where camera Z points forward,
     so in-front objects have positive view_z and clip.w > 0.
-    The VP matrix is stored in the same row-vector format as the
-    training code (vp = Rt^T @ P^T, sent as .ravel()).
+    Returns (cam_pos, vp_flat, c2w_intrinsics_flat).
     """
     cam_pos = np.array([0.0, 0.0, distance], dtype=np.float32)
 
@@ -89,36 +88,46 @@ def setup_camera(width, height, distance=1.0):
     Rt[:3, :3] = R.T
     Rt[:3, 3] = t
 
-    # GS projection (z_sign=1, matching getProjectionMatrix)
+    # Camera intrinsics
     fov = 45.0 * np.pi / 180.0
     aspect = width / height
-    near, far = 0.01, 100.0
     f_val = 1.0 / np.tan(fov / 2.0)
+    fx = f_val * width / (2.0 * aspect)
+    fy = f_val * height / 2.0
+    cx = width / 2.0
+    cy = height / 2.0
 
+    # Projection from intrinsics (no znear/zfar)
     proj = np.zeros((4, 4), dtype=np.float32)
-    proj[0, 0] = f_val / aspect
-    proj[1, 1] = f_val
-    proj[2, 2] = far / (far - near)
-    proj[2, 3] = -(far * near) / (far - near)
-    proj[3, 2] = 1.0
+    proj[0, 0] = 2 * fx / width
+    proj[0, 2] = 2 * cx / width - 1
+    proj[1, 1] = -2 * fy / height
+    proj[1, 2] = 1 - 2 * cy / height
+    proj[3, 2] = 1.0  # clip_w = eye_z
 
     # GS convention: vp = Rt^T @ proj^T (row-vector format)
-    # Shader loads rows as columns → VP_wgsl = vp^T = proj @ Rt
-    # So clip = proj @ Rt @ pos, with clip.w > 0 for in-front objects
     vp = Rt.T @ proj.T
 
-    inv_vp = np.linalg.inv(vp).astype(np.float32)
+    # c2w rotation: R_c2w = R^T (inverse of R since R is orthogonal)
+    R_c2w = R.T
 
-    return cam_pos, vp.ravel().astype(np.float32), inv_vp.ravel().astype(np.float32)
+    # Pack c2w_intrinsics: 16 floats
+    c2w_int = np.zeros(16, dtype=np.float32)
+    c2w_int[0:3] = R_c2w[:, 0]
+    c2w_int[4:7] = R_c2w[:, 1]
+    c2w_int[8:11] = R_c2w[:, 2]
+    c2w_int[12:16] = [fx, fy, cx, cy]
+
+    return cam_pos, vp.ravel().astype(np.float32), c2w_int
 
 
-def run_forward_loss(renderer, cam_pos, vp, inv_vp, gt_image):
+def run_forward_loss(renderer, cam_pos, vp, c2w_int, gt_image):
     """Run forward_tiled and compute L2 loss in float64."""
     cam_np = cam_pos.detach().cpu().numpy().ravel().astype(np.float32)
     vp_np = vp.detach().cpu().numpy().ravel().astype(np.float32)
-    inv_vp_np = inv_vp.detach().cpu().numpy().ravel().astype(np.float32)
+    c2w_int_np = c2w_int.detach().cpu().numpy().ravel().astype(np.float32)
 
-    image_np = renderer.forward_tiled(cam_np, vp_np, inv_vp_np)
+    image_np = renderer.forward_tiled(cam_np, vp_np, c2w_int_np)
     image = image_np[:, :, :3].astype(np.float64)  # RGB only
     gt = gt_image.astype(np.float64)
     diff = image - gt
@@ -131,7 +140,7 @@ def test_autograd_finite_diff():
     W, H = 32, 32
     scene = make_single_tet_scene()
 
-    cam_pos_np, vp_np, inv_vp_np = setup_camera(W, H, distance=1.0)
+    cam_pos_np, vp_np, c2w_int_np = setup_camera(W, H, distance=1.0)
 
     # Create renderer
     renderer = RMeshRenderer(
@@ -147,7 +156,7 @@ def test_autograd_finite_diff():
     # Create tensors for autograd
     cam_pos = torch.tensor(cam_pos_np, dtype=torch.float32)
     vp = torch.tensor(vp_np, dtype=torch.float32)
-    inv_vp = torch.tensor(inv_vp_np, dtype=torch.float32)
+    c2w_int = torch.tensor(c2w_int_np, dtype=torch.float32)
     vertices = torch.tensor(scene["vertices"], dtype=torch.float32, requires_grad=True)
     base_colors = torch.tensor(scene["base_colors"], dtype=torch.float32, requires_grad=True)
     densities = torch.tensor(scene["densities"], dtype=torch.float32, requires_grad=True)
@@ -157,7 +166,7 @@ def test_autograd_finite_diff():
     gt_image = np.zeros((H, W, 3), dtype=np.float32)
 
     # --- Analytical gradients via autograd ---
-    image = RMeshForward.apply(renderer, cam_pos, vp, inv_vp, vertices, base_colors, densities, color_grads)
+    image = RMeshForward.apply(renderer, cam_pos, vp, c2w_int, vertices, base_colors, densities, color_grads)
     # L2 loss on RGB channels only
     image_rgb = image[:, :, :3]
     gt_tensor = torch.tensor(gt_image, dtype=torch.float32)
@@ -200,7 +209,7 @@ def test_autograd_finite_diff():
                 scene["densities"] if group_name != "densities" else params_plus,
                 scene["color_grads"] if group_name != "color_grads" else params_plus,
             )
-            loss_plus, _ = run_forward_loss(renderer, cam_pos, vp, inv_vp, gt_image)
+            loss_plus, _ = run_forward_loss(renderer, cam_pos, vp, c2w_int, gt_image)
 
             # -eps
             params_minus = base_params.copy()
@@ -211,7 +220,7 @@ def test_autograd_finite_diff():
                 scene["densities"] if group_name != "densities" else params_minus,
                 scene["color_grads"] if group_name != "color_grads" else params_minus,
             )
-            loss_minus, _ = run_forward_loss(renderer, cam_pos, vp, inv_vp, gt_image)
+            loss_minus, _ = run_forward_loss(renderer, cam_pos, vp, c2w_int, gt_image)
 
             numerical_grad[i] = (loss_plus - loss_minus) / (2.0 * eps)
 

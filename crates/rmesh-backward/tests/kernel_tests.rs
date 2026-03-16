@@ -41,12 +41,19 @@ const H: u32 = 64;
 // Scene helpers
 // ---------------------------------------------------------------------------
 
-fn setup_camera(eye: Vec3, target: Vec3) -> (Mat4, Mat4) {
+fn setup_camera(eye: Vec3, target: Vec3) -> (Mat4, glam::Mat3, [f32; 4]) {
+    let fov_y = std::f32::consts::FRAC_PI_2;
     let aspect = W as f32 / H as f32;
-    let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
+    let proj = perspective_matrix(fov_y, aspect, 0.01, 100.0);
     let view = look_at(eye, target, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    (vp, vp.inverse())
+    let f = (target - eye).normalize();
+    let r = f.cross(Vec3::new(0.0, 0.0, 1.0)).normalize();
+    let u = r.cross(f);
+    let c2w = glam::Mat3::from_cols(r, -u, f);
+    let f_val = 1.0 / (fov_y / 2.0).tan();
+    let intrinsics = [f_val * H as f32 / 2.0, f_val * H as f32 / 2.0, W as f32 / 2.0, H as f32 / 2.0];
+    (vp, c2w, intrinsics)
 }
 
 /// Two tetrahedra sharing a face (5 unique vertices).
@@ -563,7 +570,7 @@ fn test_tiled_forward_e2e() {
     ];
     let centroid = (verts_arr[0] + verts_arr[1] + verts_arr[2] + verts_arr[3]) * 0.25;
     let eye = centroid + Vec3::new(1.0, 0.0, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, centroid);
+    let (vp, c2w, intrinsics) = setup_camera(eye, centroid);
 
     // --- Forward compute (populates colors, tiles_touched, compact_tet_ids, indirect_args) ---
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
@@ -571,7 +578,7 @@ fn test_tiled_forward_e2e() {
         rmesh_render::setup_forward(&device, &queue, &scene, &zero_base_colors, &scene.color_grads, W, H);
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -739,7 +746,7 @@ fn test_multi_tet_gradient_finite_diff() {
     // Camera validated in multi_tet_test.rs to give good coverage of both tets
     let eye = Vec3::new(3.0, 0.4, 1.0);
     let target = Vec3::new(0.5, 0.4, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, target);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
     let tile_size = 12u32;
     let n_pixels = (W * H) as usize;
@@ -761,7 +768,7 @@ fn test_multi_tet_gradient_finite_diff() {
             rmesh_render::setup_forward(&device, &queue, scene_data, base_colors, &scene_data.color_grads, W, H);
 
         let uniforms = rmesh_render::make_uniforms(
-            vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0,
+            vp, c2w, intrinsics, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0,
         );
         queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -875,7 +882,7 @@ fn test_multi_tet_gradient_finite_diff() {
             rmesh_render::setup_forward(&device, &queue, scene_data, base_colors, &scene_data.color_grads, W, H);
 
         let uniforms = rmesh_render::make_uniforms(
-            vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0,
+            vp, c2w, intrinsics, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0,
         );
         queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1191,7 +1198,7 @@ fn test_single_tet_loss_decreases() {
     ];
     let centroid = (verts_arr[0] + verts_arr[1] + verts_arr[2] + verts_arr[3]) * 0.25;
     let eye = centroid + Vec3::new(1.0, 0.0, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, centroid);
+    let (vp, c2w, intrinsics) = setup_camera(eye, centroid);
 
     // --- Setup (all created ONCE, reused across steps) ---
 
@@ -1200,7 +1207,7 @@ fn test_single_tet_loss_decreases() {
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
         rmesh_render::setup_forward(&device, &queue, &scene, &zero_base_colors, &scene.color_grads, W, H);
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1619,7 +1626,7 @@ fn test_camera_gpu_visibility() {
     let scene = known_tet_scene();
     let eye = Vec3::new(0.0, -2.0, 0.5);
     let target = Vec3::ZERO;
-    let (vp, inv_vp) = setup_camera(eye, target);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, _material, fwd_pipelines, _targets, compute_bg, _render_bg) =
@@ -1629,7 +1636,7 @@ fn test_camera_gpu_visibility() {
         );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1676,7 +1683,7 @@ fn test_camera_tiled_forward_deterministic() {
     let scene = known_tet_scene();
     let eye = Vec3::new(0.0, -2.0, 0.5);
     let target = Vec3::ZERO;
-    let (vp, inv_vp) = setup_camera(eye, target);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
     // --- Forward compute ---
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
@@ -1687,7 +1694,7 @@ fn test_camera_tiled_forward_deterministic() {
         );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1820,7 +1827,7 @@ fn test_camera_tiled_forward_deterministic() {
 }
 
 /// Test 4: CPU ray-tet intersection via shared camera utilities.
-/// pixel_ray + ray_tet_intersect → valid hit, positive t, non-trivial alpha.
+/// pixel_ray_intrinsics + ray_tet_intersect → valid hit, positive t, non-trivial alpha.
 #[test]
 fn test_camera_ray_tet_intersection() {
     use rmesh_util::camera::*;
@@ -1828,10 +1835,13 @@ fn test_camera_ray_tet_intersection() {
     let scene = known_tet_scene();
     let eye = Vec3::new(0.0, -2.0, 0.5);
     let target = Vec3::ZERO;
-    let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, 1.0, 0.01, 100.0);
-    let view = look_at(eye, target, Vec3::Z);
-    let vp = proj * view;
-    let inv_vp = vp.inverse();
+    let fov_y = std::f32::consts::FRAC_PI_2;
+    let f = (target - eye).normalize();
+    let r = f.cross(Vec3::Z).normalize();
+    let u = r.cross(f);
+    let c2w = glam::Mat3::from_cols(r, -u, f);
+    let f_val = 1.0 / (fov_y / 2.0).tan();
+    let intrinsics = [f_val * H as f32 / 2.0, f_val * H as f32 / 2.0, W as f32 / 2.0, H as f32 / 2.0];
 
     let verts = [
         Vec3::new(scene.vertices[0], scene.vertices[1], scene.vertices[2]),
@@ -1843,7 +1853,7 @@ fn test_camera_ray_tet_intersection() {
     // Shoot ray through image center
     let cx = W as f32 / 2.0;
     let cy = H as f32 / 2.0;
-    let (origin, dir) = pixel_ray(inv_vp, eye, cx, cy, W as f32, H as f32);
+    let (origin, dir) = pixel_ray_intrinsics(c2w, intrinsics, eye, cx, cy);
 
     // Origin should be the camera position
     assert!(
@@ -1879,7 +1889,7 @@ fn test_camera_ray_tet_intersection() {
         for dy in -2i32..=2 {
             let px = cx + dx as f32;
             let py = cy + dy as f32;
-            let (o, d) = pixel_ray(inv_vp, eye, px, py, W as f32, H as f32);
+            let (o, d) = pixel_ray_intrinsics(c2w, intrinsics, eye, px, py);
             if ray_tet_intersect(o, d, &verts).is_some() {
                 hits += 1;
             }

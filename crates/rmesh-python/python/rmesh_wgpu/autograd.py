@@ -20,7 +20,7 @@ class RMeshForward(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, renderer, cam_pos, vp, inv_vp, vertices, base_colors, densities, color_grads):
+    def forward(ctx, renderer, cam_pos, vp, c2w_intrinsics, vertices, base_colors, densities, color_grads):
         # Upload current parameters to GPU
         renderer.update_params(
             vertices.detach().cpu().numpy().ravel(),
@@ -32,10 +32,10 @@ class RMeshForward(torch.autograd.Function):
         # Camera data as flat numpy arrays
         cam_np = cam_pos.detach().cpu().numpy().ravel().astype(np.float32)
         vp_np = vp.detach().cpu().numpy().ravel().astype(np.float32)
-        inv_vp_np = inv_vp.detach().cpu().numpy().ravel().astype(np.float32)
+        c2w_int_np = c2w_intrinsics.detach().cpu().numpy().ravel().astype(np.float32)
 
         # Run forward render
-        image_np = renderer.forward_tiled(cam_np, vp_np, inv_vp_np)
+        image_np = renderer.forward_tiled(cam_np, vp_np, c2w_int_np)
 
         ctx.renderer = renderer
         ctx.save_for_backward(vertices, base_colors, densities, color_grads)
@@ -59,7 +59,7 @@ class RMeshForward(torch.autograd.Function):
             None,  # renderer
             None,  # cam_pos
             None,  # vp
-            None,  # inv_vp
+            None,  # c2w_intrinsics
             d_vertices,
             d_base_colors,
             d_densities,
@@ -75,7 +75,7 @@ class RMeshModule(nn.Module):
                             color_grads, circumdata, w, h)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-        image = model(cam_pos, vp, inv_vp)
+        image = model(cam_pos, vp, c2w_intrinsics)
         loss = (image - gt).pow(2).sum()
         loss.backward()
         optimizer.step()
@@ -117,13 +117,13 @@ class RMeshModule(nn.Module):
             height,
         )
 
-    def forward(self, cam_pos, vp, inv_vp):
+    def forward(self, cam_pos, vp, c2w_intrinsics):
         """Render an image from the given camera.
 
         Args:
             cam_pos: [3] tensor, camera position
             vp: [4, 4] tensor, view-projection matrix (column-major when flattened)
-            inv_vp: [4, 4] tensor, inverse view-projection matrix
+            c2w_intrinsics: [16] tensor, camera-to-world rotation + intrinsics
 
         Returns:
             [H, W, 4] tensor (premultiplied RGBA)
@@ -132,7 +132,7 @@ class RMeshModule(nn.Module):
             self.renderer,
             cam_pos,
             vp,
-            inv_vp,
+            c2w_intrinsics,
             self.vertices,
             self.base_colors,
             self.densities,

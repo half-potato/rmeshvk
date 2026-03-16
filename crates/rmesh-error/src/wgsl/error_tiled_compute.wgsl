@@ -1,21 +1,11 @@
-// Rasterize compute shader: 1 warp (32 threads) per tile.
+// Error tiled compute shader: per-tet error statistics accumulation.
 //
-// Uses workgroup shared memory for per-pixel state. For each tet assigned to
-// this tile, a scanline fill determines which of the pixels are covered,
-// and only those pixels are processed (ray-tet intersection + compositing).
+// Same tiled traversal and scanline fill as rasterize_compute.wgsl, but
+// accumulates per-tet error statistics via atomic<f32>/atomic<i32> instead
+// of compositing colors. Used during densification.
 //
-// Thread model:
-//   32 threads per workgroup (1 warp).
-//   Threads 0..TS compute scanline row ranges.
-//   Thread 0 builds prefix sum.
-//   All 32 threads process covered pixels via linear index distribution.
-//
-// One workgroup per tile. Dispatch: (num_tiles, 1, 1).
-
-// naga_oil selective imports (plain `#import module` doesn't work in 0.21).
-// Struct definitions are inlined — naga_oil 0.21 mangles struct member names.
-#import rmesh::math::{MAX_VAL, safe_clip_v3f, safe_exp_f32, phi}
-#import rmesh::intersect::FACES
+// Thread model: 32 threads per workgroup (1 warp), 1 workgroup per tile.
+// Dispatch: (num_tiles, 1, 1).
 
 struct Uniforms {
     vp_col0: vec4<f32>,
@@ -53,10 +43,7 @@ struct TileUniforms {
     _pad4: u32,
 };
 
-const AUX_DIM: u32 = /*AUX_DIM*/0u;
-const AUX_STRIDE: u32 = 8u + AUX_DIM;
-const SM_AUX_SIZE: u32 = /*SM_AUX_SIZE*/1u;
-
+// Group 0: 9 read-only scene/tile bindings
 @group(0) @binding(0) var<storage, read> uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read> vertices: array<f32>;
 @group(0) @binding(2) var<storage, read> indices: array<u32>;
@@ -66,26 +53,34 @@ const SM_AUX_SIZE: u32 = /*SM_AUX_SIZE*/1u;
 @group(0) @binding(6) var<storage, read> tile_sort_values: array<u32>;
 @group(0) @binding(7) var<storage, read> tile_ranges: array<u32>;
 @group(0) @binding(8) var<storage, read> tile_uniforms: TileUniforms;
-@group(0) @binding(9) var<storage, read_write> rendered_image: array<f32>;
 
-@group(1) @binding(0) var<storage, read_write> aux_image: array<f32>;
-@group(1) @binding(1) var<storage, read> aux_data: array<f32>;
+// Group 1: error inputs (read) + error outputs (atomic rw)
+@group(1) @binding(0) var<storage, read> pixel_err: array<f32>;
+@group(1) @binding(1) var<storage, read> ssim_err: array<f32>;
+@group(1) @binding(2) var<storage, read_write> tet_err: array<atomic<f32>>;
+@group(1) @binding(3) var<storage, read_write> tet_count_buf: array<atomic<i32>>;
+
+// Face (a, b, c, opposite_vertex) -- opposite used to flip normal inward
+const FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
+    vec4<u32>(0u, 2u, 1u, 3u),
+    vec4<u32>(1u, 2u, 3u, 0u),
+    vec4<u32>(0u, 3u, 2u, 1u),
+    vec4<u32>(3u, 0u, 1u, 2u),
+);
 
 // Workgroup shared memory
-var<workgroup> sm_color: array<vec4<f32>, 256>;  // .xyz = color_accum, .w = log_t
-var<workgroup> sm_nd: array<vec4<f32>, 256>;     // .xyz = normal_accum, .w = depth_accum
-var<workgroup> sm_ent: array<vec4<f32>, 256>;    // entropy (4 components)
-var<workgroup> sm_aux: array<f32, SM_AUX_SIZE>;  // variable aux [256 * AUX_DIM]
-var<workgroup> sm_xl: array<i32, 16>;             // scanline left x per row
-var<workgroup> sm_xr: array<i32, 16>;             // scanline right x per row
-var<workgroup> sm_prefix: array<u32, 17>;          // prefix sum of row widths
+var<workgroup> sm_log_t: array<f32, 256>;    // per-pixel log transmittance
+var<workgroup> sm_xl: array<i32, 16>;
+var<workgroup> sm_xr: array<i32, 16>;
+var<workgroup> sm_prefix: array<u32, 17>;
 
 fn load_f32x3_v(idx: u32) -> vec3<f32> {
     return vec3<f32>(vertices[idx * 3u], vertices[idx * 3u + 1u], vertices[idx * 3u + 2u]);
 }
 
-// Scanline edge test: if edge (proj[ei], proj[ej]) crosses y = yc, compute x intersection
-// and update xl/xr. Inlined as a macro-like pattern to avoid function overhead.
+fn safe_exp_f32(v: f32) -> f32 {
+    return exp(clamp(v, -88.0, 46.0517));
+}
 
 @compute @workgroup_size(32)
 fn main(
@@ -118,19 +113,13 @@ fn main(
     let cx_cam = uniforms.intrinsics.z;
     let cy_cam = uniforms.intrinsics.w;
 
-    // Initialize per-pixel state (32 threads x pixels each)
+    // Initialize per-pixel log transmittance to 0 (T = 1)
     for (var i = lane; i < TS * TS; i += 32u) {
-        sm_color[i] = vec4<f32>(0.0);
-        sm_nd[i] = vec4<f32>(0.0);
-        sm_ent[i] = vec4<f32>(0.0);
-    }
-    // Initialize aux shared memory
-    for (var i = lane; i < TS * TS * AUX_DIM; i += 32u) {
-        sm_aux[i] = 0.0;
+        sm_log_t[i] = 0.0;
     }
     workgroupBarrier();
 
-    // Process tets front-to-back (nearest first)
+    // Process tets front-to-back (same order as forward rasterize)
     var cursor = range_end;
     while (cursor > range_start) {
         cursor -= 1u;
@@ -163,7 +152,7 @@ fn main(
             proj[3] = vec2<f32>((c3.x / c3.w + 1.0) * 0.5 * W - tile_ox, (1.0 - c3.y / c3.w) * 0.5 * H - tile_oy);
         }
 
-        // Scanline fill (Variant A): threads 0..TS each compute one row
+        // Scanline fill: threads 0..TS each compute one row
         if (lane < TS) {
             var xl_f: f32 = 1e10;
             var xr_f: f32 = -1e10;
@@ -226,10 +215,7 @@ fn main(
                     }
                 }
 
-                // Include vertices within this pixel row. Without this,
-                // the top/bottom apex of the projected tet drops an entire
-                // row because the half-open edge test misses all edges
-                // emanating from a vertex exactly at yc.
+                // Include vertices within this pixel row
                 for (var v = 0u; v < 4u; v++) {
                     let vy = proj[v].y;
                     if (vy >= yc - 0.5 && vy < yc + 0.5) {
@@ -239,11 +225,6 @@ fn main(
                 }
             }
 
-            // Convert float range to integer pixel range within [0, 15].
-            // Use a small epsilon to conservatively include pixels whose centers
-            // fall exactly on the silhouette boundary.  Without this, floating-point
-            // rounding in the scanline intersection can exclude boundary pixels that
-            // the 3D ray-tet intersection correctly handles.
             if (xl_f <= xr_f) {
                 let eps = 0.001;
                 let xl_i = max(i32(ceil(xl_f - 0.5 - eps)), 0);
@@ -272,37 +253,19 @@ fn main(
         }
         workgroupBarrier();
 
-        // Load tet attributes (per-tet, not per-pixel -- hoisted above pixel loop)
-        let density_raw = densities[tet_id];
-        let colors_tet = vec3<f32>(colors_buf[tet_id * 3u], colors_buf[tet_id * 3u + 1u], colors_buf[tet_id * 3u + 2u]);
-        let grad_vec = vec3<f32>(color_grads_buf[tet_id * 3u], color_grads_buf[tet_id * 3u + 1u], color_grads_buf[tet_id * 3u + 2u]);
         var verts: array<vec3<f32>, 4>;
         verts[0] = v0; verts[1] = v1; verts[2] = v2; verts[3] = v3;
 
         let total = sm_prefix[TS];
         if (total == 0u) {
-            // No pixels covered -- skip to next tet (barrier already done)
             continue;
         }
 
-        // Precompute face normals (inward-pointing) for entry normal lookup
-        var face_normals: array<vec3<f32>, 4>;
-        for (var fi = 0u; fi < 4u; fi++) {
-            let f = FACES[fi];
-            let va = verts[f[0]];
-            let vb = verts[f[1]];
-            let vc = verts[f[2]];
-            var n = cross(vc - va, vb - va);
-            let v_opp = verts[f[3]];
-            if (dot(n, v_opp - va) < 0.0) {
-                n = -n;
-            }
-            face_normals[fi] = n;
-        }
+        let density_raw = densities[tet_id];
+        let centroid = (v0 + v1 + v2 + v3) * 0.25;
 
-        // Process covered pixels (each thread handles indices: lane, lane+32, ...)
+        // Process covered pixels
         for (var idx = lane; idx < total; idx += 32u) {
-            // Map linear index to (row, col) via prefix sum
             var row = 0u;
             for (var r = 0u; r < TS; r++) {
                 if (idx < sm_prefix[r + 1u]) {
@@ -320,7 +283,14 @@ fn main(
                 continue;
             }
 
-            // Compute ray direction from camera intrinsics (matches camera.slang get_ray):
+            // Early termination: pixel nearly opaque
+            if (sm_log_t[pixel_local] < -5.5) {
+                continue;
+            }
+
+            let pixel_idx = py * w + px;
+
+            // Compute ray from camera intrinsics (matches camera.slang get_ray):
             let dir_cam = normalize(vec3<f32>(
                 (f32(px) + 0.5 - cx_cam) / fx,
                 (f32(py) + 0.5 - cy_cam) / fy,
@@ -328,13 +298,11 @@ fn main(
             ));
             let ray_dir = normalize(c2w * dir_cam);
 
-            // Apply min_t ray origin offset (matches Slang camera.min_t)
             let ray_o = cam + ray_dir * uniforms.min_t;
 
             // Ray-tet intersection
             var t_min_val = -3.402823e38;
             var t_max_val = 3.402823e38;
-            var entry_face_idx = 4u;
             var valid = true;
 
             for (var fi = 0u; fi < 4u; fi++) {
@@ -343,7 +311,6 @@ fn main(
                 let vb = verts[f[1]];
                 let vc = verts[f[2]];
                 var n = cross(vc - va, vb - va);
-                // Flip normal to point inward (toward opposite vertex)
                 let v_opp = verts[f[3]];
                 if (dot(n, v_opp - va) < 0.0) {
                     n = -n;
@@ -358,112 +325,50 @@ fn main(
 
                 let t = num / den;
                 if (den > 0.0) {
-                    if (t > t_min_val) {
-                        t_min_val = t;
-                        entry_face_idx = fi;
-                    }
+                    if (t > t_min_val) { t_min_val = t; }
                 } else {
                     if (t < t_max_val) { t_max_val = t; }
                 }
             }
 
             if (valid && t_min_val < t_max_val) {
-                // Volume integral
-                let base_offset = dot(grad_vec, ray_o - verts[0]);
-                let base_color = colors_tet + vec3<f32>(base_offset);
-                let dc_dt = dot(grad_vec, ray_dir);
-
-                let c_start = max(base_color + vec3<f32>(dc_dt * t_min_val), vec3<f32>(0.0));
-                let c_end = max(base_color + vec3<f32>(dc_dt * t_max_val), vec3<f32>(0.0));
-
                 let dist = t_max_val - t_min_val;
                 let od = clamp(density_raw * dist, 1e-8, 88.0);
+                let trans = safe_exp_f32(sm_log_t[pixel_local]);
 
-                let alpha_t = safe_exp_f32(-od);
-                let phi_val = phi(od);
-                let w0 = phi_val - alpha_t;
-                let w1 = 1.0 - phi_val;
-                let c_premul = safe_clip_v3f(c_end * w0 + c_start * w1, 0.0, MAX_VAL);
-                let alpha = 1.0 - alpha_t;
+                if (trans >= 1e-6) {
+                    let T_val = trans * od;
 
-                // Composite color into shared memory
-                let state = sm_color[pixel_local];
-                let T_j = safe_exp_f32(state.w);
+                    let entry_pt = ray_o + ray_dir * t_min_val;
+                    let exit_pt = ray_o + ray_dir * t_max_val;
 
-                // Early termination: pixel fully opaque, skip all writes
-                if (T_j >= 1e-6) {
-                    sm_color[pixel_local] = vec4<f32>(
-                        state.xyz + c_premul * T_j,
-                        state.w - od,
-                    );
+                    let pe = pixel_err[pixel_idx];
+                    let se = ssim_err[pixel_idx];
 
-                    // Composite aux: normals + depth
-                    let nd_state = sm_nd[pixel_local];
-                    var entry_normal = vec3<f32>(0.0);
-                    if (entry_face_idx < 4u) {
-                        entry_normal = normalize(-face_normals[entry_face_idx]);
-                    }
-                    let depth_premul = w0 * t_max_val + w1 * t_min_val;
-                    sm_nd[pixel_local] = vec4<f32>(
-                        nd_state.xyz + T_j * alpha * entry_normal,
-                        nd_state.w + T_j * depth_premul,
-                    );
+                    let base = tet_id * 16u;
+                    atomicAdd(&tet_err[base + 0u], T_val);              // total weight
+                    atomicAdd(&tet_err[base + 1u], T_val * pe);         // weighted L1
+                    atomicAdd(&tet_err[base + 2u], T_val * pe * pe);    // weighted L1^2
+                    atomicAdd(&tet_err[base + 5u], T_val * se);         // weighted SSIM
+                    atomicAdd(&tet_err[base + 6u], T_val * entry_pt.x); // weighted entry.x
+                    atomicAdd(&tet_err[base + 7u], T_val * entry_pt.y); // weighted entry.y
+                    atomicAdd(&tet_err[base + 8u], T_val * entry_pt.z); // weighted entry.z
+                    atomicAdd(&tet_err[base + 9u], T_val * exit_pt.x);  // weighted exit.x
+                    atomicAdd(&tet_err[base + 10u], T_val * exit_pt.y); // weighted exit.y
+                    atomicAdd(&tet_err[base + 11u], T_val * exit_pt.z); // weighted exit.z
+                    atomicAdd(&tet_err[base + 12u], T_val);             // weight sum
+                    atomicAdd(&tet_err[base + 13u], T_val * centroid.x);// weighted centroid.x
+                    atomicAdd(&tet_err[base + 14u], T_val * centroid.y);// weighted centroid.y
+                    atomicAdd(&tet_err[base + 15u], T_val * centroid.z);// weighted centroid.z
 
-                    // Composite aux: entropy
-                    let ent_state = sm_ent[pixel_local];
-                    let wt = alpha * T_j;
-                    let c_mid = (t_min_val + t_max_val) * 0.5;
-                    let wc = wt * c_mid;
-                    sm_ent[pixel_local] = vec4<f32>(
-                        ent_state.x + wt,
-                        ent_state.y + select(0.0, wt * log(wt), wt > 1e-20),
-                        ent_state.z + wt * c_mid,
-                        ent_state.w + select(0.0, wc * log(wc), wc > 1e-20),
-                    );
+                    let count_base = tet_id * 2u;
+                    atomicAdd(&tet_count_buf[count_base], 1i);
+                    atomicMax(&tet_count_buf[count_base + 1u], i32(65535.0 * T_val));
 
-                    // Composite aux: variable aux (no-op when AUX_DIM=0)
-                    for (var ai = 0u; ai < AUX_DIM; ai++) {
-                        let sm_idx = pixel_local * AUX_DIM + ai;
-                        sm_aux[sm_idx] += T_j * alpha * aux_data[tet_id * AUX_DIM + ai];
-                    }
+                    sm_log_t[pixel_local] -= od;
                 }
             }
         }
         workgroupBarrier();
-    }
-
-    // Write output (32 threads x pixels each)
-    for (var i = lane; i < TS * TS; i += 32u) {
-        let row = i / TS;
-        let col = i % TS;
-        let px = tile_x * TS + col;
-        let py = tile_y * TS + row;
-        if (px < w && py < h) {
-            let pixel_idx = py * w + px;
-
-            // RGBA
-            let state = sm_color[i];
-            let T_final = safe_exp_f32(state.w);
-            rendered_image[pixel_idx * 4u] = state.x;
-            rendered_image[pixel_idx * 4u + 1u] = state.y;
-            rendered_image[pixel_idx * 4u + 2u] = state.z;
-            rendered_image[pixel_idx * 4u + 3u] = 1.0 - T_final;
-
-            // Aux: [normal.xyz, depth, entropy.4, aux_data...]
-            let aux_base = pixel_idx * AUX_STRIDE;
-            let nd = sm_nd[i];
-            aux_image[aux_base + 0u] = nd.x;
-            aux_image[aux_base + 1u] = nd.y;
-            aux_image[aux_base + 2u] = nd.z;
-            aux_image[aux_base + 3u] = nd.w;
-            let ent = sm_ent[i];
-            aux_image[aux_base + 4u] = ent.x;
-            aux_image[aux_base + 5u] = ent.y;
-            aux_image[aux_base + 6u] = ent.z;
-            aux_image[aux_base + 7u] = ent.w;
-            for (var ai = 0u; ai < AUX_DIM; ai++) {
-                aux_image[aux_base + 8u + ai] = sm_aux[i * AUX_DIM + ai];
-            }
-        }
     }
 }

@@ -560,10 +560,23 @@ pub fn train(
         for (view_idx, view) in views.iter().enumerate() {
             let aspect = view.width as f32 / view.height as f32;
             let vp = view.view_projection(aspect);
-            let inv_vp = vp.inverse();
+
+            // Extract c2w rotation from inverse view matrix
+            // view_projection uses Mat4::perspective_rh (RH convention)
+            let inv_view = Mat4::from_rotation_translation(view.rotation, view.position);
+            let cam_right = inv_view.col(0).truncate();
+            let cam_up = inv_view.col(1).truncate();
+            let cam_back = inv_view.col(2).truncate();
+            // Pinhole convention: x=right, y=DOWN, z=FORWARD
+            let c2w = glam::Mat3::from_cols(cam_right, -cam_up, -cam_back);
+
+            // Intrinsics from FOV
+            let f_val = 1.0 / (view.fov_y / 2.0).tan();
+            let fx = f_val * view.height as f32 / 2.0;
+            let fy = fx;
+            let intrinsics = [fx, fy, view.width as f32 / 2.0, view.height as f32 / 2.0];
 
             let vp_cols = vp.to_cols_array_2d();
-            let inv_cols = inv_vp.to_cols_array_2d();
             let pos = view.position.to_array();
 
             let uniforms = Uniforms {
@@ -571,10 +584,10 @@ pub fn train(
                 vp_col1: vp_cols[1],
                 vp_col2: vp_cols[2],
                 vp_col3: vp_cols[3],
-                inv_vp_col0: inv_cols[0],
-                inv_vp_col1: inv_cols[1],
-                inv_vp_col2: inv_cols[2],
-                inv_vp_col3: inv_cols[3],
+                c2w_col0: [c2w.col(0).x, c2w.col(0).y, c2w.col(0).z, 0.0],
+                c2w_col1: [c2w.col(1).x, c2w.col(1).y, c2w.col(1).z, 0.0],
+                c2w_col2: [c2w.col(2).x, c2w.col(2).y, c2w.col(2).z, 0.0],
+                intrinsics,
                 cam_pos_pad: [pos[0], pos[1], pos[2], 0.0],
                 screen_width: view.width as f32,
                 screen_height: view.height as f32,

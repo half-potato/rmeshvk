@@ -7,19 +7,20 @@
 //
 // No sorting required -- O(depth_complexity) per ray.
 
-const AUX_DIM: u32 = /*AUX_DIM*/0u;
-const AUX_STRIDE: u32 = 8u + AUX_DIM;
-const AUX_ACC_SIZE: u32 = /*AUX_ACC_SIZE*/1u;
+// naga_oil selective imports (plain `#import module` doesn't work in 0.21).
+// Struct definitions are inlined — naga_oil 0.21 mangles struct member names.
+#import rmesh::math::{MAX_VAL, safe_clip_v3f, safe_exp_f32, phi}
+#import rmesh::intersect::FACES
 
 struct Uniforms {
     vp_col0: vec4<f32>,
     vp_col1: vec4<f32>,
     vp_col2: vec4<f32>,
     vp_col3: vec4<f32>,
-    inv_vp_col0: vec4<f32>,
-    inv_vp_col1: vec4<f32>,
-    inv_vp_col2: vec4<f32>,
-    inv_vp_col3: vec4<f32>,
+    c2w_col0: vec4<f32>,
+    c2w_col1: vec4<f32>,
+    c2w_col2: vec4<f32>,
+    intrinsics: vec4<f32>,
     cam_pos_pad: vec4<f32>,
     screen_width: f32,
     screen_height: f32,
@@ -31,6 +32,10 @@ struct Uniforms {
     _pad1c: u32,
     _pad2: vec4<u32>,
 };
+
+const AUX_DIM: u32 = /*AUX_DIM*/0u;
+const AUX_STRIDE: u32 = 8u + AUX_DIM;
+const AUX_ACC_SIZE: u32 = /*AUX_ACC_SIZE*/1u;
 
 struct BVHNode {
     aabb_min: vec3<f32>,
@@ -56,39 +61,9 @@ struct BVHNode {
 @group(1) @binding(0) var<storage, read_write> aux_image: array<f32>;
 @group(1) @binding(1) var<storage, read> aux_data: array<f32>;
 
-// --- Safe math utilities (subset of safe_math.wgsl) ---
-const MAX_VAL: f32 = 1e+20;
-const LOG_MAX_VAL: f32 = 46.0517;  // log(1e+20), precomputed
-
-fn safe_clip_v3f(v: vec3<f32>, minv: f32, maxv: f32) -> vec3<f32> {
-    return vec3<f32>(
-        max(min(v.x, maxv), minv),
-        max(min(v.y, maxv), minv),
-        max(min(v.z, maxv), minv)
-    );
-}
-
-fn safe_exp_f32(v: f32) -> f32 {
-    return exp(clamp(v, -88.0, LOG_MAX_VAL));
-}
-// --- End safe math utilities ---
-
-// Face (a, b, c, opposite_vertex) -- opposite used to flip normal inward
-const FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
-    vec4<u32>(0u, 2u, 1u, 3u),
-    vec4<u32>(1u, 2u, 3u, 0u),
-    vec4<u32>(0u, 3u, 2u, 1u),
-    vec4<u32>(3u, 0u, 1u, 2u),
-);
-
 const LOG_T_THRESHOLD: f32 = -5.54;
 const MAX_TRAVERSAL_ITERS: u32 = 512u;
 const BVH_STACK_SIZE: u32 = 32u;
-
-fn phi(x: f32) -> f32 {
-    if (abs(x) < 1e-6) { return 1.0 - x * 0.5; }
-    return (1.0 - exp(-x)) / x;
-}
 
 fn load_f32x3_v(idx: u32) -> vec3<f32> {
     return vec3<f32>(vertices[idx * 3u], vertices[idx * 3u + 1u], vertices[idx * 3u + 2u]);
@@ -344,18 +319,20 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         ray_dir = normalize(vec3<f32>(ray_dirs[ri], ray_dirs[ri + 1u], ray_dirs[ri + 2u]));
         start_tet_id = start_tet_buf[pixel_idx_flat];
     } else {
-        // Legacy: derive from inv_vp
-        let ndc_x = (2.0 * (f32(px) + 0.5) / f32(w)) - 1.0;
-        let ndc_y = 1.0 - (2.0 * (f32(py) + 0.5) / f32(h));
-
-        let inv_vp = mat4x4<f32>(uniforms.inv_vp_col0, uniforms.inv_vp_col1, uniforms.inv_vp_col2, uniforms.inv_vp_col3);
-        let near_clip = inv_vp * vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
-        let far_clip = inv_vp * vec4<f32>(ndc_x, ndc_y, 1.0, 1.0);
-        let near_world = near_clip.xyz / near_clip.w;
-        let far_world = far_clip.xyz / far_clip.w;
+        // Derive ray from camera intrinsics (matches camera.slang get_ray):
+        let c2w = mat3x3<f32>(uniforms.c2w_col0.xyz, uniforms.c2w_col1.xyz, uniforms.c2w_col2.xyz);
+        let fx = uniforms.intrinsics.x;
+        let fy = uniforms.intrinsics.y;
+        let cx_cam = uniforms.intrinsics.z;
+        let cy_cam = uniforms.intrinsics.w;
+        let dir_cam = normalize(vec3<f32>(
+            (f32(px) + 0.5 - cx_cam) / fx,
+            (f32(py) + 0.5 - cy_cam) / fy,
+            1.0
+        ));
 
         cam = uniforms.cam_pos_pad.xyz;
-        ray_dir = normalize(far_world - near_world);
+        ray_dir = normalize(c2w * dir_cam);
         start_tet_id = start_tet_buf[0];
     }
     // Apply min_t ray origin offset (matches Slang camera.min_t)

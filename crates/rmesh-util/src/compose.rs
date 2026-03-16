@@ -1,29 +1,36 @@
 //! naga_oil Composer helper for shared WGSL modules.
 //!
-//! Provides shared WGSL modules (structs, math, SH constants, intersection helpers)
+//! Provides shared WGSL modules (math, SH constants, intersection helpers)
 //! and a helper to create composed shader modules via naga_oil's Composer.
+//!
+//! ## naga_oil 0.21 caveats
+//!
+//! - **Selective imports only**: Use `#import rmesh::math::{phi, MAX_VAL}`,
+//!   NOT `#import rmesh::math` (plain imports silently fail to inject defs).
+//! - **No struct imports**: Modules containing struct definitions (like
+//!   `rmesh::common`) cause `InvalidIdentifier` errors on struct member names.
+//!   Struct definitions must be inlined in each shader.
 
 use naga_oil::compose::{
     ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderLanguage, ShaderType,
 };
 
-const COMMON_WGSL: &str = include_str!("wgsl/common.wgsl");
 const MATH_WGSL: &str = include_str!("wgsl/math.wgsl");
 const SH_WGSL: &str = include_str!("wgsl/sh.wgsl");
 const INTERSECT_WGSL: &str = include_str!("wgsl/intersect.wgsl");
 
 /// Create a Composer pre-loaded with all shared rmesh WGSL modules.
 ///
-/// Modules available for import:
-/// - `rmesh::common` — Uniforms, TileUniforms, DrawIndirectArgs
-/// - `rmesh::math` — softplus, dsoftplus, phi, dphi_dx, project_to_ndc
-/// - `rmesh::sh` — SH basis constants + eval_sh
-/// - `rmesh::intersect` — TET_FACES constant, vertex loaders
+/// Modules available for selective import:
+/// - `rmesh::math` — MAX_VAL, safe_clip_v3f, safe_exp_f32, phi, dphi_dx, softplus, dsoftplus, project_to_ndc
+/// - `rmesh::sh` — SH basis constants (C0, C1, C2_*, C3_*)
+/// - `rmesh::intersect` — FACES constant
+///
+/// Use selective import syntax: `#import rmesh::math::{phi, MAX_VAL}`
 pub fn create_composer() -> Result<Composer, String> {
     let mut composer = Composer::default();
 
     let modules = [
-        ("rmesh::common", COMMON_WGSL),
         ("rmesh::math", MATH_WGSL),
         ("rmesh::sh", SH_WGSL),
         ("rmesh::intersect", INTERSECT_WGSL),
@@ -46,7 +53,8 @@ pub fn create_composer() -> Result<Composer, String> {
 /// Compose a WGSL shader source (which may `#import` shared modules) into a
 /// `wgpu::ShaderModule`.
 ///
-/// The source can use `#import rmesh::common`, `#import rmesh::math`, etc.
+/// The source should use selective imports:
+/// `#import rmesh::math::{phi, MAX_VAL}`
 pub fn create_shader_module(
     device: &wgpu::Device,
     label: &str,
@@ -83,4 +91,62 @@ pub fn create_shader_module(
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(wgsl_text.into()),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compose_selective_math() {
+        let mut composer = create_composer().expect("create_composer failed");
+
+        let source = r#"
+#import rmesh::math::{phi, safe_exp_f32, MAX_VAL, safe_clip_v3f}
+
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+
+@compute @workgroup_size(1)
+fn main() {
+    out[0] = phi(1.0);
+    out[1] = safe_exp_f32(1.0);
+    out[2] = MAX_VAL;
+    let v = safe_clip_v3f(vec3<f32>(1.0), 0.0, 1.0);
+    out[3] = v.x;
+}
+"#;
+
+        let module = composer.make_naga_module(NagaModuleDescriptor {
+            source,
+            file_path: "test_math.wgsl",
+            shader_type: ShaderType::Wgsl,
+            ..Default::default()
+        });
+        assert!(module.is_ok(), "selective math import failed: {:?}", module.err());
+    }
+
+    #[test]
+    fn test_compose_selective_intersect() {
+        let mut composer = create_composer().expect("create_composer failed");
+
+        let source = r#"
+#import rmesh::intersect::FACES
+
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+
+@compute @workgroup_size(1)
+fn main() {
+    let f = FACES[0];
+    out[0] = f.x;
+}
+"#;
+
+        let module = composer.make_naga_module(NagaModuleDescriptor {
+            source,
+            file_path: "test_intersect.wgsl",
+            shader_type: ShaderType::Wgsl,
+            ..Default::default()
+        });
+        assert!(module.is_ok(), "selective intersect import failed: {:?}", module.err());
+    }
 }

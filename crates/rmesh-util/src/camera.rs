@@ -54,15 +54,26 @@ pub fn pixel_to_ndc(px: f32, py: f32, w: f32, h: f32) -> (f32, f32) {
     (ndc_x, ndc_y)
 }
 
-/// Pixel → world-space ray (origin, direction). Matches rasterize_compute.wgsl.
-pub fn pixel_ray(inv_vp: Mat4, cam_pos: Vec3, px: f32, py: f32, w: f32, h: f32) -> (Vec3, Vec3) {
-    let (ndc_x, ndc_y) = pixel_to_ndc(px, py, w, h);
-
-    let clip_near = Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
-    let world_h = inv_vp * clip_near;
-    let world_pos = world_h.truncate() / world_h.w;
-
-    let dir = (world_pos - cam_pos).normalize();
+/// Pixel → world-space ray (origin, direction) using camera intrinsics.
+/// Matches rasterize_compute.wgsl intrinsic ray construction.
+pub fn pixel_ray_intrinsics(
+    c2w: glam::Mat3,
+    intrinsics: [f32; 4],
+    cam_pos: Vec3,
+    px: f32,
+    py: f32,
+) -> (Vec3, Vec3) {
+    let fx = intrinsics[0];
+    let fy = intrinsics[1];
+    let cx = intrinsics[2];
+    let cy = intrinsics[3];
+    let dir_cam = Vec3::new(
+        (px + 0.5 - cx) / fx,
+        (py + 0.5 - cy) / fy,
+        1.0,
+    )
+    .normalize();
+    let dir = (c2w * dir_cam).normalize();
     (cam_pos, dir)
 }
 
@@ -123,10 +134,10 @@ pub fn softplus(x: f32) -> f32 {
 /// Sigmoid activation `phi(x) = (1 - exp(-x)) / x` (matches WGSL).
 ///
 /// Note: this is the volume rendering integral helper, not the logistic sigmoid.
-/// For `|x| < 1e-6`, returns the Taylor approximation `1 - x/2`.
+/// For `|x| < 0.02`, uses 4-term Taylor to avoid catastrophic cancellation.
 pub fn phi(x: f32) -> f32 {
-    if x.abs() < 1e-6 {
-        1.0 - x * 0.5
+    if x.abs() < 0.02 {
+        1.0 + x * (-0.5 + x * (1.0 / 6.0 + x * (-1.0 / 24.0)))
     } else {
         (1.0 - (-x).exp()) / x
     }

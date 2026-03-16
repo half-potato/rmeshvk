@@ -6,12 +6,12 @@
 //!   - `train_step()`: full forward+loss+backward+adam on GPU, return loss
 //!   - `update_params()` / `get_params()`: parameter transfer for PyTorch optimizer path
 
-use numpy::ndarray::{Array1, Array3};
+use numpy::ndarray::{Array1, Array2, Array3};
 use numpy::{IntoPyArray, PyArray1, PyArray3, PyReadonlyArray1, PyReadonlyArray3};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use glam::{Mat4, Vec3, Vec4};
+use glam::{Mat3, Mat4, Vec3, Vec4};
 use rmesh_backward::{
     create_backward_tiled_bind_groups,
     create_prepare_dispatch_bind_group, create_rts_bind_group,
@@ -28,6 +28,10 @@ use rmesh_render::{
     record_tex_to_buffer, ForwardPipelines, LocatePipeline, LocateUniforms,
     RasterizeComputePipeline, MaterialBuffers, RayTraceBuffers, RayTracePipeline, RenderTargets,
     SceneBuffers, TexToBufferPipeline,
+};
+use rmesh_error::{
+    ErrorPipeline, ErrorBuffers, ErrorInputBuffers,
+    create_error_bg0, create_error_bg1, record_error_pass,
 };
 use rmesh_train::{
     create_adam_bind_group, create_loss_bind_group, AdamPipeline, AdamState, LossBuffers,
@@ -111,6 +115,18 @@ fn mat4_from_flat(data: &[f32]) -> Mat4 {
     )
 }
 
+/// Helper: extract c2w rotation (Mat3) + intrinsics ([f32; 4]) from flat [16] f32.
+/// Layout: [c2w_col0(xyz,0), c2w_col1(xyz,0), c2w_col2(xyz,0), intrinsics(fx,fy,cx,cy)]
+fn c2w_from_flat(data: &[f32]) -> (Mat3, [f32; 4]) {
+    let c2w = Mat3::from_cols(
+        glam::Vec3::new(data[0], data[1], data[2]),
+        glam::Vec3::new(data[4], data[5], data[6]),
+        glam::Vec3::new(data[8], data[9], data[10]),
+    );
+    let intrinsics = [data[12], data[13], data[14], data[15]];
+    (c2w, intrinsics)
+}
+
 #[pyclass]
 struct RMeshRenderer {
     device: wgpu::Device,
@@ -176,6 +192,14 @@ struct RMeshRenderer {
     locate_hint_buf: wgpu::Buffer,
     locate_result_buf: wgpu::Buffer,
     locate_capacity: u32,
+    // Error tiled pipeline
+    error_pipeline: ErrorPipeline,
+    error_buffers: ErrorBuffers,
+    error_input_buffers: ErrorInputBuffers,
+    error_bg0: wgpu::BindGroup,
+    error_bg0_b: wgpu::BindGroup,
+    error_bg1: wgpu::BindGroup,
+    last_sort_in_b: bool,
     // Cached scene data for find_containing_tet and locate_tets
     cached_vertices: Vec<f32>,
     cached_indices: Vec<u32>,
@@ -581,6 +605,27 @@ impl RMeshRenderer {
             mapped_at_creation: false,
         });
 
+        // Error tiled pipeline
+        let error_pipeline = ErrorPipeline::new(&device);
+        let error_buffers = ErrorBuffers::new(&device, tet_count);
+        let error_input_buffers = ErrorInputBuffers::new(&device, width, height);
+        let error_bg0 = create_error_bg0(
+            &device, &error_pipeline,
+            &scene_buffers.uniforms, &scene_buffers.vertices, &scene_buffers.indices,
+            &material_buffers.colors, &scene_buffers.densities, &material_buffers.color_grads,
+            &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+        );
+        let error_bg0_b = create_error_bg0(
+            &device, &error_pipeline,
+            &scene_buffers.uniforms, &scene_buffers.vertices, &scene_buffers.indices,
+            &material_buffers.colors, &scene_buffers.densities, &material_buffers.color_grads,
+            &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+        );
+        let error_bg1 = create_error_bg1(
+            &device, &error_pipeline,
+            &error_input_buffers, &error_buffers,
+        );
+
         Ok(Self {
             device,
             queue,
@@ -632,6 +677,13 @@ impl RMeshRenderer {
             locate_hint_buf,
             locate_result_buf,
             locate_capacity: 1,
+            error_pipeline,
+            error_buffers,
+            error_input_buffers,
+            error_bg0,
+            error_bg0_b,
+            error_bg1,
+            last_sort_in_b: false,
             cached_vertices: vertices_slice.to_vec(),
             cached_indices: indices_slice.to_vec(),
             cached_neighbors: neighbors,
@@ -656,7 +708,7 @@ impl RMeshRenderer {
     /// Args:
     ///     cam_pos: [3] f32 camera position
     ///     vp: [16] f32 column-major view-projection matrix
-    ///     inv_vp: [16] f32 column-major inverse view-projection matrix
+    ///     c2w_intrinsics: [16] f32 (c2w_col0[4], c2w_col1[4], c2w_col2[4], intrinsics[4])
     ///
     /// Returns:
     ///     numpy array [H, W, 4] f32 (premultiplied RGBA)
@@ -665,19 +717,20 @@ impl RMeshRenderer {
         py: Python<'py>,
         cam_pos: PyReadonlyArray1<f32>,
         vp: PyReadonlyArray1<f32>,
-        inv_vp: PyReadonlyArray1<f32>,
+        c2w_intrinsics: PyReadonlyArray1<f32>,
     ) -> PyResult<Bound<'py, PyArray3<f32>>> {
         let cam_pos_slice = cam_pos.as_slice()?;
         let vp_slice = vp.as_slice()?;
-        let inv_vp_slice = inv_vp.as_slice()?;
+        let ci_slice = c2w_intrinsics.as_slice()?;
 
         let cam = Vec3::new(cam_pos_slice[0], cam_pos_slice[1], cam_pos_slice[2]);
         let vp_mat = mat4_from_flat(vp_slice);
-        let inv_vp_mat = mat4_from_flat(inv_vp_slice);
+        let (c2w, intrinsics) = c2w_from_flat(ci_slice);
 
         let uniforms = make_uniforms(
             vp_mat,
-            inv_vp_mat,
+            c2w,
+            intrinsics,
             cam,
             self.width as f32,
             self.height as f32,
@@ -734,31 +787,32 @@ impl RMeshRenderer {
     /// Args:
     ///     cam_pos: [3] f32 camera position
     ///     vp: [16] f32 column-major view-projection matrix
-    ///     inv_vp: [16] f32 column-major inverse view-projection matrix
+    ///     c2w_intrinsics: [16] f32 (c2w_col0[4], c2w_col1[4], c2w_col2[4], intrinsics[4])
     ///     render_aux: if True, also return aux [H,W,8] (normals, depth, entropy)
     ///
     /// Returns:
     ///     numpy array [H, W, 4] f32 (RGBA), or tuple (rgba, aux) if render_aux=True
-    #[pyo3(signature = (cam_pos, vp, inv_vp, render_aux=false))]
+    #[pyo3(signature = (cam_pos, vp, c2w_intrinsics, render_aux=false))]
     fn forward_tiled<'py>(
         &mut self,
         py: Python<'py>,
         cam_pos: PyReadonlyArray1<f32>,
         vp: PyReadonlyArray1<f32>,
-        inv_vp: PyReadonlyArray1<f32>,
+        c2w_intrinsics: PyReadonlyArray1<f32>,
         render_aux: bool,
     ) -> PyResult<Py<PyAny>> {
         let cam_pos_slice = cam_pos.as_slice()?;
         let vp_slice = vp.as_slice()?;
-        let inv_vp_slice = inv_vp.as_slice()?;
+        let ci_slice = c2w_intrinsics.as_slice()?;
 
         let cam = Vec3::new(cam_pos_slice[0], cam_pos_slice[1], cam_pos_slice[2]);
         let vp_mat = mat4_from_flat(vp_slice);
-        let inv_vp_mat = mat4_from_flat(inv_vp_slice);
+        let (c2w, intrinsics) = c2w_from_flat(ci_slice);
 
         let uniforms = make_uniforms(
             vp_mat,
-            inv_vp_mat,
+            c2w,
+            intrinsics,
             cam,
             self.width as f32,
             self.height as f32,
@@ -839,6 +893,7 @@ impl RMeshRenderer {
                 &self.tile_buffers.tile_sort_keys,
                 &self.tile_buffers.tile_sort_values,
             );
+            self.last_sort_in_b = result_in_b;
 
             let (ranges_bg, fwd_bg) = if result_in_b {
                 (&self.tile_ranges_bg_b, &self.rasterize_bg_b)
@@ -905,7 +960,7 @@ impl RMeshRenderer {
     /// Args:
     ///     cam_pos: [3] f32 camera position
     ///     vp: [16] f32 column-major view-projection matrix
-    ///     inv_vp: [16] f32 column-major inverse view-projection matrix
+    ///     c2w_intrinsics: [16] f32 (c2w_col0[4], c2w_col1[4], c2w_col2[4], intrinsics[4])
     ///     ray_origins: optional [N*3] f32 per-pixel ray origins (multi-origin support)
     ///     ray_dirs: optional [N*3] f32 per-pixel ray directions
     ///     start_tets: optional [N] i32 per-pixel start tet IDs
@@ -913,13 +968,13 @@ impl RMeshRenderer {
     ///
     /// Returns:
     ///     numpy array [H, W, 4] f32 (RGBA), or tuple (rgba, aux) if render_aux=True
-    #[pyo3(signature = (cam_pos, vp, inv_vp, ray_origins=None, ray_dirs=None, start_tets=None, render_aux=false))]
+    #[pyo3(signature = (cam_pos, vp, c2w_intrinsics, ray_origins=None, ray_dirs=None, start_tets=None, render_aux=false))]
     fn forward_raytrace<'py>(
         &mut self,
         py: Python<'py>,
         cam_pos: PyReadonlyArray1<f32>,
         vp: PyReadonlyArray1<f32>,
-        inv_vp: PyReadonlyArray1<f32>,
+        c2w_intrinsics: PyReadonlyArray1<f32>,
         ray_origins: Option<PyReadonlyArray1<f32>>,
         ray_dirs: Option<PyReadonlyArray1<f32>>,
         start_tets: Option<PyReadonlyArray1<i32>>,
@@ -927,15 +982,16 @@ impl RMeshRenderer {
     ) -> PyResult<Py<PyAny>> {
         let cam_pos_slice = cam_pos.as_slice()?;
         let vp_slice = vp.as_slice()?;
-        let inv_vp_slice = inv_vp.as_slice()?;
+        let ci_slice = c2w_intrinsics.as_slice()?;
 
         let cam = Vec3::new(cam_pos_slice[0], cam_pos_slice[1], cam_pos_slice[2]);
         let vp_mat = mat4_from_flat(vp_slice);
-        let inv_vp_mat = mat4_from_flat(inv_vp_slice);
+        let (c2w, intrinsics) = c2w_from_flat(ci_slice);
 
         let mut uniforms = make_uniforms(
             vp_mat,
-            inv_vp_mat,
+            c2w,
+            intrinsics,
             cam,
             self.width as f32,
             self.height as f32,
@@ -1112,6 +1168,109 @@ impl RMeshRenderer {
         } else {
             Ok(rgba.into_pyarray(py).into_any().unbind())
         }
+    }
+
+    /// Compute per-tet error statistics using the tiled pipeline.
+    ///
+    /// Must be called after `forward_tiled()` — reuses the sorted tile data from
+    /// the most recent forward pass.
+    ///
+    /// Args:
+    ///     pixel_err: [H*W] f32 per-pixel L1 error (flattened row-major)
+    ///     ssim_err: [H*W] f32 per-pixel SSIM error (flattened row-major)
+    ///
+    /// Returns:
+    ///     tuple (tet_err [T, 16] f32, tet_count [T, 2] i32)
+    fn forward_error<'py>(
+        &mut self,
+        py: Python<'py>,
+        pixel_err: PyReadonlyArray1<f32>,
+        ssim_err: PyReadonlyArray1<f32>,
+    ) -> PyResult<Py<PyAny>> {
+        let pe = pixel_err.as_slice()?;
+        let se = ssim_err.as_slice()?;
+
+        let n_pixels = (self.width * self.height) as usize;
+        if pe.len() != n_pixels {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("pixel_err must have {} elements, got {}", n_pixels, pe.len())
+            ));
+        }
+        if se.len() != n_pixels {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("ssim_err must have {} elements, got {}", n_pixels, se.len())
+            ));
+        }
+
+        // Upload pixel errors
+        self.queue.write_buffer(
+            &self.error_input_buffers.pixel_err,
+            0,
+            bytemuck::cast_slice(pe),
+        );
+        self.queue.write_buffer(
+            &self.error_input_buffers.ssim_err,
+            0,
+            bytemuck::cast_slice(se),
+        );
+
+        // Build encoder
+        let mut encoder = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor {
+                label: Some("forward_error"),
+            },
+        );
+
+        // Clear error output buffers
+        encoder.clear_buffer(&self.error_buffers.tet_err, 0, None);
+        encoder.clear_buffer(&self.error_buffers.tet_count, 0, None);
+
+        // Select bind group based on last sort result
+        let bg0 = if self.last_sort_in_b {
+            &self.error_bg0_b
+        } else {
+            &self.error_bg0
+        };
+
+        // Dispatch error pass
+        record_error_pass(
+            &mut encoder,
+            &self.error_pipeline,
+            bg0,
+            &self.error_bg1,
+            self.tile_buffers.num_tiles,
+        );
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Read back tet_err as [T, 16] f32
+        let tet_err_data = read_buffer_f32(
+            &self.device, &self.queue, &self.error_buffers.tet_err,
+        );
+
+        let tet_err_array = Array2::from_shape_vec(
+            (self.tet_count as usize, 16),
+            tet_err_data,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+
+        // Read back tet_count as [T, 2] i32
+        let tet_count_raw = read_buffer_raw(
+            &self.device, &self.queue, &self.error_buffers.tet_count,
+        );
+        let tet_count_i32: &[i32] = bytemuck::cast_slice(&tet_count_raw);
+
+        let tet_count_array = Array2::from_shape_vec(
+            (self.tet_count as usize, 2),
+            tet_count_i32.to_vec(),
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+
+        let tuple = pyo3::types::PyTuple::new(py, &[
+            tet_err_array.into_pyarray(py).into_any(),
+            tet_count_array.into_pyarray(py).into_any(),
+        ])?;
+        Ok(tuple.into())
     }
 
     /// Locate the containing tet for each query point via GPU adjacency walking.
@@ -1588,7 +1747,7 @@ impl RMeshRenderer {
     /// Args:
     ///     cam_pos: [3] f32 camera position
     ///     vp: [16] f32 column-major VP matrix
-    ///     inv_vp: [16] f32 column-major inverse VP matrix
+    ///     c2w_intrinsics: [16] f32 camera-to-world rotation (3×vec4 columns) + intrinsics (fx,fy,cx,cy)
     ///     gt_image: [H, W, 3] f32 ground truth image
     ///     lr_verts: learning rate for vertices
     ///     lr_dens: learning rate for densities
@@ -1601,7 +1760,7 @@ impl RMeshRenderer {
         &mut self,
         cam_pos: PyReadonlyArray1<f32>,
         vp: PyReadonlyArray1<f32>,
-        inv_vp: PyReadonlyArray1<f32>,
+        c2w_intrinsics: PyReadonlyArray1<f32>,
         gt_image: PyReadonlyArray3<f32>,
         lr_verts: f32,
         lr_dens: f32,
@@ -1610,16 +1769,17 @@ impl RMeshRenderer {
     ) -> PyResult<f32> {
         let cam_pos_slice = cam_pos.as_slice()?;
         let vp_slice = vp.as_slice()?;
-        let inv_vp_slice = inv_vp.as_slice()?;
+        let c2w_int_slice = c2w_intrinsics.as_slice()?;
         let gt_data = gt_image.as_slice()?;
 
         let cam = Vec3::new(cam_pos_slice[0], cam_pos_slice[1], cam_pos_slice[2]);
         let vp_mat = mat4_from_flat(vp_slice);
-        let inv_vp_mat = mat4_from_flat(inv_vp_slice);
+        let (c2w, intrinsics) = c2w_from_flat(c2w_int_slice);
 
         let uniforms = make_uniforms(
             vp_mat,
-            inv_vp_mat,
+            c2w,
+            intrinsics,
             cam,
             self.width as f32,
             self.height as f32,

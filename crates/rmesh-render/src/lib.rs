@@ -32,6 +32,7 @@ const PROJECT_COMPUTE_WGSL: &str = include_str!("wgsl/project_compute.wgsl");
 const FORWARD_VERTEX_WGSL: &str = include_str!("wgsl/forward_vertex.wgsl");
 const FORWARD_FRAGMENT_WGSL: &str = include_str!("wgsl/forward_fragment.wgsl");
 const TEX_TO_BUFFER_WGSL: &str = include_str!("wgsl/tex_to_buffer.wgsl");
+const BLIT_WGSL: &str = include_str!("wgsl/blit.wgsl");
 const RAYTRACE_COMPUTE_WGSL: &str = include_str!("wgsl/raytrace_compute.wgsl");
 const RASTERIZE_COMPUTE_WGSL: &str = include_str!("wgsl/rasterize_compute.wgsl");
 const LOCATE_COMPUTE_WGSL: &str = include_str!("wgsl/locate_compute.wgsl");
@@ -1194,7 +1195,8 @@ pub fn setup_forward(
 /// Build a `Uniforms` struct from camera matrices and scene metadata.
 pub fn make_uniforms(
     vp: Mat4,
-    inv_vp: Mat4,
+    c2w: glam::Mat3,
+    intrinsics: [f32; 4],
     cam_pos: glam::Vec3,
     screen_width: f32,
     screen_height: f32,
@@ -1208,10 +1210,10 @@ pub fn make_uniforms(
         vp_col1: vp.col(1).into(),
         vp_col2: vp.col(2).into(),
         vp_col3: vp.col(3).into(),
-        inv_vp_col0: inv_vp.col(0).into(),
-        inv_vp_col1: inv_vp.col(1).into(),
-        inv_vp_col2: inv_vp.col(2).into(),
-        inv_vp_col3: inv_vp.col(3).into(),
+        c2w_col0: [c2w.col(0).x, c2w.col(0).y, c2w.col(0).z, 0.0],
+        c2w_col1: [c2w.col(1).x, c2w.col(1).y, c2w.col(1).z, 0.0],
+        c2w_col2: [c2w.col(2).x, c2w.col(2).y, c2w.col(2).z, 0.0],
+        intrinsics,
         cam_pos_pad: [cam_pos.x, cam_pos.y, cam_pos.z, 0.0],
         screen_width,
         screen_height,
@@ -1495,10 +1497,9 @@ impl RayTracePipeline {
             .replace("/*AUX_DIM*/0u", &format!("{}u", aux_dim))
             .replace("/*AUX_ACC_SIZE*/1u", &format!("{}u", aux_dim.max(1)));
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("raytrace_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
+        let shader = rmesh_util::compose::create_shader_module(
+            device, "raytrace_compute.wgsl", &source,
+        ).expect("Failed to compose raytrace_compute.wgsl");
 
         // Group 0: 13 bindings (0-6 read, 7 rw, 8-12 read)
         let read_only = [true, true, true, true, true, true, true, false, true, true, true, true, true];
@@ -1725,10 +1726,9 @@ impl RasterizeComputePipeline {
             .replace("/*AUX_DIM*/0u", &format!("{}u", aux_dim))
             .replace("/*SM_AUX_SIZE*/1u", &format!("{}u", (256 * aux_dim).max(1)));
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rasterize_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
+        let shader = rmesh_util::compose::create_shader_module(
+            device, "rasterize_compute.wgsl", &source,
+        ).expect("Failed to compose rasterize_compute.wgsl");
 
         // Group 0: 10 bindings
         let read_only = [true, true, true, true, true, true, true, true, true, false];
@@ -2082,4 +2082,145 @@ pub fn find_containing_tet_walk(
 
     // Walk exhausted — fall back to brute force
     find_containing_tet(vertices, indices, tet_count, point)
+}
+
+// ---------------------------------------------------------------------------
+// Blit Pipeline (Rgba16Float → sRGB swapchain)
+// ---------------------------------------------------------------------------
+
+/// Pipeline that blits the Rgba16Float render target to the sRGB swapchain
+/// via a fullscreen triangle.
+pub struct BlitPipeline {
+    pub pipeline: wgpu::RenderPipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+    pub sampler: wgpu::Sampler,
+}
+
+impl BlitPipeline {
+    /// Create the blit pipeline targeting `target_format` (e.g. Bgra8UnormSrgb).
+    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
+        });
+
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("blit_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blit_pl"),
+            bind_group_layouts: &[&bind_group_layout],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blit_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        Self {
+            pipeline,
+            bind_group_layout,
+            sampler,
+        }
+    }
+}
+
+/// Create a bind group for the blit pipeline from a source texture view.
+pub fn create_blit_bind_group(
+    device: &wgpu::Device,
+    blit: &BlitPipeline,
+    source_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("blit_bg"),
+        layout: &blit.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(source_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&blit.sampler),
+            },
+        ],
+    })
+}
+
+/// Record a blit render pass: fullscreen triangle sampling `source` to `target_view`.
+pub fn record_blit(
+    encoder: &mut wgpu::CommandEncoder,
+    blit: &BlitPipeline,
+    bind_group: &wgpu::BindGroup,
+    target_view: &wgpu::TextureView,
+) {
+    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("blit"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    });
+    rpass.set_pipeline(&blit.pipeline);
+    rpass.set_bind_group(0, bind_group, &[]);
+    rpass.draw(0..3, 0..1); // fullscreen triangle
 }

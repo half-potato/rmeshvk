@@ -23,13 +23,13 @@ const SEED: u64 = 42424242;
 const W: u32 = 16;
 const H: u32 = 16;
 
-fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat4) {
+fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat3, [f32; 4]) {
     let aspect = W as f32 / H as f32;
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, target, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let inv_vp = vp.inverse();
-    (vp, inv_vp)
+    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
+    (vp, c2w, intrinsics)
 }
 
 // ---------------------------------------------------------------------------
@@ -66,10 +66,10 @@ fn test_project_compute_kernel() {
     let verts = load_tet_verts(&scene, 0);
     let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
     let eye = centroid + Vec3::new(2.0, 0.0, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, centroid);
+    let (vp, c2w, intrinsics) = setup_camera(eye, centroid);
 
     let uniforms =
-        rmesh_render::make_uniforms(vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0, 12, 0.0);
+        rmesh_render::make_uniforms(vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0, 12, 0.0);
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     // Reset indirect args
@@ -158,13 +158,13 @@ fn test_legacy_forward_e2e() {
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, centroid, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let inv_vp = vp.inverse();
+    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, centroid, std::f32::consts::FRAC_PI_2, E2E_W as f32, E2E_H as f32);
 
-    let cpu_image = cpu_render_scene(&scene, eye, vp, inv_vp, E2E_W, E2E_H);
+    let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, E2E_W, E2E_H);
     let total_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
     assert!(total_alpha > 0.01, "CPU image is all-zero");
 
-    if let Some(gpu_image) = gpu_render_scene(&scene, eye, vp, inv_vp, E2E_W, E2E_H) {
+    if let Some(gpu_image) = gpu_render_scene(&scene, eye, vp, c2w, intrinsics, E2E_W, E2E_H) {
         let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
         eprintln!("legacy_forward_e2e: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
         assert!(mean_diff < 0.1, "mean_diff {mean_diff} >= 0.1");

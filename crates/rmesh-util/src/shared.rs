@@ -18,11 +18,12 @@ pub struct Uniforms {
     pub vp_col1: [f32; 4],
     pub vp_col2: [f32; 4],
     pub vp_col3: [f32; 4],
-    /// Column-major 4×4 inverse view-projection matrix (for backward pass ray computation)
-    pub inv_vp_col0: [f32; 4],
-    pub inv_vp_col1: [f32; 4],
-    pub inv_vp_col2: [f32; 4],
-    pub inv_vp_col3: [f32; 4],
+    /// Camera-to-world rotation matrix columns (xyz, w=0 padding)
+    pub c2w_col0: [f32; 4],
+    pub c2w_col1: [f32; 4],
+    pub c2w_col2: [f32; 4],
+    /// Camera intrinsics [fx, fy, cx, cy]
+    pub intrinsics: [f32; 4],
     /// Camera position (xyz) + padding (w)
     pub cam_pos_pad: [f32; 4],
     /// Screen dimensions
@@ -34,7 +35,7 @@ pub struct Uniforms {
     pub step: u32,
     /// Tile size for tiled pipeline (must match shaders).
     pub tile_size_u: u32,
-    /// Ray mode: 0 = derive from inv_vp (legacy), 1 = read from ray buffers.
+    /// Ray mode: 0 = derive from c2w + intrinsics, 1 = read from ray buffers.
     pub ray_mode: u32,
     /// Minimum ray-origin offset along view direction (matches Slang camera.min_t).
     pub min_t: f32,
@@ -52,12 +53,11 @@ impl Uniforms {
         )
     }
 
-    pub fn inv_vp_matrix(&self) -> glam::Mat4 {
-        glam::Mat4::from_cols(
-            glam::Vec4::from(self.inv_vp_col0),
-            glam::Vec4::from(self.inv_vp_col1),
-            glam::Vec4::from(self.inv_vp_col2),
-            glam::Vec4::from(self.inv_vp_col3),
+    pub fn c2w_matrix(&self) -> glam::Mat3 {
+        glam::Mat3::from_cols(
+            glam::Vec3::new(self.c2w_col0[0], self.c2w_col0[1], self.c2w_col0[2]),
+            glam::Vec3::new(self.c2w_col1[0], self.c2w_col1[1], self.c2w_col1[2]),
+            glam::Vec3::new(self.c2w_col2[0], self.c2w_col2[1], self.c2w_col2[2]),
         )
     }
 }

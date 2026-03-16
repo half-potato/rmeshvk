@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 rmesh-render = { path = "../rmesh-render" }
 rmesh-backward = { path = "../rmesh-backward" }
+rmesh-error = { path = "../rmesh-error" }
 rmesh-data = { path = "../rmesh-data" }
 rmesh-util = { path = "../rmesh-util" }
 rmesh-train = { path = "../rmesh-train" }

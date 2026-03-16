@@ -19,13 +19,13 @@ const SEED: u64 = 189710234;
 const W: u32 = 64;
 const H: u32 = 64;
 
-fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat4) {
+fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat3, [f32; 4]) {
     let aspect = W as f32 / H as f32;
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, target, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let inv_vp = vp.inverse();
-    (vp, inv_vp)
+    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
+    (vp, c2w, intrinsics)
 }
 
 /// Helper: render a scene with all available renderers and return results.
@@ -41,12 +41,12 @@ fn render_all(
     Option<Vec<[f32; 4]>>,
     Option<Vec<[f32; 4]>>,
 ) {
-    let (vp, inv_vp) = setup_camera(eye, target);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
-    let cpu = cpu_render_scene(scene, eye, vp, inv_vp, W, H);
-    let hw_raster = gpu_render_scene(scene, eye, vp, inv_vp, W, H);
-    let raytrace = gpu_raytrace_scene(scene, eye, vp, inv_vp, W, H);
-    let tiled = gpu_tiled_render_scene(scene, eye, vp, inv_vp, W, H);
+    let cpu = cpu_render_scene(scene, eye, vp, c2w, intrinsics, W, H);
+    let hw_raster = gpu_render_scene(scene, eye, vp, c2w, intrinsics, W, H);
+    let raytrace = gpu_raytrace_scene(scene, eye, vp, c2w, intrinsics, W, H);
+    let tiled = gpu_tiled_render_scene(scene, eye, vp, c2w, intrinsics, W, H);
 
     (cpu, hw_raster, raytrace, tiled)
 }
@@ -263,16 +263,16 @@ fn test_single_tet_multi_angle_cross_renderer() {
     ];
 
     for (eye, label) in &viewpoints {
-        let (vp, inv_vp) = setup_camera(*eye, centroid);
+        let (vp, c2w, intrinsics) = setup_camera(*eye, centroid);
 
-        let cpu = cpu_render_scene(&scene, *eye, vp, inv_vp, W, H);
+        let cpu = cpu_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H);
         let total_alpha: f32 = cpu.iter().map(|p| p[3]).sum();
         if total_alpha < 0.01 {
             eprintln!("{label}: tet not visible, skipping");
             continue;
         }
 
-        if let Some(tiled) = gpu_tiled_render_scene(&scene, *eye, vp, inv_vp, W, H) {
+        if let Some(tiled) = gpu_tiled_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H) {
             let (max_diff, mean_diff, _) = compare_images(&cpu, &tiled);
             eprintln!("{label}: CPU vs tiled: max={max_diff:.6}, mean={mean_diff:.8}");
             if max_diff > 0.002 {
@@ -291,7 +291,7 @@ fn test_single_tet_multi_angle_cross_renderer() {
             return;
         }
 
-        if let Some(raytrace) = gpu_raytrace_scene(&scene, *eye, vp, inv_vp, W, H) {
+        if let Some(raytrace) = gpu_raytrace_scene(&scene, *eye, vp, c2w, intrinsics, W, H) {
             let (max_diff, mean_diff, _) = compare_images(&cpu, &raytrace);
             eprintln!("{label}: CPU vs raytrace: max={max_diff:.6}, mean={mean_diff:.8}");
             if max_diff > 0.002 {
@@ -323,16 +323,16 @@ fn assert_all_renderers_match_cpu(
     target: Vec3,
     label: &str,
 ) {
-    let (vp, inv_vp) = setup_camera(eye, target);
-    let cpu = cpu_render_scene(scene, eye, vp, inv_vp, W, H);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
+    let cpu = cpu_render_scene(scene, eye, vp, c2w, intrinsics, W, H);
     let total_alpha: f32 = cpu.iter().map(|p| p[3]).sum();
     assert!(total_alpha > 0.01, "{label}: CPU image is all-zero");
 
     // (name, gpu_image, mean_tolerance, max_tolerance)
     let renderers: Vec<(&str, Option<Vec<[f32; 4]>>, f32, f32)> = vec![
-        ("HW raster", gpu_render_scene(scene, eye, vp, inv_vp, W, H), 0.05, 0.01),
-        ("raytrace", gpu_raytrace_scene(scene, eye, vp, inv_vp, W, H), 0.01, 0.002),
-        ("tiled", gpu_tiled_render_scene(scene, eye, vp, inv_vp, W, H), 0.01, 0.002),
+        ("HW raster", gpu_render_scene(scene, eye, vp, c2w, intrinsics, W, H), 0.05, 0.01),
+        ("raytrace", gpu_raytrace_scene(scene, eye, vp, c2w, intrinsics, W, H), 0.01, 0.002),
+        ("tiled", gpu_tiled_render_scene(scene, eye, vp, c2w, intrinsics, W, H), 0.01, 0.002),
     ];
 
     // Print all comparisons before asserting (so we see ALL renderer results
@@ -455,13 +455,13 @@ fn test_four_tet_all_renderers() {
 
     eprintln!("=== Four-tet all-renderers test ===");
     for (eye, target, label) in &viewpoints {
-        let (vp, inv_vp) = setup_camera(*eye, *target);
-        let cpu = cpu_render_scene(&scene, *eye, vp, inv_vp, W, H);
+        let (vp, c2w, intrinsics) = setup_camera(*eye, *target);
+        let cpu = cpu_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H);
         let total_alpha: f32 = cpu.iter().map(|p| p[3]).sum();
         assert!(total_alpha > 0.01, "{label}: CPU image is all-zero");
 
         // Tiled: strict match (same ray-tet intersection math as CPU)
-        if let Some(ref tiled) = gpu_tiled_render_scene(&scene, *eye, vp, inv_vp, W, H) {
+        if let Some(ref tiled) = gpu_tiled_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H) {
             let (max_diff, mean_diff, _) = compare_images(&cpu, tiled);
             eprintln!("{label}: CPU vs tiled: max={max_diff:.6}, mean={mean_diff:.8}");
             if max_diff > 0.002 {
@@ -472,7 +472,7 @@ fn test_four_tet_all_renderers() {
         }
 
         // Raytrace: relaxed (adjacency traversal can't reach isolated tets)
-        if let Some(ref rt) = gpu_raytrace_scene(&scene, *eye, vp, inv_vp, W, H) {
+        if let Some(ref rt) = gpu_raytrace_scene(&scene, *eye, vp, c2w, intrinsics, W, H) {
             let (max_diff, mean_diff, _) = compare_images(&cpu, rt);
             eprintln!("{label}: CPU vs raytrace: max={max_diff:.6}, mean={mean_diff:.8} (non-watertight → relaxed)");
             if max_diff > 0.8 {
@@ -481,7 +481,7 @@ fn test_four_tet_all_renderers() {
         }
 
         // HW raster: relaxed (degenerate face triangles for edge-on faces)
-        if let Some(ref hw) = gpu_render_scene(&scene, *eye, vp, inv_vp, W, H) {
+        if let Some(ref hw) = gpu_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H) {
             let (max_diff, mean_diff, _) = compare_images(&cpu, hw);
             eprintln!("{label}: CPU vs HW raster: max={max_diff:.6}, mean={mean_diff:.8} (non-watertight → relaxed)");
             if max_diff > 0.8 {
@@ -531,15 +531,15 @@ fn test_two_tet_cross_renderer() {
     // Avoid looking along Z axis since up=(0,0,1) creates degenerate look_at.
     let eye = Vec3::new(3.0, 0.4, 1.0);
     let target = Vec3::new(0.5, 0.4, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, target);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
-    let cpu = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+    let cpu = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
     let total_alpha: f32 = cpu.iter().map(|p| p[3]).sum();
     assert!(total_alpha > 0.01, "CPU image is all-zero");
 
     eprintln!("=== Two-tet cross-renderer test ===");
 
-    if let Some(tiled) = gpu_tiled_render_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(tiled) = gpu_tiled_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let (max_diff, mean_diff, _) = compare_images(&cpu, &tiled);
         eprintln!("CPU vs tiled:     max={max_diff:.6}, mean={mean_diff:.8}");
         if max_diff > 0.002 {
@@ -558,7 +558,7 @@ fn test_two_tet_cross_renderer() {
         return;
     }
 
-    if let Some(raytrace) = gpu_raytrace_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(raytrace) = gpu_raytrace_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let (max_diff, mean_diff, _) = compare_images(&cpu, &raytrace);
         eprintln!("CPU vs raytrace:  max={max_diff:.6}, mean={mean_diff:.8}");
         if max_diff > 0.002 {
@@ -619,9 +619,9 @@ fn test_four_tet_cross_renderer() {
     ];
 
     for (eye, target, label) in &viewpoints {
-        let (vp, inv_vp) = setup_camera(*eye, *target);
+        let (vp, c2w, intrinsics) = setup_camera(*eye, *target);
 
-        let cpu = cpu_render_scene(&scene, *eye, vp, inv_vp, W, H);
+        let cpu = cpu_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H);
         let total_alpha: f32 = cpu.iter().map(|p| p[3]).sum();
         if total_alpha < 0.01 {
             eprintln!("  {label}: not visible, skipping");
@@ -629,7 +629,7 @@ fn test_four_tet_cross_renderer() {
         }
 
         // Tiled: strict match
-        if let Some(tiled) = gpu_tiled_render_scene(&scene, *eye, vp, inv_vp, W, H) {
+        if let Some(tiled) = gpu_tiled_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H) {
             let (max_diff, mean_diff, _) = compare_images(&cpu, &tiled);
             eprintln!("  {label}: CPU vs tiled: max={max_diff:.6}, mean={mean_diff:.8}");
             if max_diff > 0.002 {
@@ -649,7 +649,7 @@ fn test_four_tet_cross_renderer() {
         }
 
         // Raytrace: log only (non-watertight mesh → adjacency traversal misses isolated tets)
-        if let Some(raytrace) = gpu_raytrace_scene(&scene, *eye, vp, inv_vp, W, H) {
+        if let Some(raytrace) = gpu_raytrace_scene(&scene, *eye, vp, c2w, intrinsics, W, H) {
             let (max_diff, mean_diff, _) = compare_images(&cpu, &raytrace);
             eprintln!("  {label}: CPU vs raytrace: max={max_diff:.6}, mean={mean_diff:.8} (non-watertight → logged only)");
         }
@@ -669,11 +669,11 @@ fn test_tet_at_boundary_cross_renderer() {
     // Camera aimed so tet is at the edge of the frame
     let eye = Vec3::new(3.0, 1.5, 0.0);
     let target = Vec3::new(0.0, 1.5, 0.0); // looking past the tet
-    let (vp, inv_vp) = setup_camera(eye, target);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
-    let cpu = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+    let cpu = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
 
-    if let Some(tiled) = gpu_tiled_render_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(tiled) = gpu_tiled_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let (max_diff, mean_diff, _) = compare_images(&cpu, &tiled);
         eprintln!("boundary: CPU vs tiled: max={max_diff:.6}, mean={mean_diff:.8}");
         if max_diff > 0.002 {
@@ -701,16 +701,16 @@ fn test_tet_behind_camera_cross_renderer() {
     // Camera looking away from the tet
     let eye = Vec3::new(3.0, 0.0, 0.0);
     let target = Vec3::new(10.0, 0.0, 0.0); // looking away
-    let (vp, inv_vp) = setup_camera(eye, target);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
-    let cpu = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+    let cpu = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
     let cpu_alpha: f32 = cpu.iter().map(|p| p[3]).sum();
     assert!(
         cpu_alpha < 0.01,
         "CPU should show nothing when tet is behind camera, alpha={cpu_alpha}"
     );
 
-    if let Some(tiled) = gpu_tiled_render_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(tiled) = gpu_tiled_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let tiled_alpha: f32 = tiled.iter().map(|p| p[3]).sum();
         assert!(
             tiled_alpha < 0.01,
@@ -718,7 +718,7 @@ fn test_tet_behind_camera_cross_renderer() {
         );
     }
 
-    if let Some(raytrace) = gpu_raytrace_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(raytrace) = gpu_raytrace_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let rt_alpha: f32 = raytrace.iter().map(|p| p[3]).sum();
         assert!(
             rt_alpha < 0.01,
@@ -735,13 +735,13 @@ fn test_distant_tet_cross_renderer() {
 
     let eye = Vec3::new(50.0, 0.0, 0.0);
     let target = Vec3::ZERO;
-    let (vp, inv_vp) = setup_camera(eye, target);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
-    let cpu = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+    let cpu = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
 
     // At distance 50, the tet (radius ~1) subtends a very small angle.
     // It should either hit 0-1 pixels consistently across renderers.
-    if let Some(tiled) = gpu_tiled_render_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(tiled) = gpu_tiled_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let (_, mean_diff, _) = compare_images(&cpu, &tiled);
         eprintln!("distant: CPU vs tiled: mean={mean_diff:.8}");
         // Both should be near-zero (tet is tiny or culled)
@@ -764,9 +764,9 @@ fn test_center_pixel_cross_renderer() {
 
     let eye = Vec3::new(3.0, 0.0, 0.0);
     let target = Vec3::ZERO;
-    let (vp, inv_vp) = setup_camera(eye, target);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
-    let cpu = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+    let cpu = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
 
     let center_idx = ((H / 2) * W + (W / 2)) as usize;
     let cpu_pixel = cpu[center_idx];
@@ -790,7 +790,7 @@ fn test_center_pixel_cross_renderer() {
     }
 
     // Compare with GPU renderers at this specific pixel
-    if let Some(tiled) = gpu_tiled_render_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(tiled) = gpu_tiled_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let tiled_pixel = tiled[center_idx];
         eprintln!("Center pixel tiled: RGBA={:.6?}", tiled_pixel);
         for ch in 0..4 {
@@ -803,7 +803,7 @@ fn test_center_pixel_cross_renderer() {
         }
     }
 
-    if let Some(raytrace) = gpu_raytrace_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(raytrace) = gpu_raytrace_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let rt_pixel = raytrace[center_idx];
         eprintln!("Center pixel raytrace: RGBA={:.6?}", rt_pixel);
         for ch in 0..4 {
@@ -816,7 +816,7 @@ fn test_center_pixel_cross_renderer() {
         }
     }
 
-    if let Some(hw) = gpu_render_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(hw) = gpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let hw_pixel = hw[center_idx];
         eprintln!("Center pixel HW raster: RGBA={:.6?}", hw_pixel);
         for ch in 0..4 {
@@ -841,11 +841,11 @@ fn test_worst_pixel_divergence() {
     let verts = load_tet_verts(&scene, 0);
     let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
     let eye = centroid + Vec3::new(2.0, 0.0, 0.0);
-    let (vp, inv_vp) = setup_camera(eye, centroid);
+    let (vp, c2w, intrinsics) = setup_camera(eye, centroid);
 
-    let cpu = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+    let cpu = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
 
-    if let Some(tiled) = gpu_tiled_render_scene(&scene, eye, vp, inv_vp, W, H) {
+    if let Some(tiled) = gpu_tiled_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let mut worst_diff = 0.0f32;
         let mut worst_idx = 0;
 
@@ -905,7 +905,7 @@ fn test_four_tet_diagnostic() {
 
     let eye = Vec3::new(3.0, 0.0, 0.0);
     let target = Vec3::ZERO;
-    let (vp, inv_vp) = setup_camera(eye, target);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
 
     eprintln!("=== Four-tet diagnostic ===");
     eprintln!("densities: {:?}", &scene.densities);
@@ -928,7 +928,7 @@ fn test_four_tet_diagnostic() {
     // Check failing pixels: trace per-tet ray-tet intersection
     let failing_pixels = [(29u32,34u32), (28,35), (26,37), (37,26), (36,27), (35,28)];
     for (px, py) in &failing_pixels {
-        let ray_dir = pixel_ray_dir(inv_vp, eye, *px as f32, *py as f32, W as f32, H as f32);
+        let ray_dir = pixel_ray_dir(c2w, intrinsics, eye, *px as f32, *py as f32);
         eprintln!("\npixel ({px},{py}): ray_dir={:.6?}", ray_dir);
 
         for tet in 0..tet_count {
@@ -967,7 +967,7 @@ fn test_four_tet_diagnostic() {
     }
 
     // Render and compare
-    let cpu = cpu_render_scene(&scene, eye, vp, inv_vp, W, H);
+    let cpu = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
     for (px, py) in &failing_pixels {
         let idx = (*py * W + *px) as usize;
         eprintln!("pixel ({px},{py}): cpu={:.4?}", cpu[idx]);

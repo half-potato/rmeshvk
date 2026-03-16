@@ -239,7 +239,7 @@ fn create_shared_state() -> Option<SharedState> {
         scene.vertex_count, scene.tet_count
     );
 
-    let (vp, inv_vp, eye) = setup_camera();
+    let (vp, c2w, intrinsics, eye) = setup_camera();
 
     let scene_buffers = rmesh_render::SceneBuffers::upload(&device, &queue, &scene);
     let base_colors = vec![0.5f32; scene.tet_count as usize * 3];
@@ -251,7 +251,7 @@ fn create_shared_state() -> Option<SharedState> {
     );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
     );
     queue.write_buffer(&scene_buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -597,14 +597,22 @@ fn buf_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     }
 }
 
-fn setup_camera() -> (Mat4, Mat4, Vec3) {
+fn setup_camera() -> (Mat4, glam::Mat3, [f32; 4], Vec3) {
+    let fov_y = std::f32::consts::FRAC_PI_4;
     let aspect = W as f32 / H as f32;
-    let proj = perspective_matrix(std::f32::consts::FRAC_PI_4, aspect, 0.01, 100.0);
+    let proj = perspective_matrix(fov_y, aspect, 0.01, 100.0);
     let eye = Vec3::new(0.5, 0.5, 3.0);
     let target = Vec3::new(0.5, 0.5, 0.5);
-    let view = look_at(eye, target, Vec3::new(0.0, 1.0, 0.0));
+    let up = Vec3::new(0.0, 1.0, 0.0);
+    let view = look_at(eye, target, up);
     let vp = proj * view;
-    (vp, vp.inverse(), eye)
+    let f = (target - eye).normalize();
+    let r = f.cross(up).normalize();
+    let u = r.cross(f);
+    let c2w = glam::Mat3::from_cols(r, -u, f);
+    let f_val = 1.0 / (fov_y / 2.0).tan();
+    let intrinsics = [f_val * H as f32 / 2.0, f_val * H as f32 / 2.0, W as f32 / 2.0, H as f32 / 2.0];
+    (vp, c2w, intrinsics, eye)
 }
 
 // ---------------------------------------------------------------------------
@@ -837,9 +845,9 @@ fn main() {
         let num_tiles = ts.tile_buffers.num_tiles;
 
         // Update uniforms buffer with the correct tile_size for this run
-        let (vp, inv_vp, eye) = setup_camera();
+        let (vp, c2w, intrinsics, eye) = setup_camera();
         let uniforms = rmesh_render::make_uniforms(
-            vp, inv_vp, eye, W as f32, H as f32, shared.tet_count, 0u32, tile_size, 0.0,
+            vp, c2w, intrinsics, eye, W as f32, H as f32, shared.tet_count, 0u32, tile_size, 0.0,
         );
         shared.queue.write_buffer(
             &shared.scene_buffers.uniforms,
