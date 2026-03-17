@@ -16,6 +16,16 @@ use rmesh_util::sh_eval::{ShEvalPipeline, ShEvalUniforms};
 
 use glam::Vec3;
 
+use rmesh_interact::{
+    InteractContext, InteractEvent, InteractKey, InteractResult, Primitive, PrimitiveKind,
+    TransformInteraction,
+};
+use rmesh_compositor::{
+    PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets,
+    CompositorPipeline, CompositorTargets, CompositorUniforms,
+    create_compositor_bind_group, record_primitive_pass, record_composite,
+};
+
 #[wasm_bindgen(start)]
 pub fn main() {
     console_error_panic_hook::set_once();
@@ -37,6 +47,8 @@ struct SceneState {
     sh_eval_uniforms_buf: wgpu::Buffer,
     sh_degree: u32,
     tet_count: u32,
+    compositor_bg: wgpu::BindGroup,
+    compositor_blit_bg: wgpu::BindGroup,
 }
 
 #[wasm_bindgen]
@@ -52,6 +64,17 @@ pub struct WebViewer {
     targets: RenderTargets,
     sh_eval_pipeline: ShEvalPipeline,
     scene: Option<SceneState>,
+    // Compositor
+    primitive_geometry: PrimitiveGeometry,
+    primitive_pipeline: PrimitivePipeline,
+    primitive_targets: PrimitiveTargets,
+    compositor_pipeline: CompositorPipeline,
+    compositor_targets: CompositorTargets,
+    show_primitives: bool,
+    // Interaction
+    interaction: TransformInteraction,
+    primitives: Vec<Primitive>,
+    next_primitive_id: u32,
 }
 
 #[wasm_bindgen]
@@ -135,6 +158,13 @@ impl WebViewer {
 
         let camera = Camera::new(Vec3::new(0.0, 3.0, -2.0));
 
+        // Compositor setup
+        let primitive_geometry = PrimitiveGeometry::new(&device);
+        let primitive_pipeline = PrimitivePipeline::new(&device);
+        let primitive_targets = PrimitiveTargets::new(&device, width, height);
+        let compositor_pipeline = CompositorPipeline::new(&device);
+        let compositor_targets = CompositorTargets::new(&device, width, height);
+
         log::info!("WebViewer initialized ({width}×{height})");
 
         Ok(WebViewer {
@@ -149,6 +179,15 @@ impl WebViewer {
             targets,
             sh_eval_pipeline,
             scene: None,
+            primitive_geometry,
+            primitive_pipeline,
+            primitive_targets,
+            compositor_pipeline,
+            compositor_targets,
+            show_primitives: false,
+            interaction: TransformInteraction::new(),
+            primitives: Vec::new(),
+            next_primitive_id: 1,
         })
     }
 
@@ -289,8 +328,40 @@ impl WebViewer {
             &self.queue,
         );
 
-        // Blit to swapchain
-        record_blit(&mut encoder, &self.blit_pipeline, &scene.blit_bg, &view);
+        // Primitive + compositor passes (when enabled and primitives exist)
+        if self.show_primitives && !self.primitives.is_empty() {
+            record_primitive_pass(
+                &mut encoder,
+                &self.queue,
+                &self.primitive_pipeline,
+                &self.primitive_geometry,
+                &self.primitive_targets,
+                &self.primitives,
+                &vp,
+            );
+
+            let comp_uniforms = CompositorUniforms {
+                near: self.camera.near_z,
+                far: self.camera.far_z,
+                _pad: [0.0; 2],
+            };
+            self.queue.write_buffer(
+                &self.compositor_pipeline.uniforms_buffer,
+                0,
+                bytemuck::bytes_of(&comp_uniforms),
+            );
+
+            record_composite(
+                &mut encoder,
+                &self.compositor_pipeline,
+                &scene.compositor_bg,
+                &self.compositor_targets.color_view,
+            );
+
+            record_blit(&mut encoder, &self.blit_pipeline, &scene.compositor_blit_bg, &view);
+        } else {
+            record_blit(&mut encoder, &self.blit_pipeline, &scene.blit_bg, &view);
+        }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
@@ -308,12 +379,29 @@ impl WebViewer {
         self.surface.configure(&self.device, &self.surface_config);
         self.targets = RenderTargets::new(&self.device, width, height);
 
-        // Recreate blit bind group since color_view changed
+        // Recreate compositor targets
+        self.primitive_targets = PrimitiveTargets::new(&self.device, width, height);
+        self.compositor_targets = CompositorTargets::new(&self.device, width, height);
+
+        // Recreate blit bind group and compositor bind groups since views changed
         if let Some(scene) = &mut self.scene {
             scene.blit_bg = create_blit_bind_group(
                 &self.device,
                 &self.blit_pipeline,
                 &self.targets.color_view,
+            );
+            scene.compositor_bg = create_compositor_bind_group(
+                &self.device,
+                &self.compositor_pipeline,
+                &self.targets.color_view,
+                &self.targets.depth_view,
+                &self.primitive_targets.color_view,
+                &self.primitive_targets.depth_view,
+            );
+            scene.compositor_blit_bg = create_blit_bind_group(
+                &self.device,
+                &self.blit_pipeline,
+                &self.compositor_targets.color_view,
             );
         }
     }
@@ -332,10 +420,181 @@ impl WebViewer {
     pub fn has_scene(&self) -> bool {
         self.scene.is_some()
     }
+
+    /// Returns true if the interaction system is active (suppress camera controls in JS).
+    pub fn is_interacting(&self) -> bool {
+        self.interaction.is_active()
+    }
+
+    /// Process a key down event from JS. Returns a string describing the result.
+    pub fn on_key_down(&mut self, key: &str) -> String {
+        let ctx = self.interact_ctx();
+        // Try InteractKey first
+        if let Some(ikey) = js_key_to_interact(key) {
+            let result = self.interaction.process_event(
+                &InteractEvent::KeyDown(ikey),
+                &mut self.primitives,
+                &ctx,
+            );
+            if result != InteractResult::NotConsumed {
+                return format!("{:?}", result);
+            }
+        }
+        // Try CharInput for digits
+        if key.len() == 1 {
+            let ch = key.chars().next().unwrap();
+            if matches!(ch, '0'..='9' | '.' | '-') {
+                let result = self.interaction.process_event(
+                    &InteractEvent::CharInput(ch),
+                    &mut self.primitives,
+                    &ctx,
+                );
+                return format!("{:?}", result);
+            }
+        }
+        "NotConsumed".to_string()
+    }
+
+    /// Process a key up event from JS.
+    pub fn on_key_up(&mut self, key: &str) {
+        if let Some(ikey) = js_key_to_interact(key) {
+            let ctx = self.interact_ctx();
+            self.interaction.process_event(
+                &InteractEvent::KeyUp(ikey),
+                &mut self.primitives,
+                &ctx,
+            );
+        }
+    }
+
+    /// Feed mouse movement to the interaction system (when active).
+    pub fn on_interact_mouse_move(&mut self, dx: f32, dy: f32) {
+        let ctx = self.interact_ctx();
+        self.interaction.process_event(
+            &InteractEvent::MouseMove { dx, dy },
+            &mut self.primitives,
+            &ctx,
+        );
+    }
+
+    /// Feed mouse button to interaction. button: 0=left, 1=middle, 2=right.
+    pub fn on_interact_mouse_down(&mut self, button: u32) -> String {
+        let mb = match button {
+            0 => rmesh_interact::MouseButton::Left,
+            1 => rmesh_interact::MouseButton::Middle,
+            2 => rmesh_interact::MouseButton::Right,
+            _ => return "NotConsumed".to_string(),
+        };
+        let ctx = self.interact_ctx();
+        let result = self.interaction.process_event(
+            &InteractEvent::MouseDown { button: mb },
+            &mut self.primitives,
+            &ctx,
+        );
+        format!("{:?}", result)
+    }
+
+    /// Add a primitive of the given kind. kind: "cube", "sphere", "plane", "cylinder".
+    pub fn add_primitive(&mut self, kind: &str) -> i32 {
+        let pk = match kind {
+            "cube" => PrimitiveKind::Cube,
+            "sphere" => PrimitiveKind::Sphere,
+            "plane" => PrimitiveKind::Plane,
+            "cylinder" => PrimitiveKind::Cylinder,
+            _ => return -1,
+        };
+        let name = format!("{}.{:03}", pk.label(), self.next_primitive_id);
+        self.next_primitive_id += 1;
+        self.primitives.push(Primitive::new(pk, name));
+        let idx = self.primitives.len() - 1;
+        self.interaction.set_selected(Some(idx));
+        idx as i32
+    }
+
+    /// Set the selected primitive index (-1 for none).
+    pub fn set_selected(&mut self, idx: i32) {
+        self.interaction.set_selected(if idx < 0 { None } else { Some(idx as usize) });
+    }
+
+    /// Get the selected primitive index (-1 for none).
+    pub fn get_selected(&self) -> i32 {
+        self.interaction.selected().map_or(-1, |i| i as i32)
+    }
+
+    /// Delete the selected primitive.
+    pub fn delete_selected(&mut self) {
+        if let Some(idx) = self.interaction.selected() {
+            if idx < self.primitives.len() {
+                self.primitives.remove(idx);
+                self.interaction.set_selected(None);
+            }
+        }
+    }
+
+    /// Get display info as "mode|axis|numeric" or empty string if idle.
+    pub fn display_info(&self) -> String {
+        if let Some(info) = self.interaction.display_info() {
+            let axis_str = info.axis.label().unwrap_or_default();
+            format!("{}|{}|{}", info.mode.label(), axis_str, info.numeric_text)
+        } else {
+            String::new()
+        }
+    }
+
+    /// Get primitive count.
+    pub fn primitive_count(&self) -> u32 {
+        self.primitives.len() as u32
+    }
+
+    /// Get primitive name by index.
+    pub fn primitive_name(&self, idx: u32) -> String {
+        self.primitives.get(idx as usize).map_or(String::new(), |p| p.name.clone())
+    }
+
+    /// Toggle the primitive compositor overlay.
+    pub fn set_show_primitives(&mut self, show: bool) {
+        self.show_primitives = show;
+    }
+
+    /// Get the current show_primitives state.
+    pub fn get_show_primitives(&self) -> bool {
+        self.show_primitives
+    }
+}
+
+/// Map JS `event.key` string to `InteractKey`.
+fn js_key_to_interact(key: &str) -> Option<InteractKey> {
+    match key {
+        "g" | "G" => Some(InteractKey::G),
+        "s" | "S" => Some(InteractKey::S),
+        "r" | "R" => Some(InteractKey::R),
+        "x" | "X" => Some(InteractKey::X),
+        "y" | "Y" => Some(InteractKey::Y),
+        "z" | "Z" => Some(InteractKey::Z),
+        "Shift" => Some(InteractKey::Shift),
+        "Enter" => Some(InteractKey::Enter),
+        "Escape" => Some(InteractKey::Escape),
+        "Backspace" => Some(InteractKey::Backspace),
+        "Delete" => Some(InteractKey::Delete),
+        "Tab" => Some(InteractKey::Tab),
+        _ => None,
+    }
 }
 
 // Private helpers (not exported to JS)
 impl WebViewer {
+    fn interact_ctx(&mut self) -> InteractContext {
+        let w = self.surface_config.width;
+        let h = self.surface_config.height;
+        let aspect = w as f32 / h as f32;
+        InteractContext {
+            view_matrix: self.camera.view_matrix(),
+            proj_matrix: self.camera.projection_matrix(aspect),
+            viewport_width: w as f32,
+            viewport_height: h as f32,
+        }
+    }
+
     fn upload_scene(&mut self, scene_data: rmesh_data::SceneData, sh_coeffs: rmesh_data::ShCoeffs) {
         let tet_count = scene_data.tet_count;
 
@@ -405,6 +664,20 @@ impl WebViewer {
             &self.targets.color_view,
         );
 
+        let compositor_bg = create_compositor_bind_group(
+            &self.device,
+            &self.compositor_pipeline,
+            &self.targets.color_view,
+            &self.targets.depth_view,
+            &self.primitive_targets.color_view,
+            &self.primitive_targets.depth_view,
+        );
+        let compositor_blit_bg = create_blit_bind_group(
+            &self.device,
+            &self.blit_pipeline,
+            &self.compositor_targets.color_view,
+        );
+
         self.scene = Some(SceneState {
             buffers,
             material,
@@ -418,6 +691,8 @@ impl WebViewer {
             sh_eval_uniforms_buf,
             sh_degree: sh_coeffs.degree,
             tet_count,
+            compositor_bg,
+            compositor_blit_bg,
         });
     }
 }

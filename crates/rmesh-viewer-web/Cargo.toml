@@ -11,6 +11,8 @@ rmesh-render = { path = "../rmesh-render" }
 rmesh-data = { path = "../rmesh-data", default-features = false }
 rmesh-sort = { path = "../rmesh-sort" }
 rmesh-util = { path = "../rmesh-util" }
+rmesh-interact = { path = "../rmesh-interact" }
+rmesh-compositor = { path = "../rmesh-compositor" }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
 glam = { workspace = true }

@@ -1,0 +1,34 @@
+{
+    "rdocCaptureSettings": 1,
+    "settings": {
+        "autoStart": false,
+        "commandLine": "/home/amai/delaunay_splatting/output/london_ls1e-3_do-1/ckpt.ply",
+        "environment": [
+            {
+                "separator": "Platform style",
+                "type": "Set",
+                "value": "",
+                "variable": "WAYLAND_DISPLAY"
+            }
+        ],
+        "executable": "/home/amai/delaunay_splatting/rmeshvk/target/release/rmesh-viewer",
+        "inject": false,
+        "numQueuedFrames": 0,
+        "options": {
+            "allowFullscreen": true,
+            "allowVSync": true,
+            "apiValidation": false,
+            "captureAllCmdLists": false,
+            "captureCallstacks": false,
+            "captureCallstacksOnlyDraws": false,
+            "debugOutputMute": true,
+            "delayForDebugger": 0,
+            "hookIntoChildren": false,
+            "refAllResources": false,
+            "softMemoryLimit": 0,
+            "verifyBufferAccess": false
+        },
+        "queuedFrameCap": 0,
+        "workingDir": ""
+    }
+}

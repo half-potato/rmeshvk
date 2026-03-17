@@ -154,5 +154,11 @@ fn main(@builtin(instance_index) instance_idx: u32, @builtin(vertex_index) vert_
     let vp = mat4x4<f32>(uniforms.vp_col0, uniforms.vp_col1, uniforms.vp_col2, uniforms.vp_col3);
     out.position = vp * vec4<f32>(world_pos, 1.0);
 
+    // Cull back-facing triangles: degenerate to zero-area triangle.
+    // numerator > 0 means camera is on the outward side (front-facing).
+    if numerators[fv.x] <= 0.0 {
+        out.position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+
     return out;
 }

@@ -16,11 +16,16 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use rmesh_interact::{
+    InteractContext, InteractEvent, InteractKey, InteractResult, Primitive, PrimitiveKind,
+    TransformInteraction,
+};
+use rmesh_sim::{FluidParams, FluidSim};
 use rmesh_util::camera::Camera;
 use rmesh_util::sh_eval::{ShEvalPipeline, ShEvalUniforms};
 use wgpu::util::DeviceExt;
@@ -29,7 +34,14 @@ use rayon::prelude::*;
 use rmesh_render::{
     create_compute_bind_group, create_render_bind_group,
     create_render_bind_group_with_sort_values, BlitPipeline, ForwardPipelines, MaterialBuffers,
-    RenderTargets, SceneBuffers, Uniforms, create_blit_bind_group, record_blit,
+    MeshForwardPipelines, RenderTargets, SceneBuffers, Uniforms, create_blit_bind_group,
+    create_indirect_convert_bind_group, create_mesh_render_bind_group,
+    create_mesh_render_bind_group_with_sort_values, record_blit,
+};
+use rmesh_compositor::{
+    PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets,
+    CompositorPipeline, CompositorTargets, CompositorUniforms,
+    create_compositor_bind_group, record_primitive_pass, record_composite,
 };
 
 // SH basis function constants — kept for CPU reference fallback (evaluate_sh_colors).
@@ -80,6 +92,22 @@ struct GpuState {
     sh_eval_uniforms_buf: wgpu::Buffer,
     sh_degree: u32,
     pending_reconfigure: bool,
+    // Mesh shader (optional)
+    mesh_pipelines: Option<MeshForwardPipelines>,
+    mesh_render_bg_a: Option<wgpu::BindGroup>,
+    mesh_render_bg_b: Option<wgpu::BindGroup>,
+    indirect_convert_bg: Option<wgpu::BindGroup>,
+    // Fluid simulation
+    fluid_sim: Option<FluidSim>,
+    tet_neighbors_buf: Option<wgpu::Buffer>,
+    // Compositor (primitive overlay)
+    primitive_geometry: PrimitiveGeometry,
+    primitive_pipeline: PrimitivePipeline,
+    primitive_targets: PrimitiveTargets,
+    compositor_pipeline: CompositorPipeline,
+    compositor_targets: CompositorTargets,
+    compositor_bg: wgpu::BindGroup,
+    compositor_blit_bg: wgpu::BindGroup,
     // egui
     egui_renderer: egui_wgpu::Renderer,
     egui_state: egui_winit::State,
@@ -102,6 +130,17 @@ struct App {
     loaded_path: Option<PathBuf>,
     pending_load: Option<PathBuf>,
     vsync: bool,
+    use_mesh_shader: bool,
+    mesh_shader_supported: bool,
+    // Fluid simulation
+    fluid_enabled: bool,
+    fluid_params: FluidParams,
+    // Compositor
+    show_primitives: bool,
+    // Transform interaction
+    interaction: TransformInteraction,
+    primitives: Vec<Primitive>,
+    next_primitive_id: u32,
 }
 
 impl App {
@@ -129,6 +168,14 @@ impl App {
             loaded_path: None,
             pending_load: None,
             vsync: true,
+            use_mesh_shader: false,
+            mesh_shader_supported: false,
+            fluid_enabled: false,
+            fluid_params: FluidParams::default(),
+            show_primitives: false,
+            interaction: TransformInteraction::new(),
+            primitives: Vec::new(),
+            next_primitive_id: 1,
         }
     }
 
@@ -249,7 +296,7 @@ impl App {
 
         let surface = instance.create_surface(window.clone()).unwrap();
 
-        let (adapter, device, queue) = pollster::block_on(async {
+        let (adapter, device, queue, mesh_shader_supported) = pollster::block_on(async {
             let adapter = instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::HighPerformance,
@@ -261,26 +308,60 @@ impl App {
 
             log::info!("GPU: {:?}", adapter.get_info().name);
 
+            let mesh_shader_supported = adapter
+                .features()
+                .contains(wgpu::Features::EXPERIMENTAL_MESH_SHADER);
+            log::info!("Mesh shader support: {}", mesh_shader_supported);
+
+            let mut required_features = wgpu::Features::SUBGROUP
+                | wgpu::Features::SHADER_FLOAT32_ATOMIC;
+            if mesh_shader_supported {
+                required_features |= wgpu::Features::EXPERIMENTAL_MESH_SHADER;
+            }
+
             let mut limits = wgpu::Limits::default();
             limits.max_storage_buffers_per_shader_stage = 16;
             limits.max_storage_buffer_binding_size = 1024 * 1024 * 1024; // 1 GB
             limits.max_buffer_size = 1024 * 1024 * 1024; // 1 GB
 
+            // Copy mesh shader limits from adapter (they default to 0 = disabled)
+            if mesh_shader_supported {
+                let supported = adapter.limits();
+                limits.max_mesh_invocations_per_workgroup = supported.max_mesh_invocations_per_workgroup;
+                limits.max_mesh_invocations_per_dimension = supported.max_mesh_invocations_per_dimension;
+                limits.max_mesh_output_vertices = supported.max_mesh_output_vertices;
+                limits.max_mesh_output_primitives = supported.max_mesh_output_primitives;
+                limits.max_mesh_output_layers = supported.max_mesh_output_layers;
+                limits.max_mesh_multiview_view_count = supported.max_mesh_multiview_view_count;
+                limits.max_task_mesh_workgroup_total_count = supported.max_task_mesh_workgroup_total_count;
+                limits.max_task_mesh_workgroups_per_dimension = supported.max_task_mesh_workgroups_per_dimension;
+            }
+
+            // SAFETY: We opt into experimental features (mesh shaders) and accept
+            // that the API surface may change in future wgpu releases.
+            let experimental = if mesh_shader_supported {
+                unsafe { wgpu::ExperimentalFeatures::enabled() }
+            } else {
+                wgpu::ExperimentalFeatures::disabled()
+            };
+
             let (device, queue) = adapter
                 .request_device(
                     &wgpu::DeviceDescriptor {
                         label: Some("rmesh device"),
-                        required_features: wgpu::Features::SUBGROUP
-                            | wgpu::Features::SHADER_FLOAT32_ATOMIC,
+                        required_features,
                         required_limits: limits,
+                        experimental_features: experimental,
                         ..Default::default()
                     },
                 )
                 .await
                 .expect("Failed to create device");
 
-            (adapter, device, queue)
+            (adapter, device, queue, mesh_shader_supported)
         });
+        self.mesh_shader_supported = mesh_shader_supported;
+        self.use_mesh_shader = mesh_shader_supported;
 
         let surface_caps = surface.get_capabilities(&adapter);
         // Prefer non-sRGB surface — blit shader applies linear→sRGB manually.
@@ -310,6 +391,12 @@ impl App {
         let t0 = std::time::Instant::now();
         let pipelines = ForwardPipelines::new(&device, color_format);
         let blit_pipeline = BlitPipeline::new(&device, surface_format);
+        let mesh_pipelines = if mesh_shader_supported {
+            log::info!("Compiling mesh shader pipelines...");
+            Some(MeshForwardPipelines::new(&device, color_format))
+        } else {
+            None
+        };
         log::info!("Pipelines compiled: {:.2}s", t0.elapsed().as_secs_f64());
 
         log::info!("Uploading scene buffers ({} tets)...", self.scene_data.tet_count);
@@ -366,6 +453,8 @@ impl App {
         sort_state.upload_configs(&queue);
         log::info!("Sort pipelines: {:.2}s", t0.elapsed().as_secs_f64());
 
+        // Fluid simulation: lazily initialized when first enabled (saves ~500MB GPU memory)
+
         let compute_bg = create_compute_bind_group(&device, &pipelines, &buffers, &material);
         let render_bg = create_render_bind_group(&device, &pipelines, &buffers, &material);
         let render_bg_b = create_render_bind_group_with_sort_values(
@@ -376,7 +465,36 @@ impl App {
             &sort_state.values_b,
         );
 
+        // Mesh shader bind groups (if supported)
+        let (mesh_render_bg_a, mesh_render_bg_b, indirect_convert_bg) =
+            if let Some(ref mp) = mesh_pipelines {
+                let a = create_mesh_render_bind_group(&device, mp, &buffers, &material);
+                let b = create_mesh_render_bind_group_with_sort_values(
+                    &device, mp, &buffers, &material, &sort_state.values_b,
+                );
+                let ic = create_indirect_convert_bind_group(&device, mp, &buffers);
+                (Some(a), Some(b), Some(ic))
+            } else {
+                (None, None, None)
+            };
+
         let blit_bg = create_blit_bind_group(&device, &blit_pipeline, &targets.color_view);
+
+        // Compositor setup
+        let primitive_geometry = PrimitiveGeometry::new(&device);
+        let primitive_pipeline = PrimitivePipeline::new(&device);
+        let primitive_targets = PrimitiveTargets::new(&device, size.width.max(1), size.height.max(1));
+        let compositor_pipeline = CompositorPipeline::new(&device);
+        let compositor_targets = CompositorTargets::new(&device, size.width.max(1), size.height.max(1));
+        let compositor_bg = create_compositor_bind_group(
+            &device,
+            &compositor_pipeline,
+            &targets.color_view,
+            &targets.depth_view,
+            &primitive_targets.color_view,
+            &primitive_targets.depth_view,
+        );
+        let compositor_blit_bg = create_blit_bind_group(&device, &blit_pipeline, &compositor_targets.color_view);
 
         // egui setup
         let egui_renderer = egui_wgpu::Renderer::new(
@@ -418,6 +536,19 @@ impl App {
             sh_eval_uniforms_buf,
             sh_degree,
             pending_reconfigure: false,
+            mesh_pipelines,
+            mesh_render_bg_a,
+            mesh_render_bg_b,
+            indirect_convert_bg,
+            fluid_sim: None,
+            tet_neighbors_buf: None,
+            primitive_geometry,
+            primitive_pipeline,
+            primitive_targets,
+            compositor_pipeline,
+            compositor_targets,
+            compositor_bg,
+            compositor_blit_bg,
             egui_renderer,
             egui_state,
         });
@@ -541,6 +672,31 @@ impl App {
         let tet_count = gpu.tet_count;
         let mut open_file = false;
         let mut vsync = self.vsync;
+        let mut use_mesh_shader = self.use_mesh_shader;
+        let mesh_shader_supported = self.mesh_shader_supported;
+        let mut fluid_enabled = self.fluid_enabled;
+        let mut show_primitives = self.show_primitives;
+        let mut fluid_reset = false;
+        let fluid_params = &mut self.fluid_params;
+        let interact_display = self.interaction.display_info();
+        let interact_selected = self.interaction.selected();
+        let mut new_selected = interact_selected;
+        let mut add_primitive: Option<PrimitiveKind> = None;
+        let mut delete_selected = false;
+        let primitives_ref = &self.primitives;
+        // Get mesh bbox for dynamic slider ranges
+        let (fluid_bbox_min, fluid_bbox_max) = if let Some(ref sim) = gpu.fluid_sim {
+            (sim.mesh_bbox_min, sim.mesh_bbox_max)
+        } else {
+            ([-5.0; 3], [5.0; 3])
+        };
+        let fluid_extent = {
+            let dx = fluid_bbox_max[0] - fluid_bbox_min[0];
+            let dy = fluid_bbox_max[1] - fluid_bbox_min[1];
+            let dz = fluid_bbox_max[2] - fluid_bbox_min[2];
+            dx.max(dy).max(dz).max(0.1)
+        };
+        let margin = fluid_extent * 0.5;
         #[allow(deprecated)]
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -553,6 +709,12 @@ impl App {
                     });
                     ui.menu_button("Settings", |ui| {
                         ui.checkbox(&mut vsync, "Vsync");
+                        ui.add_enabled(
+                            mesh_shader_supported,
+                            egui::Checkbox::new(&mut use_mesh_shader, "Mesh Shader"),
+                        );
+                        ui.checkbox(&mut fluid_enabled, "Fluid Sim");
+                        ui.checkbox(&mut show_primitives, "Show Primitives");
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(format!(
@@ -562,6 +724,93 @@ impl App {
                     });
                 });
             });
+
+            // Primitives panel
+            egui::SidePanel::left("primitives_panel").default_width(160.0).show(ctx, |ui| {
+                ui.heading("Primitives");
+                ui.horizontal(|ui| {
+                    if ui.button("Cube").clicked() {
+                        add_primitive = Some(PrimitiveKind::Cube);
+                    }
+                    if ui.button("Sphere").clicked() {
+                        add_primitive = Some(PrimitiveKind::Sphere);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Plane").clicked() {
+                        add_primitive = Some(PrimitiveKind::Plane);
+                    }
+                    if ui.button("Cylinder").clicked() {
+                        add_primitive = Some(PrimitiveKind::Cylinder);
+                    }
+                });
+                ui.separator();
+                for (i, prim) in primitives_ref.iter().enumerate() {
+                    let selected = new_selected == Some(i);
+                    if ui.selectable_label(selected, &prim.name).clicked() {
+                        new_selected = if selected { None } else { Some(i) };
+                    }
+                }
+                if new_selected.is_some() {
+                    ui.separator();
+                    if ui.button("Delete").clicked() {
+                        delete_selected = true;
+                    }
+                }
+            });
+
+            // Transform HUD overlay (centered at bottom)
+            if let Some(ref info) = interact_display {
+                egui::TopBottomPanel::bottom("interact_hud").show(ctx, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new(info.mode.label())
+                                .size(16.0)
+                                .strong(),
+                        );
+                        if let Some(axis_label) = info.axis.label() {
+                            ui.label(
+                                egui::RichText::new(axis_label)
+                                    .size(16.0)
+                                    .color(egui::Color32::from_rgb(100, 180, 255)),
+                            );
+                        }
+                        if !info.numeric_text.is_empty() {
+                            ui.label(
+                                egui::RichText::new(&info.numeric_text)
+                                    .size(16.0)
+                                    .monospace(),
+                            );
+                        }
+                    });
+                });
+            }
+
+            // Fluid simulation panel (only shown when enabled)
+            if fluid_enabled {
+                egui::SidePanel::right("fluid_panel").default_width(200.0).show(ctx, |ui| {
+                    ui.heading("Fluid Simulation");
+                    if ui.button("Reset").clicked() {
+                        fluid_reset = true;
+                    }
+                    ui.separator();
+                    ui.add(egui::Slider::new(&mut fluid_params.dt, 0.001..=0.1).text("dt").logarithmic(true));
+                    ui.add(egui::Slider::new(&mut fluid_params.viscosity, 0.0..=0.1).text("Viscosity").logarithmic(true));
+                    ui.add(egui::Slider::new(&mut fluid_params.buoyancy, 0.0..=20.0).text("Buoyancy"));
+                    ui.add(egui::Slider::new(&mut fluid_params.density_scale, 0.1..=100.0).text("Density Scale").logarithmic(true));
+                    ui.separator();
+                    ui.label("Source");
+                    ui.add(egui::Slider::new(&mut fluid_params.source_pos[0], (fluid_bbox_min[0] - margin)..=(fluid_bbox_max[0] + margin)).text("X"));
+                    ui.add(egui::Slider::new(&mut fluid_params.source_pos[1], (fluid_bbox_min[1] - margin)..=(fluid_bbox_max[1] + margin)).text("Y"));
+                    ui.add(egui::Slider::new(&mut fluid_params.source_pos[2], (fluid_bbox_min[2] - margin)..=(fluid_bbox_max[2] + margin)).text("Z"));
+                    ui.add(egui::Slider::new(&mut fluid_params.source_radius, 0.001..=(fluid_extent * 0.5)).text("Radius"));
+                    ui.add(egui::Slider::new(&mut fluid_params.source_strength, 0.0..=50.0).text("Strength"));
+                    ui.separator();
+                    ui.label("Solver");
+                    ui.add(egui::Slider::new(&mut fluid_params.diffuse_iterations, 1..=100).text("Diffuse Iters"));
+                    ui.add(egui::Slider::new(&mut fluid_params.pressure_iterations, 1..=200).text("Pressure Iters"));
+                });
+            }
         });
         if open_file {
             if let Some(path) = rfd::FileDialog::new()
@@ -574,6 +823,34 @@ impl App {
         if vsync != self.vsync {
             self.vsync = vsync;
             gpu.pending_reconfigure = true;
+        }
+        self.use_mesh_shader = use_mesh_shader;
+        self.fluid_enabled = fluid_enabled;
+        self.show_primitives = show_primitives;
+
+        // Handle primitive add/delete/selection
+        if let Some(kind) = add_primitive {
+            let name = format!("{}.{:03}", kind.label(), self.next_primitive_id);
+            self.next_primitive_id += 1;
+            self.primitives.push(Primitive::new(kind, name));
+            let idx = self.primitives.len() - 1;
+            self.interaction.set_selected(Some(idx));
+        } else if delete_selected {
+            if let Some(idx) = self.interaction.selected() {
+                if idx < self.primitives.len() {
+                    self.primitives.remove(idx);
+                    self.interaction.set_selected(None);
+                }
+            }
+        } else {
+            self.interaction.set_selected(new_selected);
+        }
+
+        if fluid_reset {
+            if let Some(ref mut sim) = gpu.fluid_sim {
+                sim.reset(&gpu.queue);
+                log::info!("[fluid] Reset simulation state");
+            }
         }
         gpu.egui_state
             .handle_platform_output(window, full_output.platform_output);
@@ -603,24 +880,166 @@ impl App {
         gpu.sh_eval_pipeline
             .record(&mut encoder, &gpu.sh_eval_bg, gpu.tet_count);
 
-        // Sorted forward pass: compute → radix sort → HW render
-        rmesh_render::record_sorted_forward_pass(
-            &mut encoder,
-            &gpu.device,
-            &gpu.pipelines,
-            &gpu.sort_pipelines,
-            &gpu.sort_state,
-            &gpu.buffers,
-            &gpu.targets,
-            &gpu.compute_bg,
-            &gpu.render_bg,
-            &gpu.render_bg_b,
-            gpu.tet_count,
-            &gpu.queue,
-        );
+        // Fluid simulation step (if enabled)
+        if self.fluid_enabled {
+            // Lazy init: create FluidSim on first enable
+            if gpu.fluid_sim.is_none() {
+                log::info!("[fluid] Initializing fluid simulation...");
+                let t0_fluid = std::time::Instant::now();
+                let neighbors = rmesh_render::compute_tet_neighbors(
+                    &self.scene_data.indices,
+                    self.scene_data.tet_count as usize,
+                );
+                let tet_neighbors_buf =
+                    gpu.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("tet_neighbors"),
+                            contents: bytemuck::cast_slice(&neighbors),
+                            usage: wgpu::BufferUsages::STORAGE,
+                        });
+                let mut fluid_sim = FluidSim::new(&gpu.device, gpu.tet_count);
+                {
+                    let mut precompute_encoder =
+                        gpu.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("precompute_geometry"),
+                            });
+                    fluid_sim.precompute_geometry(
+                        &gpu.device,
+                        &mut precompute_encoder,
+                        &gpu.buffers.vertices,
+                        &gpu.buffers.indices,
+                        &tet_neighbors_buf,
+                    );
+                    gpu.queue.submit(std::iter::once(precompute_encoder.finish()));
+                }
+                fluid_sim.compute_mesh_bbox(&gpu.device, &gpu.queue);
+                fluid_sim.log_precompute_stats(&gpu.device, &gpu.queue);
+                // Auto-set fluid params to match mesh geometry
+                self.fluid_params = fluid_sim.default_params_for_mesh();
+                log::info!(
+                    "[fluid] Auto-set source_pos=[{:.3},{:.3},{:.3}] radius={:.4} (mesh center=[{:.3},{:.3},{:.3}] extent={:.3})",
+                    self.fluid_params.source_pos[0], self.fluid_params.source_pos[1], self.fluid_params.source_pos[2],
+                    self.fluid_params.source_radius,
+                    fluid_sim.mesh_center()[0], fluid_sim.mesh_center()[1], fluid_sim.mesh_center()[2],
+                    fluid_sim.mesh_extent(),
+                );
+                log::info!(
+                    "[fluid] Fluid sim initialized: {:.2}s",
+                    t0_fluid.elapsed().as_secs_f64()
+                );
+                gpu.fluid_sim = Some(fluid_sim);
+                gpu.tet_neighbors_buf = Some(tet_neighbors_buf);
+            }
 
-        // Blit Rgba16Float render target to sRGB swapchain
-        record_blit(&mut encoder, &gpu.blit_pipeline, &gpu.blit_bg, &view);
+            if let (Some(ref mut sim), Some(ref neighbors_buf)) =
+                (&mut gpu.fluid_sim, &gpu.tet_neighbors_buf)
+            {
+                let should_log = sim.step_count < 3 || sim.step_count % 60 == 0;
+                sim.step(
+                    &gpu.device,
+                    &mut encoder,
+                    &gpu.queue,
+                    &self.fluid_params,
+                    neighbors_buf,
+                    &gpu.buffers.densities,
+                    &gpu.material_buffers.base_colors,
+                );
+                // Log on first few frames + every 60 after that.
+                // Must submit first since step() only records commands.
+                if should_log {
+                    // Submit the encoder so far, log, then create a fresh encoder
+                    gpu.queue.submit(std::iter::once(encoder.finish()));
+                    sim.log_step_stats(
+                        &gpu.device,
+                        &gpu.queue,
+                        &gpu.buffers.densities,
+                        &gpu.material_buffers.base_colors,
+                    );
+                    encoder = gpu.device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
+                            label: Some("forward pass (post-fluid)"),
+                        },
+                    );
+                }
+            }
+        }
+
+        // Sorted forward pass: compute → radix sort → render
+        if self.use_mesh_shader
+            && gpu.mesh_pipelines.is_some()
+            && gpu.mesh_render_bg_a.is_some()
+        {
+            rmesh_render::record_sorted_mesh_forward_pass(
+                &mut encoder,
+                &gpu.device,
+                &gpu.pipelines,
+                gpu.mesh_pipelines.as_ref().unwrap(),
+                &gpu.sort_pipelines,
+                &gpu.sort_state,
+                &gpu.buffers,
+                &gpu.targets,
+                &gpu.compute_bg,
+                gpu.mesh_render_bg_a.as_ref().unwrap(),
+                gpu.mesh_render_bg_b.as_ref().unwrap(),
+                gpu.indirect_convert_bg.as_ref().unwrap(),
+                gpu.tet_count,
+                &gpu.queue,
+            );
+        } else {
+            rmesh_render::record_sorted_forward_pass(
+                &mut encoder,
+                &gpu.device,
+                &gpu.pipelines,
+                &gpu.sort_pipelines,
+                &gpu.sort_state,
+                &gpu.buffers,
+                &gpu.targets,
+                &gpu.compute_bg,
+                &gpu.render_bg,
+                &gpu.render_bg_b,
+                gpu.tet_count,
+                &gpu.queue,
+            );
+        }
+
+        // Primitive + compositor passes (when enabled and primitives exist)
+        if self.show_primitives && !self.primitives.is_empty() {
+            record_primitive_pass(
+                &mut encoder,
+                &gpu.queue,
+                &gpu.primitive_pipeline,
+                &gpu.primitive_geometry,
+                &gpu.primitive_targets,
+                &self.primitives,
+                &vp,
+            );
+
+            // Write compositor uniforms (near/far)
+            let comp_uniforms = CompositorUniforms {
+                near: self.camera.near_z,
+                far: self.camera.far_z,
+                _pad: [0.0; 2],
+            };
+            gpu.queue.write_buffer(
+                &gpu.compositor_pipeline.uniforms_buffer,
+                0,
+                bytemuck::bytes_of(&comp_uniforms),
+            );
+
+            record_composite(
+                &mut encoder,
+                &gpu.compositor_pipeline,
+                &gpu.compositor_bg,
+                &gpu.compositor_targets.color_view,
+            );
+
+            // Blit composited result to sRGB swapchain
+            record_blit(&mut encoder, &gpu.blit_pipeline, &gpu.compositor_blit_bg, &view);
+        } else {
+            // Blit Rgba16Float render target directly to sRGB swapchain
+            record_blit(&mut encoder, &gpu.blit_pipeline, &gpu.blit_bg, &view);
+        }
 
         // egui render pass (overlay on swapchain)
         {
@@ -769,6 +1188,54 @@ impl App {
                 &gpu.material_buffers,
                 &gpu.sort_state.values_b,
             );
+
+            // Recreate mesh shader bind groups
+            if let Some(ref mp) = gpu.mesh_pipelines {
+                gpu.mesh_render_bg_a = Some(create_mesh_render_bind_group(
+                    &gpu.device, mp, &gpu.buffers, &gpu.material_buffers,
+                ));
+                gpu.mesh_render_bg_b = Some(create_mesh_render_bind_group_with_sort_values(
+                    &gpu.device, mp, &gpu.buffers, &gpu.material_buffers,
+                    &gpu.sort_state.values_b,
+                ));
+                gpu.indirect_convert_bg = Some(create_indirect_convert_bind_group(
+                    &gpu.device, mp, &gpu.buffers,
+                ));
+            }
+
+            // Recreate fluid simulation
+            let neighbors = rmesh_render::compute_tet_neighbors(
+                &self.scene_data.indices,
+                self.scene_data.tet_count as usize,
+            );
+            let tet_neighbors_buf =
+                gpu.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("tet_neighbors"),
+                        contents: bytemuck::cast_slice(&neighbors),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
+            let mut fluid_sim = FluidSim::new(&gpu.device, self.scene_data.tet_count);
+            {
+                let mut encoder =
+                    gpu.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("precompute_geometry_reload"),
+                        });
+                fluid_sim.precompute_geometry(
+                    &gpu.device,
+                    &mut encoder,
+                    &gpu.buffers.vertices,
+                    &gpu.buffers.indices,
+                    &tet_neighbors_buf,
+                );
+                gpu.queue.submit(std::iter::once(encoder.finish()));
+            }
+            fluid_sim.compute_mesh_bbox(&gpu.device, &gpu.queue);
+            fluid_sim.log_precompute_stats(&gpu.device, &gpu.queue);
+            self.fluid_params = fluid_sim.default_params_for_mesh();
+            gpu.fluid_sim = Some(fluid_sim);
+            gpu.tet_neighbors_buf = Some(tet_neighbors_buf);
         }
 
         // Update window title
@@ -796,7 +1263,43 @@ impl App {
                 &gpu.blit_pipeline,
                 &gpu.targets.color_view,
             );
+
+            // Recreate compositor targets and bind groups
+            gpu.primitive_targets = PrimitiveTargets::new(&gpu.device, new_size.width, new_size.height);
+            gpu.compositor_targets = CompositorTargets::new(&gpu.device, new_size.width, new_size.height);
+            gpu.compositor_bg = create_compositor_bind_group(
+                &gpu.device,
+                &gpu.compositor_pipeline,
+                &gpu.targets.color_view,
+                &gpu.targets.depth_view,
+                &gpu.primitive_targets.color_view,
+                &gpu.primitive_targets.depth_view,
+            );
+            gpu.compositor_blit_bg = create_blit_bind_group(
+                &gpu.device,
+                &gpu.blit_pipeline,
+                &gpu.compositor_targets.color_view,
+            );
         }
+    }
+}
+
+/// Map winit KeyCode to InteractKey.
+fn winit_key_to_interact(key: KeyCode) -> Option<InteractKey> {
+    match key {
+        KeyCode::KeyG => Some(InteractKey::G),
+        KeyCode::KeyS => Some(InteractKey::S),
+        KeyCode::KeyR => Some(InteractKey::R),
+        KeyCode::KeyX => Some(InteractKey::X),
+        KeyCode::KeyY => Some(InteractKey::Y),
+        KeyCode::KeyZ => Some(InteractKey::Z),
+        KeyCode::ShiftLeft | KeyCode::ShiftRight => Some(InteractKey::Shift),
+        KeyCode::Enter | KeyCode::NumpadEnter => Some(InteractKey::Enter),
+        KeyCode::Escape => Some(InteractKey::Escape),
+        KeyCode::Backspace => Some(InteractKey::Backspace),
+        KeyCode::Delete => Some(InteractKey::Delete),
+        KeyCode::Tab => Some(InteractKey::Tab),
+        _ => None,
     }
 }
 
@@ -831,51 +1334,138 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Check if egui wants the pointer (from previous frame)
+        // Check if egui wants keyboard/pointer (from previous frame)
         let egui_wants_pointer = self.egui_ctx.egui_wants_pointer_input();
+        let egui_wants_keyboard = self.egui_ctx.egui_wants_keyboard_input();
+
+        // Build interaction context for the state machine
+        let interact_ctx = {
+            let (w, h) = self.gpu.as_ref().map_or((800, 600), |g| {
+                (g.surface_config.width, g.surface_config.height)
+            });
+            let aspect = w as f32 / h as f32;
+            InteractContext {
+                view_matrix: self.camera.view_matrix(),
+                proj_matrix: self.camera.projection_matrix(aspect),
+                viewport_width: w as f32,
+                viewport_height: h as f32,
+            }
+        };
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+
             WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::Escape),
-                        state: ElementState::Pressed,
-                        ..
-                    },
+                event: ref key_event,
                 ..
-            } => event_loop.exit(),
+            } if !egui_wants_keyboard => {
+                let PhysicalKey::Code(code) = key_event.physical_key else {
+                    return;
+                };
+
+                // Try interaction system first
+                let mut consumed = false;
+                if let Some(ikey) = winit_key_to_interact(code) {
+                    let ie = match key_event.state {
+                        ElementState::Pressed => InteractEvent::KeyDown(ikey),
+                        ElementState::Released => InteractEvent::KeyUp(ikey),
+                    };
+                    let result = self.interaction.process_event(
+                        &ie,
+                        &mut self.primitives,
+                        &interact_ctx,
+                    );
+                    consumed = result != InteractResult::NotConsumed;
+                }
+
+                // CharInput for numeric entry (only on press)
+                if !consumed && key_event.state == ElementState::Pressed {
+                    if let Some(ref text) = key_event.text {
+                        for ch in text.chars() {
+                            if matches!(ch, '0'..='9' | '.' | '-') {
+                                let ie = InteractEvent::CharInput(ch);
+                                let result = self.interaction.process_event(
+                                    &ie,
+                                    &mut self.primitives,
+                                    &interact_ctx,
+                                );
+                                if result != InteractResult::NotConsumed {
+                                    consumed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: Escape quits if not consumed by interaction
+                if !consumed
+                    && code == KeyCode::Escape
+                    && key_event.state == ElementState::Pressed
+                {
+                    event_loop.exit();
+                }
+            }
 
             WindowEvent::Resized(size) => {
                 self.resize(size);
             }
 
-            WindowEvent::MouseInput { state, button, .. } if !egui_wants_pointer => match button {
-                MouseButton::Left => {
-                    self.left_pressed = state == ElementState::Pressed;
+            WindowEvent::MouseInput { state, button, .. } if !egui_wants_pointer => {
+                // Feed mouse buttons to interaction system
+                let mb = match button {
+                    MouseButton::Left => Some(rmesh_interact::MouseButton::Left),
+                    MouseButton::Middle => Some(rmesh_interact::MouseButton::Middle),
+                    MouseButton::Right => Some(rmesh_interact::MouseButton::Right),
+                    _ => None,
+                };
+                if let Some(mb) = mb {
+                    let ie = match state {
+                        ElementState::Pressed => InteractEvent::MouseDown { button: mb },
+                        ElementState::Released => InteractEvent::MouseUp { button: mb },
+                    };
+                    let result = self.interaction.process_event(
+                        &ie,
+                        &mut self.primitives,
+                        &interact_ctx,
+                    );
+                    if result == InteractResult::NotConsumed {
+                        // Only update camera button state if not consumed
+                        match button {
+                            MouseButton::Left => self.left_pressed = state == ElementState::Pressed,
+                            MouseButton::Middle => self.middle_pressed = state == ElementState::Pressed,
+                            MouseButton::Right => self.right_pressed = state == ElementState::Pressed,
+                            _ => {}
+                        }
+                    }
                 }
-                MouseButton::Middle => {
-                    self.middle_pressed = state == ElementState::Pressed;
-                }
-                MouseButton::Right => {
-                    self.right_pressed = state == ElementState::Pressed;
-                }
-                _ => {}
-            },
+            }
 
             WindowEvent::CursorMoved { position, .. } => {
                 let dx = position.x - self.last_mouse.0;
                 let dy = position.y - self.last_mouse.1;
 
                 if !egui_wants_pointer {
-                    if self.left_pressed {
-                        self.camera.orbit(dx as f32, dy as f32);
-                    }
-                    if self.middle_pressed {
-                        self.camera.pan(dx as f32, dy as f32);
-                    }
-                    if self.right_pressed {
-                        self.camera.zoom(dy as f32);
+                    if self.interaction.is_active() {
+                        // Feed mouse movement to interaction system
+                        let ie = InteractEvent::MouseMove {
+                            dx: dx as f32,
+                            dy: dy as f32,
+                        };
+                        self.interaction.process_event(
+                            &ie,
+                            &mut self.primitives,
+                            &interact_ctx,
+                        );
+                    } else {
+                        if self.left_pressed {
+                            self.camera.orbit(dx as f32, dy as f32);
+                        }
+                        if self.middle_pressed {
+                            self.camera.pan(dx as f32, dy as f32);
+                        }
+                        if self.right_pressed {
+                            self.camera.zoom(dy as f32);
+                        }
                     }
                 }
 
@@ -883,11 +1473,13 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } if !egui_wants_pointer => {
-                let scroll = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.1,
-                };
-                self.camera.zoom(-scroll);
+                if !self.interaction.is_active() {
+                    let scroll = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                        winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.1,
+                    };
+                    self.camera.zoom(-scroll);
+                }
             }
 
             WindowEvent::RedrawRequested => {

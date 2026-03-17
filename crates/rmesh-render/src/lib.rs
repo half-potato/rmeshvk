@@ -36,6 +36,8 @@ const BLIT_WGSL: &str = include_str!("wgsl/blit.wgsl");
 const RAYTRACE_COMPUTE_WGSL: &str = include_str!("wgsl/raytrace_compute.wgsl");
 const RASTERIZE_COMPUTE_WGSL: &str = include_str!("wgsl/rasterize_compute.wgsl");
 const LOCATE_COMPUTE_WGSL: &str = include_str!("wgsl/locate_compute.wgsl");
+const FORWARD_MESH_WGSL: &str = include_str!("wgsl/forward_mesh.wgsl");
+const INDIRECT_CONVERT_WGSL: &str = include_str!("wgsl/indirect_convert.wgsl");
 
 // ---------------------------------------------------------------------------
 // GPU Buffers
@@ -63,6 +65,8 @@ pub struct SceneBuffers {
     pub tiles_touched: wgpu::Buffer,
     /// Compact visible tet IDs [M] u32 (written by compute at vis_idx)
     pub compact_tet_ids: wgpu::Buffer,
+    /// Mesh shader indirect dispatch args [3] u32 (x, y, z workgroup counts)
+    pub mesh_indirect_args: wgpu::Buffer,
 }
 
 /// GPU buffers for per-tet material/appearance data (pluggable per rendering mode).
@@ -155,6 +159,14 @@ impl SceneBuffers {
             mapped_at_creation: false,
         });
 
+        let mesh_indirect_args = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh_indirect_args"),
+            contents: bytemuck::cast_slice(&[0u32, 1u32, 1u32]),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
+        });
+
         Self {
             vertices,
             indices,
@@ -166,6 +178,7 @@ impl SceneBuffers {
             uniforms,
             tiles_touched,
             compact_tet_ids,
+            mesh_indirect_args,
         }
     }
 }
@@ -397,6 +410,173 @@ impl ForwardPipelines {
             compute_bind_group_layout,
             render_pipeline,
             render_bind_group_layout,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mesh Shader Pipelines (optional, requires EXPERIMENTAL_MESH_SHADER)
+// ---------------------------------------------------------------------------
+
+/// Compiled pipelines for the mesh shader forward pass.
+pub struct MeshForwardPipelines {
+    pub mesh_render_pipeline: wgpu::RenderPipeline,
+    pub mesh_render_bg_layout: wgpu::BindGroupLayout,
+    pub indirect_convert_pipeline: wgpu::ComputePipeline,
+    pub indirect_convert_bg_layout: wgpu::BindGroupLayout,
+}
+
+impl MeshForwardPipelines {
+    /// Create mesh shader pipelines. Requires `Features::EXPERIMENTAL_MESH_SHADER`.
+    pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
+        // ----- Mesh render pipeline (8 read-only storage bindings) -----
+        // Bindings 0-6: same as vertex shader render bind group
+        // Binding 7: indirect_args (read visible_count)
+        let mesh_read_only = [true; 8];
+        let mesh_entries = storage_entries(
+            8,
+            wgpu::ShaderStages::MESH,
+            &mesh_read_only,
+        );
+        let mesh_render_bg_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("mesh_render_bg_layout"),
+                entries: &mesh_entries,
+            });
+        let mesh_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("mesh_pipeline_layout"),
+                bind_group_layouts: &[&mesh_render_bg_layout],
+                immediate_size: 0,
+            });
+        let mesh_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("forward_mesh.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(FORWARD_MESH_WGSL.into()),
+        });
+        let fragment_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("forward_fragment.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(FORWARD_FRAGMENT_WGSL.into()),
+        });
+
+        // Same blend state as ForwardPipelines
+        let premul_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+
+        let mesh_render_pipeline =
+            device.create_mesh_pipeline(&wgpu::MeshPipelineDescriptor {
+                label: Some("mesh_forward_render_pipeline"),
+                layout: Some(&mesh_pipeline_layout),
+                task: None,
+                mesh: wgpu::MeshState {
+                    module: &mesh_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &fragment_shader,
+                    entry_point: Some("main"),
+                    targets: &[
+                        Some(wgpu::ColorTargetState {
+                            format: color_format,
+                            blend: Some(premul_blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: color_format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: color_format,
+                            blend: Some(premul_blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: color_format,
+                            blend: Some(premul_blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                    ],
+                    compilation_options: Default::default(),
+                }),
+                multiview: None,
+                cache: None,
+            });
+
+        // ----- Indirect convert compute pipeline (2 bindings) -----
+        let indirect_convert_bg_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("indirect_convert_bg_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let indirect_convert_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("indirect_convert_pipeline_layout"),
+                bind_group_layouts: &[&indirect_convert_bg_layout],
+                immediate_size: 0,
+            });
+        let indirect_convert_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("indirect_convert.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(INDIRECT_CONVERT_WGSL.into()),
+            });
+        let indirect_convert_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("indirect_convert_pipeline"),
+                layout: Some(&indirect_convert_layout),
+                module: &indirect_convert_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        Self {
+            mesh_render_pipeline,
+            mesh_render_bg_layout,
+            indirect_convert_pipeline,
+            indirect_convert_bg_layout,
         }
     }
 }
@@ -763,6 +943,76 @@ pub fn create_render_bind_group_with_sort_values(
             buf_entry(4, &buffers.densities),
             buf_entry(5, &material.color_grads),
             buf_entry(6, sort_values),
+        ],
+    })
+}
+
+/// Create the mesh shader render bind group (8 bindings).
+///
+/// Binding order matches `forward_mesh.wgsl`:
+///   0: uniforms, 1: vertices, 2: indices, 3: colors,
+///   4: densities, 5: color_grads, 6: sorted_indices, 7: indirect_args
+pub fn create_mesh_render_bind_group(
+    device: &wgpu::Device,
+    mesh_pipelines: &MeshForwardPipelines,
+    buffers: &SceneBuffers,
+    material: &MaterialBuffers,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("mesh_render_bind_group"),
+        layout: &mesh_pipelines.mesh_render_bg_layout,
+        entries: &[
+            buf_entry(0, &buffers.uniforms),
+            buf_entry(1, &buffers.vertices),
+            buf_entry(2, &buffers.indices),
+            buf_entry(3, &material.colors),
+            buf_entry(4, &buffers.densities),
+            buf_entry(5, &material.color_grads),
+            buf_entry(6, &buffers.sort_values),  // sorted indices
+            buf_entry(7, &buffers.indirect_args),
+        ],
+    })
+}
+
+/// Create a mesh render bind group with an explicit sort_values buffer.
+///
+/// Same as [`create_mesh_render_bind_group`] but binding 6 uses a caller-provided
+/// `sort_values` buffer (the radix sort alternate B buffer).
+pub fn create_mesh_render_bind_group_with_sort_values(
+    device: &wgpu::Device,
+    mesh_pipelines: &MeshForwardPipelines,
+    buffers: &SceneBuffers,
+    material: &MaterialBuffers,
+    sort_values: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("mesh_render_bind_group_sort_b"),
+        layout: &mesh_pipelines.mesh_render_bg_layout,
+        entries: &[
+            buf_entry(0, &buffers.uniforms),
+            buf_entry(1, &buffers.vertices),
+            buf_entry(2, &buffers.indices),
+            buf_entry(3, &material.colors),
+            buf_entry(4, &buffers.densities),
+            buf_entry(5, &material.color_grads),
+            buf_entry(6, sort_values),
+            buf_entry(7, &buffers.indirect_args),
+        ],
+    })
+}
+
+/// Create the indirect convert bind group (2 bindings).
+pub fn create_indirect_convert_bind_group(
+    device: &wgpu::Device,
+    mesh_pipelines: &MeshForwardPipelines,
+    buffers: &SceneBuffers,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("indirect_convert_bind_group"),
+        layout: &mesh_pipelines.indirect_convert_bg_layout,
+        entries: &[
+            buf_entry(0, &buffers.indirect_args),
+            buf_entry(1, &buffers.mesh_indirect_args),
         ],
     })
 }
@@ -1153,6 +1403,155 @@ pub fn record_sorted_forward_pass(
         rpass.set_bind_group(0, render_bg, &[]);
 
         rpass.draw_indirect(&buffers.indirect_args, 0);
+    }
+}
+
+/// Record a sorted forward pass using mesh shaders instead of hardware vertex rasterization.
+///
+/// Steps 1-3 are identical to [`record_sorted_forward_pass`]:
+///   1. Reset indirect args
+///   2. Compute pass (SH eval + cull + depth keys)
+///   3. Radix sort
+///   3.5. Indirect convert: turns `indirect_args.instance_count` into mesh dispatch args
+///   4. Render pass with `draw_mesh_tasks_indirect`
+pub fn record_sorted_mesh_forward_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    device: &wgpu::Device,
+    fwd_pipelines: &ForwardPipelines,
+    mesh_pipelines: &MeshForwardPipelines,
+    sort_pipelines: &rmesh_sort::RadixSortPipelines,
+    sort_state: &rmesh_sort::RadixSortState,
+    buffers: &SceneBuffers,
+    targets: &RenderTargets,
+    compute_bg: &wgpu::BindGroup,
+    mesh_render_bg_a: &wgpu::BindGroup,
+    mesh_render_bg_b: &wgpu::BindGroup,
+    indirect_convert_bg: &wgpu::BindGroup,
+    tet_count: u32,
+    queue: &wgpu::Queue,
+) {
+    // ----- 1. Reset indirect args -----
+    let reset_cmd = DrawIndirectCommand {
+        vertex_count: 12,
+        instance_count: 0,
+        first_vertex: 0,
+        first_instance: 0,
+    };
+    queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
+    // Reset mesh dispatch args to safe values (0 workgroups)
+    queue.write_buffer(
+        &buffers.mesh_indirect_args,
+        0,
+        bytemuck::cast_slice(&[0u32, 1u32, 1u32]),
+    );
+
+    let n_pow2 = tet_count.next_power_of_two();
+    queue.write_buffer(&sort_state.num_keys_buf, 0, bytemuck::bytes_of(&n_pow2));
+
+    // ----- 2. Compute pass -----
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("project_compute"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&fwd_pipelines.compute_pipeline);
+        cpass.set_bind_group(0, compute_bg, &[]);
+
+        let workgroup_size = 64u32;
+        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+        let max_per_dim = 65535u32;
+        let dispatch_x = total_workgroups.min(max_per_dim);
+        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    }
+
+    // ----- 3. Radix sort -----
+    let result_in_b = rmesh_sort::record_radix_sort(
+        encoder, device, sort_pipelines, sort_state,
+        &buffers.sort_keys, &buffers.sort_values,
+    );
+
+    // ----- 3.5. Indirect convert: instance_count → mesh dispatch args -----
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("indirect_convert"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&mesh_pipelines.indirect_convert_pipeline);
+        cpass.set_bind_group(0, indirect_convert_bg, &[]);
+        cpass.dispatch_workgroups(1, 1, 1);
+    }
+
+    // ----- 4. Mesh shader render pass -----
+    let mesh_bg = if result_in_b { mesh_render_bg_b } else { mesh_render_bg_a };
+    {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("mesh_forward_render"),
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0, g: 0.0, b: 0.0, a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.aux0_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0, g: 0.0, b: 0.0, a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.normals_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0, g: 0.0, b: 0.0, a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.depth_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0, g: 0.0, b: 0.0, a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
+            ],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        rpass.set_viewport(
+            0.0,
+            0.0,
+            targets.width as f32,
+            targets.height as f32,
+            0.0,
+            1.0,
+        );
+        rpass.set_scissor_rect(0, 0, targets.width, targets.height);
+        rpass.set_pipeline(&mesh_pipelines.mesh_render_pipeline);
+        rpass.set_bind_group(0, mesh_bg, &[]);
+
+        rpass.draw_mesh_tasks_indirect(&buffers.mesh_indirect_args, 0);
     }
 }
 

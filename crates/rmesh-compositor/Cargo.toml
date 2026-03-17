@@ -1,0 +1,11 @@
+[package]
+name = "rmesh-compositor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rmesh-interact = { path = "../rmesh-interact" }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }

@@ -3377,6 +3377,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmesh-compositor"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "log",
+ "rmesh-interact",
+ "wgpu",
+]
+
+[[package]]
 name = "rmesh-data"
 version = "0.1.0"
 dependencies = [
@@ -3397,6 +3408,13 @@ dependencies = [
  "bytemuck",
  "rmesh-tile",
  "wgpu",
+]
+
+[[package]]
+name = "rmesh-interact"
+version = "0.1.0"
+dependencies = [
+ "glam",
 ]
 
 [[package]]
@@ -3435,6 +3453,16 @@ dependencies = [
  "rmesh-sort",
  "rmesh-tile",
  "rmesh-util",
+ "wgpu",
+]
+
+[[package]]
+name = "rmesh-sim"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "log",
  "wgpu",
 ]
 
@@ -3502,8 +3530,11 @@ dependencies = [
  "pollster",
  "rayon",
  "rfd",
+ "rmesh-compositor",
  "rmesh-data",
+ "rmesh-interact",
  "rmesh-render",
+ "rmesh-sim",
  "rmesh-sort",
  "rmesh-util",
  "wgpu",
@@ -3520,7 +3551,9 @@ dependencies = [
  "glam",
  "js-sys",
  "log",
+ "rmesh-compositor",
  "rmesh-data",
+ "rmesh-interact",
  "rmesh-render",
  "rmesh-sort",
  "rmesh-util",

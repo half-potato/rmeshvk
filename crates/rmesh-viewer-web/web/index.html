@@ -14,6 +14,30 @@
       font-size: 13px; opacity: 0.8;
     }
     #file-input { font-size: 13px; }
+    #primitives-panel {
+      position: absolute; top: 50px; left: 10px; z-index: 10;
+      background: rgba(30,30,30,0.9); border-radius: 6px; padding: 8px;
+      font-size: 13px; min-width: 140px;
+    }
+    #primitives-panel button {
+      margin: 2px; padding: 4px 8px; font-size: 12px;
+      background: #444; color: #eee; border: 1px solid #666; border-radius: 3px; cursor: pointer;
+    }
+    #primitives-panel button:hover { background: #555; }
+    #prim-list { margin-top: 6px; }
+    #prim-list div {
+      padding: 3px 6px; cursor: pointer; border-radius: 3px;
+    }
+    #prim-list div:hover { background: #444; }
+    #prim-list div.selected { background: #2a5a8a; }
+    #interact-hud {
+      position: absolute; bottom: 40px; left: 50%; transform: translateX(-50%);
+      z-index: 10; background: rgba(0,0,0,0.7); border-radius: 6px; padding: 6px 16px;
+      font-size: 16px; font-weight: bold; display: none;
+    }
+    #interact-hud .mode { color: #fff; }
+    #interact-hud .axis { color: #64b4ff; margin-left: 8px; }
+    #interact-hud .numeric { color: #ffcc00; margin-left: 8px; font-family: monospace; }
     #status {
       position: absolute; bottom: 10px; left: 10px; z-index: 10;
       font-size: 12px; opacity: 0.6;
@@ -30,8 +54,25 @@
     <input type="file" id="file-input" accept=".rmesh,.ply">
     <span id="info"></span>
   </div>
+  <div id="primitives-panel">
+    <strong>Primitives</strong><br>
+    <button onclick="addPrimitive('cube')">Cube</button>
+    <button onclick="addPrimitive('sphere')">Sphere</button>
+    <button onclick="addPrimitive('plane')">Plane</button>
+    <button onclick="addPrimitive('cylinder')">Cylinder</button>
+    <button id="delete-btn" onclick="deleteSelected()" style="display:none; background:#833;">Delete</button>
+    <div style="margin-top:6px;">
+      <label><input type="checkbox" id="show-prims-cb" onchange="toggleShowPrimitives(this.checked)"> Show Primitives</label>
+    </div>
+    <div id="prim-list"></div>
+  </div>
+  <div id="interact-hud">
+    <span class="mode"></span>
+    <span class="axis"></span>
+    <span class="numeric"></span>
+  </div>
   <div id="status">Initializing WebGPU...</div>
-  <canvas id="canvas"></canvas>
+  <canvas id="canvas" tabindex="0"></canvas>
 
   <script type="module">
     import init, { WebViewer } from './pkg/rmesh_viewer_web.js';
@@ -40,10 +81,61 @@
     const status = document.getElementById('status');
     const info = document.getElementById('info');
     const fileInput = document.getElementById('file-input');
+    const primList = document.getElementById('prim-list');
+    const deleteBtn = document.getElementById('delete-btn');
+    const interactHud = document.getElementById('interact-hud');
 
     let viewer = null;
     let leftDown = false, middleDown = false, rightDown = false;
     let lastX = 0, lastY = 0;
+
+    // Expose to onclick handlers
+    window.addPrimitive = function(kind) {
+      if (!viewer) return;
+      viewer.add_primitive(kind);
+      refreshPrimList();
+    };
+    window.deleteSelected = function() {
+      if (!viewer) return;
+      viewer.delete_selected();
+      refreshPrimList();
+    };
+    window.toggleShowPrimitives = function(show) {
+      if (!viewer) return;
+      viewer.set_show_primitives(show);
+    };
+
+    function refreshPrimList() {
+      if (!viewer) return;
+      const count = viewer.primitive_count();
+      const sel = viewer.get_selected();
+      primList.innerHTML = '';
+      for (let i = 0; i < count; i++) {
+        const div = document.createElement('div');
+        div.textContent = viewer.primitive_name(i);
+        if (i === sel) div.classList.add('selected');
+        div.addEventListener('click', () => {
+          viewer.set_selected(i === sel ? -1 : i);
+          refreshPrimList();
+        });
+        primList.appendChild(div);
+      }
+      deleteBtn.style.display = sel >= 0 ? '' : 'none';
+    }
+
+    function updateHud() {
+      if (!viewer) return;
+      const info = viewer.display_info();
+      if (!info) {
+        interactHud.style.display = 'none';
+        return;
+      }
+      const parts = info.split('|');
+      interactHud.querySelector('.mode').textContent = parts[0] || '';
+      interactHud.querySelector('.axis').textContent = parts[1] || '';
+      interactHud.querySelector('.numeric').textContent = parts[2] || '';
+      interactHud.style.display = info ? '' : 'none';
+    }
 
     async function start() {
       if (!navigator.gpu) {
@@ -88,8 +180,33 @@
         }
       });
 
+      // --- Keyboard controls ---
+      window.addEventListener('keydown', (e) => {
+        if (!viewer) return;
+        const result = viewer.on_key_down(e.key);
+        if (result !== 'NotConsumed') {
+          e.preventDefault();
+          updateHud();
+          refreshPrimList();
+        }
+      });
+
+      window.addEventListener('keyup', (e) => {
+        if (!viewer) return;
+        viewer.on_key_up(e.key);
+      });
+
       // --- Mouse controls ---
       canvas.addEventListener('mousedown', (e) => {
+        if (!viewer) return;
+        if (viewer.is_interacting()) {
+          const result = viewer.on_interact_mouse_down(e.button);
+          if (result !== 'NotConsumed') {
+            updateHud();
+            refreshPrimList();
+            return;
+          }
+        }
         if (e.button === 0) leftDown = true;
         if (e.button === 1) middleDown = true;
         if (e.button === 2) rightDown = true;
@@ -109,6 +226,12 @@
         lastX = e.clientX;
         lastY = e.clientY;
 
+        if (!viewer) return;
+        if (viewer.is_interacting()) {
+          viewer.on_interact_mouse_move(dx, dy);
+          updateHud();
+          return;
+        }
         if (leftDown)   viewer.orbit(dx, dy);
         if (middleDown) viewer.pan(dx, dy);
         if (rightDown)  viewer.zoom(dy);
@@ -116,7 +239,9 @@
 
       canvas.addEventListener('wheel', (e) => {
         e.preventDefault();
-        viewer.zoom(-e.deltaY * 0.1);
+        if (viewer && !viewer.is_interacting()) {
+          viewer.zoom(-e.deltaY * 0.1);
+        }
       }, { passive: false });
 
       canvas.addEventListener('contextmenu', (e) => e.preventDefault());
