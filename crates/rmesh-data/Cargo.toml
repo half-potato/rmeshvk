@@ -3,6 +3,10 @@ name = "rmesh-data"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
+
 [dependencies]
 bytemuck = { workspace = true }
 glam = { workspace = true }
@@ -11,4 +15,4 @@ log = { workspace = true }
 half = { workspace = true }
 image = { workspace = true }
 flate2 = { workspace = true }
-rayon = { workspace = true }
+rayon = { workspace = true, optional = true }

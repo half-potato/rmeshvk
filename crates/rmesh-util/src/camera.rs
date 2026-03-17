@@ -1,8 +1,99 @@
 //! Shared camera, projection, and ray-tet intersection utilities.
 //!
 //! Analogous to `camera.slang`. All functions match the WGSL shader conventions exactly.
+//! Also contains the orbit `Camera` struct shared between native and web viewers.
 
 use glam::{Mat4, Vec3, Vec4};
+
+// ---------------------------------------------------------------------------
+// Orbit camera (shared between rmesh-viewer and rmesh-viewer-web)
+// ---------------------------------------------------------------------------
+
+/// Orbit camera matching the webrm Camera class.
+///
+/// Input-agnostic: callers feed pixel deltas from whatever input system they use
+/// (winit, web-sys mouse events, gamepad, etc.).
+pub struct Camera {
+    pub position: Vec3,
+    pub orbit_target: Vec3,
+    pub orbit_distance: f32,
+    pub orbit_yaw: f32,
+    pub orbit_pitch: f32,
+    pub fov_y: f32,
+    pub near_z: f32,
+    pub far_z: f32,
+}
+
+impl Camera {
+    pub fn new(position: Vec3) -> Self {
+        let distance = position.length();
+        let pitch = (position.z / distance).asin();
+        let yaw = position.y.atan2(position.x);
+
+        Self {
+            position,
+            orbit_target: Vec3::ZERO,
+            orbit_distance: distance,
+            orbit_yaw: yaw,
+            orbit_pitch: pitch,
+            fov_y: 50.0_f32.to_radians(),
+            near_z: 0.01,
+            far_z: 1000.0,
+        }
+    }
+
+    pub fn view_matrix(&mut self) -> Mat4 {
+        let d = self.orbit_distance;
+        let yaw = self.orbit_yaw;
+        let pitch = self.orbit_pitch;
+
+        let eye = self.orbit_target
+            + Vec3::new(
+                d * pitch.cos() * yaw.cos(),
+                d * pitch.cos() * yaw.sin(),
+                d * pitch.sin(),
+            );
+
+        self.position = eye;
+
+        // Z-up look-at
+        let up = Vec3::new(0.0, 0.0, -1.0);
+        Mat4::look_at_rh(eye, self.orbit_target, up)
+    }
+
+    pub fn projection_matrix(&self, aspect: f32) -> Mat4 {
+        Mat4::perspective_rh(self.fov_y, aspect, self.near_z, self.far_z)
+    }
+
+    pub fn orbit(&mut self, dx: f32, dy: f32) {
+        let sensitivity = 0.004;
+        self.orbit_yaw -= dx * sensitivity;
+        self.orbit_pitch += dy * sensitivity;
+        let limit = std::f32::consts::FRAC_PI_2 - 0.001;
+        self.orbit_pitch = self.orbit_pitch.clamp(-limit, limit);
+    }
+
+    pub fn zoom(&mut self, delta: f32) {
+        self.orbit_distance = (self.orbit_distance + delta * 0.01).max(0.1);
+    }
+
+    pub fn pan(&mut self, dx: f32, dy: f32) {
+        let sensitivity = 0.002 * self.orbit_distance;
+        let yaw = self.orbit_yaw;
+        let pitch = self.orbit_pitch;
+
+        // Right vector (perpendicular to forward in XY plane)
+        let right = Vec3::new(-yaw.sin(), yaw.cos(), 0.0);
+        // Up vector (perpendicular to forward and right)
+        let up = Vec3::new(
+            -pitch.sin() * yaw.cos(),
+            -pitch.sin() * yaw.sin(),
+            pitch.cos(),
+        );
+
+        self.orbit_target += sensitivity * (-dx * right + dy * up);
+    }
+}
 
 /// Tet face winding: (a, b, c, opposite_vertex).
 /// Matches WGSL FACES constant in forward_tiled, backward_tiled, etc.

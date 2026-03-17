@@ -1,0 +1,26 @@
+[package]
+name = "rmesh-viewer-web"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rmesh-render = { path = "../rmesh-render" }
+rmesh-data = { path = "../rmesh-data", default-features = false }
+rmesh-sort = { path = "../rmesh-sort" }
+rmesh-util = { path = "../rmesh-util" }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+web-sys = { workspace = true, features = [
+    "HtmlCanvasElement", "Document", "Window", "Element",
+    "MouseEvent", "WheelEvent", "KeyboardEvent",
+] }
+console_log = { workspace = true }
+console_error_panic_hook = { workspace = true }
+js-sys = { workspace = true }

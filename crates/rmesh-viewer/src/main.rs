@@ -11,7 +11,7 @@
 //!   Escape: Quit
 
 use anyhow::{Context, Result};
-use glam::{Mat4, Vec3};
+use glam::Vec3;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +21,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use rmesh_util::camera::Camera;
 use rmesh_util::sh_eval::{ShEvalPipeline, ShEvalUniforms};
 use wgpu::util::DeviceExt;
 
@@ -55,89 +56,6 @@ const C3: [f32; 7] = [
     -0.5900435899266435,
 ];
 
-/// Orbit camera matching the webrm Camera class.
-struct Camera {
-    position: Vec3,
-    orbit_target: Vec3,
-    orbit_distance: f32,
-    orbit_yaw: f32,
-    orbit_pitch: f32,
-    fov_y: f32,
-    near_z: f32,
-    far_z: f32,
-}
-
-impl Camera {
-    fn new(position: Vec3) -> Self {
-        let distance = position.length();
-        let pitch = (position.z / distance).asin();
-        let yaw = position.y.atan2(position.x);
-
-        Self {
-            position,
-            orbit_target: Vec3::ZERO,
-            orbit_distance: distance,
-            orbit_yaw: yaw,
-            orbit_pitch: pitch,
-            fov_y: 50.0_f32.to_radians(),
-            near_z: 0.01,
-            far_z: 1000.0,
-        }
-    }
-
-    fn view_matrix(&mut self) -> Mat4 {
-        let d = self.orbit_distance;
-        let yaw = self.orbit_yaw;
-        let pitch = self.orbit_pitch;
-
-        let eye = self.orbit_target
-            + Vec3::new(
-                d * pitch.cos() * yaw.cos(),
-                d * pitch.cos() * yaw.sin(),
-                d * pitch.sin(),
-            );
-
-        self.position = eye;
-
-        // Z-up look-at
-        let up = Vec3::new(0.0, 0.0, -1.0);
-        Mat4::look_at_rh(eye, self.orbit_target, up)
-    }
-
-    fn projection_matrix(&self, aspect: f32) -> Mat4 {
-        Mat4::perspective_rh(self.fov_y, aspect, self.near_z, self.far_z)
-    }
-
-    fn orbit(&mut self, dx: f32, dy: f32) {
-        let sensitivity = 0.004;
-        self.orbit_yaw -= dx * sensitivity;
-        self.orbit_pitch += dy * sensitivity;
-        let limit = std::f32::consts::FRAC_PI_2 - 0.001;
-        self.orbit_pitch = self.orbit_pitch.clamp(-limit, limit);
-    }
-
-    fn zoom(&mut self, delta: f32) {
-        self.orbit_distance = (self.orbit_distance + delta * 0.01).max(0.1);
-    }
-
-    fn pan(&mut self, dx: f32, dy: f32) {
-        let sensitivity = 0.002 * self.orbit_distance;
-        let yaw = self.orbit_yaw;
-        let pitch = self.orbit_pitch;
-
-        // Right vector (perpendicular to forward in XY plane)
-        let right = Vec3::new(-yaw.sin(), yaw.cos(), 0.0);
-        // Up vector (perpendicular to forward and right)
-        let up = Vec3::new(
-            -pitch.sin() * yaw.cos(),
-            -pitch.sin() * yaw.sin(),
-            pitch.cos(),
-        );
-
-        self.orbit_target += sensitivity * (-dx * right + dy * up);
-    }
-}
-
 struct GpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -161,6 +79,7 @@ struct GpuState {
     sh_coeffs_buf: wgpu::Buffer,
     sh_eval_uniforms_buf: wgpu::Buffer,
     sh_degree: u32,
+    pending_reconfigure: bool,
     // egui
     egui_renderer: egui_wgpu::Renderer,
     egui_state: egui_winit::State,
@@ -182,6 +101,7 @@ struct App {
     fps: f64,
     loaded_path: Option<PathBuf>,
     pending_load: Option<PathBuf>,
+    vsync: bool,
 }
 
 impl App {
@@ -208,6 +128,7 @@ impl App {
             fps: 0.0,
             loaded_path: None,
             pending_load: None,
+            vsync: true,
         }
     }
 
@@ -496,6 +417,7 @@ impl App {
             sh_coeffs_buf,
             sh_eval_uniforms_buf,
             sh_degree,
+            pending_reconfigure: false,
             egui_renderer,
             egui_state,
         });
@@ -549,6 +471,17 @@ impl App {
         let fps = self.fps;
 
         let gpu = self.gpu.as_mut().unwrap();
+
+        // Apply deferred surface reconfigure (must happen before get_current_texture)
+        if gpu.pending_reconfigure {
+            gpu.pending_reconfigure = false;
+            gpu.surface_config.present_mode = if self.vsync {
+                wgpu::PresentMode::Fifo
+            } else {
+                wgpu::PresentMode::Mailbox
+            };
+            gpu.surface.configure(&gpu.device, &gpu.surface_config);
+        }
 
         let output = match gpu.surface.get_current_texture() {
             Ok(t) => t,
@@ -607,6 +540,7 @@ impl App {
         let raw_input = gpu.egui_state.take_egui_input(window);
         let tet_count = gpu.tet_count;
         let mut open_file = false;
+        let mut vsync = self.vsync;
         #[allow(deprecated)]
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -616,6 +550,9 @@ impl App {
                             open_file = true;
                             ui.close_menu();
                         }
+                    });
+                    ui.menu_button("Settings", |ui| {
+                        ui.checkbox(&mut vsync, "Vsync");
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(format!(
@@ -633,6 +570,10 @@ impl App {
             {
                 self.pending_load = Some(path);
             }
+        }
+        if vsync != self.vsync {
+            self.vsync = vsync;
+            gpu.pending_reconfigure = true;
         }
         gpu.egui_state
             .handle_platform_output(window, full_output.platform_output);

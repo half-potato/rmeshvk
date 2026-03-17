@@ -476,13 +476,15 @@ fn test_tile_fill_kernel() {
     // tile_sort_keys doesn't have COPY_SRC, so we verify via tile_pair_count instead
     // (tile_fill doesn't write pair_count, but we verified dispatch didn't error)
     // For a proper readback test, create custom key buffer:
-    let test_keys = create_rw_buffer(&device, "test_keys", (tile_buffers.max_pairs_pow2 as u64) * 4);
+    // Key buffer is 2 u32s per pair (64-bit keys: lo=depth, hi=tile_id)
+    let test_keys = create_rw_buffer(&device, "test_keys", (tile_buffers.max_pairs_pow2 as u64) * 8);
     let test_values = create_rw_buffer(&device, "test_values", (tile_buffers.max_pairs_pow2 as u64) * 4);
 
     // Write some non-sentinel data first
-    let garbage: Vec<u32> = (0..tile_buffers.max_pairs_pow2).collect();
-    queue.write_buffer(&test_keys, 0, bytemuck::cast_slice(&garbage));
-    queue.write_buffer(&test_values, 0, bytemuck::cast_slice(&garbage));
+    let key_garbage: Vec<u32> = (0..tile_buffers.max_pairs_pow2 * 2).collect();
+    let val_garbage: Vec<u32> = (0..tile_buffers.max_pairs_pow2).collect();
+    queue.write_buffer(&test_keys, 0, bytemuck::cast_slice(&key_garbage));
+    queue.write_buffer(&test_values, 0, bytemuck::cast_slice(&val_garbage));
 
     // Create a custom tile fill bind group with our readable buffers
     let test_fill_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -517,19 +519,19 @@ fn test_tile_fill_kernel() {
     }
     queue.submit(std::iter::once(encoder.finish()));
 
-    let keys: Vec<u32> = read_buffer(&device, &queue, &test_keys, tile_buffers.max_pairs_pow2 as usize);
+    let keys: Vec<u32> = read_buffer(&device, &queue, &test_keys, (tile_buffers.max_pairs_pow2 * 2) as usize);
     let values: Vec<u32> = read_buffer(&device, &queue, &test_values, tile_buffers.max_pairs_pow2 as usize);
 
-    // All keys should be sentinel
+    // All key words (2 per pair) should be sentinel
     for (i, &k) in keys.iter().enumerate() {
-        assert_eq!(k, 0xFFFFFFFF, "Key at {i} = {k:#x}, expected 0xFFFFFFFF");
+        assert_eq!(k, 0xFFFFFFFF, "Key word at {i} = {k:#x}, expected 0xFFFFFFFF");
     }
     // All values should be 0
     for (i, &v) in values.iter().enumerate() {
         assert_eq!(v, 0, "Value at {i} = {v}, expected 0");
     }
 
-    eprintln!("tile_fill: verified {} entries", tile_buffers.max_pairs_pow2);
+    eprintln!("tile_fill: verified {} pairs ({} u32s)", tile_buffers.max_pairs_pow2, tile_buffers.max_pairs_pow2 * 2);
 }
 
 // ===========================================================================

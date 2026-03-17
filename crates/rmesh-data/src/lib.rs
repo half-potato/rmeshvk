@@ -17,10 +17,31 @@
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
-use glam::Vec3;
 use half::f16;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use std::io::Read;
+
+/// Parallel `chunks_mut` + `enumerate` + `for_each` when the `parallel` feature is
+/// enabled, sequential fallback otherwise.
+macro_rules! par_chunks_for_each {
+    ($data:expr, $chunk_size:expr, $closure:expr) => {{
+        #[cfg(feature = "parallel")]
+        {
+            $data
+                .par_chunks_mut($chunk_size)
+                .enumerate()
+                .for_each($closure);
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            $data
+                .chunks_mut($chunk_size)
+                .enumerate()
+                .for_each($closure);
+        }
+    }};
+}
 
 /// Loaded scene data, ready for GPU upload.
 #[derive(Clone)]
@@ -138,23 +159,21 @@ fn slice_u32(data: &[u8], off: &mut usize, count: usize) -> Vec<u32> {
     }
 }
 
-/// Bulk f16 → f32 conversion with rayon parallelism for large arrays.
+/// Bulk f16 → f32 conversion with parallelism for large arrays.
 fn slice_f16_to_f32(data: &[u8], off: &mut usize, count: usize) -> Vec<f32> {
     let byte_len = count * 2;
     let bytes = &data[*off..*off + byte_len];
     *off += byte_len;
-    // For large arrays (>100K elements), use parallel conversion
+    // For large arrays (>100K elements), use parallel conversion when available
     if count > 100_000 {
         let mut out = vec![0.0f32; count];
-        out.par_chunks_mut(8192)
-            .enumerate()
-            .for_each(|(chunk_idx, chunk)| {
-                let start = chunk_idx * 8192;
-                for (i, val) in chunk.iter_mut().enumerate() {
-                    let bi = (start + i) * 2;
-                    *val = f16::from_le_bytes(bytes[bi..bi + 2].try_into().unwrap()).to_f32();
-                }
-            });
+        par_chunks_for_each!(out, 8192, |(chunk_idx, chunk): (usize, &mut [f32])| {
+            let start = chunk_idx * 8192;
+            for (i, val) in chunk.iter_mut().enumerate() {
+                let bi = (start + i) * 2;
+                *val = f16::from_le_bytes(bytes[bi..bi + 2].try_into().unwrap()).to_f32();
+            }
+        });
         out
     } else {
         bytes
@@ -217,15 +236,12 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs)> {
     let densities_u8 = &data[offset..offset + tet_count as usize];
     offset += tet_count as usize;
     let mut densities = vec![0.0f32; tet_count as usize];
-    densities
-        .par_chunks_mut(8192)
-        .enumerate()
-        .for_each(|(ci, chunk)| {
-            let start = ci * 8192;
-            for (i, d) in chunk.iter_mut().enumerate() {
-                *d = ((densities_u8[start + i] as f32 - 100.0) / 20.0).exp();
-            }
-        });
+    par_chunks_for_each!(densities, 8192, |(ci, chunk): (usize, &mut [f32])| {
+        let start = ci * 8192;
+        for (i, d) in chunk.iter_mut().enumerate() {
+            *d = ((densities_u8[start + i] as f32 - 100.0) / 20.0).exp();
+        }
+    });
 
     // Align to 4 bytes
     offset = (offset + 3) & !3;
@@ -253,19 +269,16 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs)> {
     let k = k_components as usize;
     let mut sh_coeffs = vec![0.0f32; tet_count as usize * total_dims];
 
-    sh_coeffs
-        .par_chunks_mut(total_dims)
-        .enumerate()
-        .for_each(|(tet, chunk)| {
-            let w_base = tet * k;
-            for feat in 0..total_dims {
-                let mut val = mean[feat];
-                for ki in 0..k {
-                    val += weights[w_base + ki] * basis[ki * total_dims + feat];
-                }
-                chunk[feat] = val;
+    par_chunks_for_each!(sh_coeffs, total_dims, |(tet, chunk): (usize, &mut [f32])| {
+        let w_base = tet * k;
+        for feat in 0..total_dims {
+            let mut val = mean[feat];
+            for ki in 0..k {
+                val += weights[w_base + ki] * basis[ki * total_dims + feat];
             }
-        });
+            chunk[feat] = val;
+        }
+    });
     log::info!("PCA decompression: {:.2}s", t0.elapsed().as_secs_f64());
 
     // --- Parallel circumsphere computation ---
@@ -307,10 +320,7 @@ fn compute_circumspheres_parallel(
 
     let mut circumdata = vec![0.0f32; tet_count * 4];
 
-    circumdata
-        .par_chunks_mut(4)
-        .enumerate()
-        .for_each(|(i, out)| {
+    par_chunks_for_each!(circumdata, 4, |(i, out): (usize, &mut [f32])| {
             let i0 = indices[i * 4] as usize;
             let i1 = indices[i * 4 + 1] as usize;
             let i2 = indices[i * 4 + 2] as usize;
@@ -485,54 +495,42 @@ pub fn load_ply(data: &[u8]) -> Result<(SceneData, ShCoeffs)> {
     let mut sh_coeffs = vec![0.0f32; tet_count as usize * total_dims];
 
     // Parallel parse: indices (4 u32 per tet)
-    let n_tets = tet_count as usize;
-    indices
-        .par_chunks_mut(4)
-        .enumerate()
-        .for_each(|(t, idx)| {
-            let rec = &tet_data[t * tet_stride + 1..]; // skip list count byte
-            for k in 0..4 {
-                idx[k] = i32::from_le_bytes(rec[k * 4..k * 4 + 4].try_into().unwrap()) as u32;
-            }
-        });
+    let _n_tets = tet_count as usize;
+    par_chunks_for_each!(indices, 4, |(t, idx): (usize, &mut [u32])| {
+        let rec = &tet_data[t * tet_stride + 1..]; // skip list count byte
+        for k in 0..4 {
+            idx[k] = i32::from_le_bytes(rec[k * 4..k * 4 + 4].try_into().unwrap()) as u32;
+        }
+    });
 
     // Parallel parse: density + gradients + SH (all scalar properties)
     // Scalar props start at offset 17 within each tet record (1 list_count + 16 indices)
     let scalar_off = 17usize;
 
-    densities
-        .par_chunks_mut(1)
-        .enumerate()
-        .for_each(|(t, d)| {
-            let off = t * tet_stride + scalar_off;
-            d[0] = f32::from_le_bytes(tet_data[off..off + 4].try_into().unwrap());
-        });
+    par_chunks_for_each!(densities, 1, |(t, d): (usize, &mut [f32])| {
+        let off = t * tet_stride + scalar_off;
+        d[0] = f32::from_le_bytes(tet_data[off..off + 4].try_into().unwrap());
+    });
 
-    color_grads
-        .par_chunks_mut(3)
-        .enumerate()
-        .for_each(|(t, g)| {
-            let off = t * tet_stride + scalar_off + 4;
-            for k in 0..3 {
-                g[k] = f32::from_le_bytes(tet_data[off + k * 4..off + k * 4 + 4].try_into().unwrap());
-            }
-        });
+    par_chunks_for_each!(color_grads, 3, |(t, g): (usize, &mut [f32])| {
+        let off = t * tet_stride + scalar_off + 4;
+        for k in 0..3 {
+            g[k] = f32::from_le_bytes(tet_data[off + k * 4..off + k * 4 + 4].try_into().unwrap());
+        }
+    });
 
     // SH: interleaved [sh_0_r, sh_0_g, sh_0_b, sh_1_r, ...] → planar [R..., G..., B...]
     let sh_byte_off = scalar_off + 16; // density(4) + grad(12)
-    sh_coeffs
-        .par_chunks_mut(total_dims)
-        .enumerate()
-        .for_each(|(t, sh_out)| {
-            let off = t * tet_stride + sh_byte_off;
-            for coeff in 0..nc_usize {
-                for ch in 0..3usize {
-                    let src = off + (coeff * 3 + ch) * 4;
-                    sh_out[ch * nc_usize + coeff] =
-                        f32::from_le_bytes(tet_data[src..src + 4].try_into().unwrap());
-                }
+    par_chunks_for_each!(sh_coeffs, total_dims, |(t, sh_out): (usize, &mut [f32])| {
+        let off = t * tet_stride + sh_byte_off;
+        for coeff in 0..nc_usize {
+            for ch in 0..3usize {
+                let src = off + (coeff * 3 + ch) * 4;
+                sh_out[ch * nc_usize + coeff] =
+                    f32::from_le_bytes(tet_data[src..src + 4].try_into().unwrap());
             }
-        });
+        }
+    });
 
     log::info!("Tet parsing: {:.2}s", t0.elapsed().as_secs_f64());
 

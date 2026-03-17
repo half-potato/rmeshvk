@@ -388,7 +388,7 @@ impl RMeshRenderer {
         let tile_buffers = TileBuffers::new(&device, tet_count, width, height, tile_size);
 
         // Radix sort — 64-bit keys: lo=depth(32 bits), hi=tile_id
-        let sorting_bits = rmesh_sort::sorting_bits_for_tiles(tile_buffers.num_tiles);
+        let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
         let radix_pipelines = RadixSortPipelines::new(&device, 2);
         let radix_state = RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
         radix_state.upload_configs(&queue);

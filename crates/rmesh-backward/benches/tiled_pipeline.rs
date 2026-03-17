@@ -65,7 +65,8 @@ struct BenchState {
     tile_gen_scan_bg: wgpu::BindGroup,
     tile_ranges_bg_a: wgpu::BindGroup,
     tile_ranges_bg_b: wgpu::BindGroup,
-    // HW raster sort (for sorted forward HW pass)
+    // HW raster sort (for sorted forward HW pass, 32-bit keys)
+    hw_radix_pipelines: rmesh_backward::RadixSortPipelines,
     hw_sort_state: rmesh_backward::RadixSortState,
     render_bg_b: wgpu::BindGroup,
     // Forward tiled
@@ -200,6 +201,7 @@ fn create_bench_state() -> Option<BenchState> {
     );
 
     // HW raster sort infrastructure (sized for tet_count, not tile pairs — 32-bit keys)
+    let hw_radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 1);
     let hw_n_pow2 = scene.tet_count.next_power_of_two();
     let hw_sort_state = rmesh_backward::RadixSortState::new(&device, hw_n_pow2, 32, 1);
     hw_sort_state.upload_configs(&queue);
@@ -331,6 +333,7 @@ fn create_bench_state() -> Option<BenchState> {
         tile_gen_scan_bg,
         tile_ranges_bg_a,
         tile_ranges_bg_b,
+        hw_radix_pipelines,
         hw_sort_state,
         render_bg_b,
         rasterize,
@@ -768,7 +771,7 @@ fn run_forward_hw_rasterize(s: &BenchState) {
         &mut encoder,
         &s.device,
         &s.fwd_pipelines,
-        &s.radix_pipelines,
+        &s.hw_radix_pipelines,
         &s.hw_sort_state,
         &s.buffers,
         &s.targets,

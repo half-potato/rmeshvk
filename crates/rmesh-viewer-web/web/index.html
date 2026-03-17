@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>rmesh viewer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a1a; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
+    #controls {
+      position: absolute; top: 10px; left: 10px; z-index: 10;
+      display: flex; gap: 8px; align-items: center;
+    }
+    #controls label, #controls span {
+      font-size: 13px; opacity: 0.8;
+    }
+    #file-input { font-size: 13px; }
+    #status {
+      position: absolute; bottom: 10px; left: 10px; z-index: 10;
+      font-size: 12px; opacity: 0.6;
+    }
+    canvas {
+      display: block; width: 100vw; height: 100vh;
+      cursor: grab;
+    }
+    canvas:active { cursor: grabbing; }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <input type="file" id="file-input" accept=".rmesh,.ply">
+    <span id="info"></span>
+  </div>
+  <div id="status">Initializing WebGPU...</div>
+  <canvas id="canvas"></canvas>
+
+  <script type="module">
+    import init, { WebViewer } from './pkg/rmesh_viewer_web.js';
+
+    const canvas = document.getElementById('canvas');
+    const status = document.getElementById('status');
+    const info = document.getElementById('info');
+    const fileInput = document.getElementById('file-input');
+
+    let viewer = null;
+    let leftDown = false, middleDown = false, rightDown = false;
+    let lastX = 0, lastY = 0;
+
+    async function start() {
+      if (!navigator.gpu) {
+        const msg = 'WebGPU is not supported in this browser.\n\n'
+          + 'Requirements:\n'
+          + '  - Chrome 113+ / Edge 113+\n'
+          + '  - Firefox: enable dom.webgpu.enabled in about:config\n'
+          + '  - Safari 18+\n\n'
+          + 'Make sure hardware acceleration is enabled.';
+        alert(msg);
+        status.textContent = 'WebGPU not available';
+        return;
+      }
+
+      await init();
+      try {
+        viewer = await WebViewer.create('canvas');
+        status.textContent = 'Ready — load an .rmesh or .ply file';
+      } catch (e) {
+        alert('WebGPU initialization failed:\n\n' + e);
+        status.textContent = 'WebGPU init failed: ' + e;
+        console.error(e);
+        return;
+      }
+
+      fileInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        status.textContent = 'Loading ' + file.name + '...';
+        const buf = new Uint8Array(await file.arrayBuffer());
+        try {
+          if (file.name.endsWith('.ply')) {
+            viewer.load_ply(buf);
+          } else {
+            viewer.load_rmesh(buf);
+          }
+          info.textContent = file.name;
+          status.textContent = '';
+        } catch (err) {
+          status.textContent = 'Load error: ' + err;
+          console.error(err);
+        }
+      });
+
+      // --- Mouse controls ---
+      canvas.addEventListener('mousedown', (e) => {
+        if (e.button === 0) leftDown = true;
+        if (e.button === 1) middleDown = true;
+        if (e.button === 2) rightDown = true;
+        lastX = e.clientX;
+        lastY = e.clientY;
+      });
+
+      window.addEventListener('mouseup', (e) => {
+        if (e.button === 0) leftDown = false;
+        if (e.button === 1) middleDown = false;
+        if (e.button === 2) rightDown = false;
+      });
+
+      canvas.addEventListener('mousemove', (e) => {
+        const dx = e.clientX - lastX;
+        const dy = e.clientY - lastY;
+        lastX = e.clientX;
+        lastY = e.clientY;
+
+        if (leftDown)   viewer.orbit(dx, dy);
+        if (middleDown) viewer.pan(dx, dy);
+        if (rightDown)  viewer.zoom(dy);
+      });
+
+      canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        viewer.zoom(-e.deltaY * 0.1);
+      }, { passive: false });
+
+      canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+      // --- Resize ---
+      function onResize() {
+        const dpr = window.devicePixelRatio || 1;
+        const w = Math.floor(canvas.clientWidth * dpr);
+        const h = Math.floor(canvas.clientHeight * dpr);
+        canvas.width = w;
+        canvas.height = h;
+        if (viewer) viewer.resize(w, h);
+      }
+      window.addEventListener('resize', onResize);
+      onResize();
+
+      // --- Render loop ---
+      function frame() {
+        if (viewer && viewer.has_scene()) {
+          try { viewer.render(); } catch (e) { console.error('render:', e); }
+        }
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+    }
+
+    start();
+  </script>
+</body>
+</html>
