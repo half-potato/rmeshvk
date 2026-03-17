@@ -115,6 +115,24 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
         return;
     }
 
+    // --- 2b. Max optical depth cull ---
+    // Maximum ray path through tet <= longest edge. If density * longest_edge
+    // is below threshold, no ray can produce meaningful alpha — skip entirely.
+    {
+        let e01 = v1 - v0; let e02 = v2 - v0; let e03 = v3 - v0;
+        let e12 = v2 - v1; let e13 = v3 - v1; let e23 = v3 - v2;
+        let max_edge_sq = max(
+            max(dot(e01, e01), max(dot(e02, e02), dot(e03, e03))),
+            max(dot(e12, e12), max(dot(e13, e13), dot(e23, e23)))
+        );
+        let max_od = densities[tet_id] * sqrt(max_edge_sq);
+        if (max_od < 0.01) {
+            sort_keys[tet_id] = 0xFFFFFFFFu;
+            sort_values[tet_id] = tet_id;
+            return;
+        }
+    }
+
     // --- 3. Depth key from circumsphere ---
     let cx = circumdata[tet_id * 4u];
     let cy = circumdata[tet_id * 4u + 1u];

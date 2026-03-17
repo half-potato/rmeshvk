@@ -2131,7 +2131,9 @@ pub struct RasterizeComputePipeline {
     pub rendered_image: wgpu::Buffer,
     /// Auxiliary output buffer: [W x H x AUX_STRIDE] f32
     pub aux_image: wgpu::Buffer,
-    /// Default aux bind group (group 1) with dummy aux_data
+    /// Debug stats output buffer: [W x H x 4] u32 (ray_miss, ghost, occluded, useful)
+    pub debug_image: wgpu::Buffer,
+    /// Default aux bind group (group 1) with dummy aux_data + debug_image
     aux_bind_group: wgpu::BindGroup,
     pub width: u32,
     pub height: u32,
@@ -2167,8 +2169,8 @@ impl RasterizeComputePipeline {
                 entries: &entries,
             });
 
-        // Group 1: aux_image (rw), aux_data (read)
-        let aux_entries: Vec<wgpu::BindGroupLayoutEntry> = [false, true]
+        // Group 1: aux_image (rw), aux_data (read), debug_image (rw)
+        let aux_entries: Vec<wgpu::BindGroupLayoutEntry> = [false, true, false]
             .iter()
             .enumerate()
             .map(|(i, &ro)| rmesh_tile::storage_entry(i as u32, ro))
@@ -2220,12 +2222,23 @@ impl RasterizeComputePipeline {
             mapped_at_creation: false,
         });
 
+        // Debug stats buffer: 4 u32 per pixel (ray_miss, ghost, occluded, useful)
+        let debug_image = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rasterize_debug_image"),
+            size: (width as u64) * (height as u64) * 4 * 4, // 4 × u32 per pixel
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
         let aux_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rasterize_aux_bg_default"),
             layout: &aux_bind_group_layout,
             entries: &[
                 buf_entry(0, &aux_image),
                 buf_entry(1, &aux_data_dummy),
+                buf_entry(2, &debug_image),
             ],
         });
 
@@ -2235,6 +2248,7 @@ impl RasterizeComputePipeline {
             aux_bind_group_layout,
             rendered_image,
             aux_image,
+            debug_image,
             aux_bind_group,
             width,
             height,

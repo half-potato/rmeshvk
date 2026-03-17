@@ -900,6 +900,236 @@ async fn gpu_tiled_render_scene_async(
 }
 
 // ---------------------------------------------------------------------------
+// GPU tiled forward pipeline with overdraw stats readback
+// ---------------------------------------------------------------------------
+
+/// Overdraw stats per pixel: [ray_miss, ghost, occluded, useful].
+pub type OverdrawStats = [u32; 4];
+
+/// Run the GPU tiled forward pipeline and read back both the color image
+/// and the per-pixel overdraw debug stats.
+/// Returns None if no GPU adapter is available.
+pub fn gpu_tiled_render_with_stats(
+    scene: &SceneData,
+    cam_pos: Vec3,
+    vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
+    w: u32,
+    h: u32,
+) -> Option<(Vec<[f32; 4]>, Vec<OverdrawStats>)> {
+    pollster::block_on(gpu_tiled_render_with_stats_async(scene, cam_pos, vp, c2w, intrinsics, w, h))
+}
+
+async fn gpu_tiled_render_with_stats_async(
+    scene: &SceneData,
+    cam_pos: Vec3,
+    vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
+    w: u32,
+    h: u32,
+) -> Option<(Vec<[f32; 4]>, Vec<OverdrawStats>)> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .ok()?;
+
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
+                required_limits: wgpu::Limits {
+                    max_storage_buffers_per_shader_stage: 16,
+                    max_storage_buffer_binding_size: 1 << 30,
+                    max_buffer_size: 1 << 30,
+                    ..wgpu::Limits::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()?;
+
+    let tile_size = 12u32;
+
+    // Forward compute setup
+    let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
+    let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
+        rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
+
+    let uniforms = rmesh_render::make_uniforms(
+        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0,
+    );
+    queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+
+    // Run forward compute
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    rmesh_render::record_project_compute(
+        &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // Tile pipeline setup
+    let tile_pipelines = rmesh_tile::TilePipelines::new(&device);
+    let radix_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 2);
+    let tile_buffers = rmesh_tile::TileBuffers::new(&device, scene.tet_count, w, h, tile_size);
+    let sorting_bits = rmesh_sort::sorting_bits_for_tiles(tile_buffers.num_tiles);
+    let radix_state = rmesh_sort::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
+    radix_state.upload_configs(&queue);
+
+    let scan_pipelines = rmesh_tile::ScanPipelines::new(&device);
+    let scan_buffers = rmesh_tile::ScanBuffers::new(&device, scene.tet_count);
+
+    let tile_uni = rmesh_util::shared::TileUniforms {
+        screen_width: w,
+        screen_height: h,
+        tile_size,
+        tiles_x: tile_buffers.tiles_x,
+        tiles_y: tile_buffers.tiles_y,
+        num_tiles: tile_buffers.num_tiles,
+        visible_tet_count: 0,
+        _pad: [0; 5],
+    };
+    queue.write_buffer(&tile_buffers.tile_uniforms, 0, bytemuck::bytes_of(&tile_uni));
+
+    // Create bind groups
+    let prepare_dispatch_bg = rmesh_tile::create_prepare_dispatch_bind_group(
+        &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
+    );
+    let rts_bg = rmesh_tile::create_rts_bind_group(
+        &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
+    );
+    let tile_fill_bg = rmesh_tile::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
+    let tile_gen_scan_bg = rmesh_tile::create_tile_gen_scan_bind_group(
+        &device, &scan_pipelines, &tile_buffers,
+        &buffers.uniforms, &buffers.vertices, &buffers.indices,
+        &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
+        &scan_buffers, &radix_state.num_keys_buf,
+    );
+
+    let tile_ranges_bg_a = rmesh_tile::create_tile_ranges_bind_group_with_keys(
+        &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+    );
+    let tile_ranges_bg_b = rmesh_tile::create_tile_ranges_bind_group_with_keys(
+        &device, &tile_pipelines, &radix_state.keys_b,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+    );
+
+    // Forward tiled pipeline
+    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, w, h, 0);
+    let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
+        &device, &rasterize, &buffers.uniforms,
+        &buffers.vertices, &buffers.indices, &material.colors,
+        &buffers.densities, &material.color_grads,
+        &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+    );
+    let rasterize_bg_b = rmesh_render::create_rasterize_bind_group(
+        &device, &rasterize, &buffers.uniforms,
+        &buffers.vertices, &buffers.indices, &material.colors,
+        &buffers.densities, &material.color_grads,
+        &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+    );
+
+    // Dispatch tiled forward pipeline
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    encoder.clear_buffer(&rasterize.rendered_image, 0, None);
+    encoder.clear_buffer(&rasterize.debug_image, 0, None);
+    encoder.clear_buffer(&tile_buffers.tile_ranges, 0, None);
+
+    // 1. Scan-based tile pipeline
+    rmesh_tile::record_scan_tile_pipeline(
+        &mut encoder, &scan_pipelines, &tile_pipelines,
+        &prepare_dispatch_bg, &rts_bg,
+        &tile_fill_bg, &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
+    );
+
+    // 2. Radix sort
+    let result_in_b = rmesh_sort::record_radix_sort(
+        &mut encoder, &device, &radix_pipelines, &radix_state,
+        &tile_buffers.tile_sort_keys, &tile_buffers.tile_sort_values,
+    );
+
+    // 3. Tile ranges
+    {
+        let ranges_bg = if result_in_b { &tile_ranges_bg_b } else { &tile_ranges_bg_a };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tile_ranges"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&tile_pipelines.tile_ranges_pipeline);
+        pass.set_bind_group(0, ranges_bg, &[]);
+        let wgs = (tile_buffers.max_pairs_pow2 + 255) / 256;
+        pass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
+    }
+
+    // 4. Forward tiled
+    {
+        let fwd_bg = if result_in_b { &rasterize_bg_b } else { &rasterize_bg_a };
+        rmesh_render::record_rasterize_compute(&mut encoder, &rasterize, fwd_bg, tile_buffers.num_tiles);
+    }
+
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // Read back rendered image + debug stats
+    let pixel_count = (w * h) as usize;
+    let img_size = (pixel_count as u64) * 4 * 4;
+    let readback_img = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback_img"),
+        size: img_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let readback_dbg = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback_dbg"),
+        size: img_size, // same size: 4 × u32 per pixel
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    encoder.copy_buffer_to_buffer(&rasterize.rendered_image, 0, &readback_img, 0, img_size);
+    encoder.copy_buffer_to_buffer(&rasterize.debug_image, 0, &readback_dbg, 0, img_size);
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // Map image buffer
+    let slice_img = readback_img.slice(..);
+    let (tx1, rx1) = std::sync::mpsc::channel();
+    slice_img.map_async(wgpu::MapMode::Read, move |r| { tx1.send(r).unwrap(); });
+    let slice_dbg = readback_dbg.slice(..);
+    let (tx2, rx2) = std::sync::mpsc::channel();
+    slice_dbg.map_async(wgpu::MapMode::Read, move |r| { tx2.send(r).unwrap(); });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    rx1.recv().unwrap().ok()?;
+    rx2.recv().unwrap().ok()?;
+
+    let img_data = slice_img.get_mapped_range();
+    let floats: &[f32] = bytemuck::cast_slice(&img_data);
+    let mut image = vec![[0.0f32; 4]; pixel_count];
+    for i in 0..pixel_count {
+        image[i] = [floats[i * 4], floats[i * 4 + 1], floats[i * 4 + 2], floats[i * 4 + 3]];
+    }
+    drop(img_data);
+    readback_img.unmap();
+
+    let dbg_data = slice_dbg.get_mapped_range();
+    let uints: &[u32] = bytemuck::cast_slice(&dbg_data);
+    let mut stats = vec![[0u32; 4]; pixel_count];
+    for i in 0..pixel_count {
+        stats[i] = [uints[i * 4], uints[i * 4 + 1], uints[i * 4 + 2], uints[i * 4 + 3]];
+    }
+    drop(dbg_data);
+    readback_dbg.unmap();
+
+    Some((image, stats))
+}
+
+// ---------------------------------------------------------------------------
 // Test scene builders
 // ---------------------------------------------------------------------------
 

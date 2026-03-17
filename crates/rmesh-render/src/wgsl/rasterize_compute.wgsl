@@ -70,12 +70,14 @@ const SM_AUX_SIZE: u32 = /*SM_AUX_SIZE*/1u;
 
 @group(1) @binding(0) var<storage, read_write> aux_image: array<f32>;
 @group(1) @binding(1) var<storage, read> aux_data: array<f32>;
+@group(1) @binding(2) var<storage, read_write> debug_image: array<u32>;
 
 // Workgroup shared memory
 var<workgroup> sm_color: array<vec4<f32>, 256>;  // .xyz = color_accum, .w = log_t
 var<workgroup> sm_nd: array<vec4<f32>, 256>;     // .xyz = normal_accum, .w = depth_accum
 var<workgroup> sm_ent: array<vec4<f32>, 256>;    // entropy (4 components)
 var<workgroup> sm_aux: array<f32, SM_AUX_SIZE>;  // variable aux [256 * AUX_DIM]
+var<workgroup> sm_stats: array<vec4<u32>, 256>;  // [ray_miss, ghost, occluded, useful]
 var<workgroup> sm_xl: array<i32, 16>;             // scanline left x per row
 var<workgroup> sm_xr: array<i32, 16>;             // scanline right x per row
 var<workgroup> sm_prefix: array<u32, 17>;          // prefix sum of row widths
@@ -123,6 +125,7 @@ fn main(
         sm_color[i] = vec4<f32>(0.0);
         sm_nd[i] = vec4<f32>(0.0);
         sm_ent[i] = vec4<f32>(0.0);
+        sm_stats[i] = vec4<u32>(0u);
     }
     // Initialize aux shared memory
     for (var i = lane; i < TS * TS * AUX_DIM; i += 32u) {
@@ -246,8 +249,18 @@ fn main(
             // the 3D ray-tet intersection correctly handles.
             if (xl_f <= xr_f) {
                 let eps = 0.001;
-                let xl_i = max(i32(ceil(xl_f - 0.5 - eps)), 0);
-                let xr_i = min(i32(floor(xr_f - 0.5 + eps)), i32(TS) - 1);
+                var xl_i = max(i32(ceil(xl_f - 0.5 - eps)), 0);
+                var xr_i = min(i32(floor(xr_f - 0.5 + eps)), i32(TS) - 1);
+
+                // Trim saturated pixels from row edges.
+                // Pixels with T_j < 1e-6 can't contribute — exclude from work distribution.
+                while (xl_i <= xr_i && sm_color[lane * TS + u32(xl_i)].w < -13.8) {
+                    xl_i++;
+                }
+                while (xr_i >= xl_i && sm_color[lane * TS + u32(xr_i)].w < -13.8) {
+                    xr_i--;
+                }
+
                 if (xl_i <= xr_i) {
                     sm_xl[lane] = xl_i;
                     sm_xr[lane] = xr_i;
@@ -320,6 +333,13 @@ fn main(
                 continue;
             }
 
+            // Skip saturated pixels before expensive ray intersection.
+            // log_t < -13.8 means T_j = exp(log_t) < 1e-6.
+            if (sm_color[pixel_local].w < -13.8) {
+                sm_stats[pixel_local].z += 1u; // occluded
+                continue;
+            }
+
             // Compute ray direction from camera intrinsics (matches camera.slang get_ray):
             let dir_cam = normalize(vec3<f32>(
                 (f32(px) + 0.5 - cx_cam) / fx,
@@ -367,7 +387,16 @@ fn main(
                 }
             }
 
-            if (valid && t_min_val < t_max_val) {
+            if (!(valid && t_min_val < t_max_val)) {
+                // Ray miss: scanline covers pixel but ray doesn't hit tet.
+                // Classify: degenerate slab (thin tet, t_min ≈ t_max) vs true miss.
+                if (valid && (t_min_val - t_max_val) < 0.01) {
+                    // Degenerate: valid slab but t_min >= t_max by a tiny margin
+                    sm_stats[pixel_local].z += 1u; // reuse occluded slot
+                } else {
+                    sm_stats[pixel_local].x += 1u;
+                }
+            } else {
                 // Volume integral
                 let base_offset = dot(grad_vec, ray_o - verts[0]);
                 let base_color = colors_tet + vec3<f32>(base_offset);
@@ -389,6 +418,17 @@ fn main(
                 // Composite color into shared memory
                 let state = sm_color[pixel_local];
                 let T_j = safe_exp_f32(state.w);
+
+                if (od < 0.01) {
+                    // Ghost: valid intersection but near-zero optical depth
+                    sm_stats[pixel_local].y += 1u;
+                } else if (T_j < 1e-6) {
+                    // Occluded: decent density but pixel already saturated
+                    sm_stats[pixel_local].z += 1u;
+                } else {
+                    // Useful: contributes meaningful color
+                    sm_stats[pixel_local].w += 1u;
+                }
 
                 // Early termination: pixel fully opaque, skip all writes
                 if (T_j >= 1e-6) {
@@ -464,6 +504,14 @@ fn main(
             for (var ai = 0u; ai < AUX_DIM; ai++) {
                 aux_image[aux_base + 8u + ai] = sm_aux[i * AUX_DIM + ai];
             }
+
+            // Debug stats: [ray_miss, ghost, occluded, useful] per pixel
+            let stats = sm_stats[i];
+            let dbg_base = pixel_idx * 4u;
+            debug_image[dbg_base + 0u] = stats.x;
+            debug_image[dbg_base + 1u] = stats.y;
+            debug_image[dbg_base + 2u] = stats.z;
+            debug_image[dbg_base + 3u] = stats.w;
         }
     }
 }
