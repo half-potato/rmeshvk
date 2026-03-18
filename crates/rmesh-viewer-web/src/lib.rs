@@ -333,6 +333,9 @@ impl WebViewer {
             scene.tet_count,
             &self.queue,
             &self.primitive_targets.depth_view,
+            None,
+            false,
+            None, None, None,
         );
 
         // Blit directly — no compositor needed

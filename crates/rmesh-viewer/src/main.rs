@@ -32,11 +32,12 @@ use wgpu::util::DeviceExt;
 
 use rayon::prelude::*;
 use rmesh_render::{
-    create_compute_bind_group, create_render_bind_group,
+    create_compute_bind_group, create_hw_compute_bind_group, create_render_bind_group,
     create_render_bind_group_with_sort_values, BlitPipeline, ForwardPipelines, MaterialBuffers,
     MeshForwardPipelines, RenderTargets, SceneBuffers, Uniforms, create_blit_bind_group,
     create_indirect_convert_bind_group, create_mesh_render_bind_group,
     create_mesh_render_bind_group_with_sort_values, record_blit,
+    create_prepass_bind_group, create_quad_render_bind_group,
 };
 use rmesh_compositor::{
     PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets,
@@ -80,6 +81,7 @@ struct GpuState {
     material_buffers: MaterialBuffers,
     targets: RenderTargets,
     compute_bg: wgpu::BindGroup,
+    hw_compute_bg: wgpu::BindGroup,
     render_bg: wgpu::BindGroup,
     render_bg_b: wgpu::BindGroup,
     blit_bg: wgpu::BindGroup,
@@ -96,6 +98,11 @@ struct GpuState {
     mesh_render_bg_a: Option<wgpu::BindGroup>,
     mesh_render_bg_b: Option<wgpu::BindGroup>,
     indirect_convert_bg: Option<wgpu::BindGroup>,
+    // Quad prepass bind groups (A/B for sort result location)
+    prepass_bg_a: wgpu::BindGroup,
+    prepass_bg_b: wgpu::BindGroup,
+    // Quad render bind group (no A/B needed — only reads uniforms + precomputed)
+    quad_render_bg: wgpu::BindGroup,
     // Fluid simulation
     fluid_sim: Option<FluidSim>,
     tet_neighbors_buf: Option<wgpu::Buffer>,
@@ -106,6 +113,9 @@ struct GpuState {
     // egui
     egui_renderer: egui_wgpu::Renderer,
     egui_state: egui_winit::State,
+    // Instance count readback (for debugging)
+    instance_count_readback: wgpu::Buffer,
+    visible_instance_count: u32,
 }
 
 struct App {
@@ -131,8 +141,9 @@ struct App {
     // Fluid simulation
     fluid_enabled: bool,
     fluid_params: FluidParams,
-    // Compositor
+    // Rendering options
     show_primitives: bool,
+    use_quad_shader: bool,
     // Transform interaction
     interaction: TransformInteraction,
     primitives: Vec<Primitive>,
@@ -170,6 +181,7 @@ impl App {
             fluid_enabled: false,
             fluid_params: FluidParams::default(),
             show_primitives: false,
+            use_quad_shader: false,
             interaction: TransformInteraction::new(),
             primitives: Vec::new(),
             next_primitive_id: 1,
@@ -459,6 +471,7 @@ impl App {
         // Fluid simulation: lazily initialized when first enabled (saves ~500MB GPU memory)
 
         let compute_bg = create_compute_bind_group(&device, &pipelines, &buffers, &material);
+        let hw_compute_bg = create_hw_compute_bind_group(&device, &pipelines, &buffers, &material);
         let render_bg = create_render_bind_group(&device, &pipelines, &buffers, &material);
         let render_bg_b = create_render_bind_group_with_sort_values(
             &device,
@@ -481,12 +494,31 @@ impl App {
                 (None, None, None)
             };
 
+        // Quad prepass + render bind groups (A/B for sort result location)
+        let prepass_bg_a = create_prepass_bind_group(
+            &device, &pipelines, &buffers, &material, &buffers.sort_values,
+        );
+        let prepass_bg_b = create_prepass_bind_group(
+            &device, &pipelines, &buffers, &material, &sort_state.values_b,
+        );
+        let quad_render_bg = create_quad_render_bind_group(
+            &device, &pipelines, &buffers,
+        );
+
         let blit_bg = create_blit_bind_group(&device, &blit_pipeline, &targets.color_view);
 
         // Primitive setup (depth used for hardware early-z culling in forward pass)
         let primitive_geometry = PrimitiveGeometry::new(&device);
         let primitive_pipeline = PrimitivePipeline::new(&device);
         let primitive_targets = PrimitiveTargets::new(&device, size.width.max(1), size.height.max(1));
+
+        // Instance count readback buffer
+        let instance_count_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("instance_count_readback"),
+            size: 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
 
         // egui setup
         let egui_renderer = egui_wgpu::Renderer::new(
@@ -518,6 +550,7 @@ impl App {
             material_buffers: material,
             targets,
             compute_bg,
+            hw_compute_bg,
             render_bg,
             render_bg_b,
             blit_bg,
@@ -532,6 +565,9 @@ impl App {
             mesh_render_bg_a,
             mesh_render_bg_b,
             indirect_convert_bg,
+            prepass_bg_a,
+            prepass_bg_b,
+            quad_render_bg,
             fluid_sim: None,
             tet_neighbors_buf: None,
             primitive_geometry,
@@ -539,6 +575,8 @@ impl App {
             primitive_targets,
             egui_renderer,
             egui_state,
+            instance_count_readback,
+            visible_instance_count: 0,
         });
     }
 
@@ -588,6 +626,7 @@ impl App {
         let vp_cols = vp.to_cols_array_2d();
         let pos = self.camera.position.to_array();
         let fps = self.fps;
+        let visible_count = self.gpu.as_ref().map_or(0, |g| g.visible_instance_count);
 
         let gpu = self.gpu.as_mut().unwrap();
 
@@ -664,6 +703,7 @@ impl App {
         let mesh_shader_supported = self.mesh_shader_supported;
         let mut fluid_enabled = self.fluid_enabled;
         let mut show_primitives = self.show_primitives;
+        let mut use_quad_shader = self.use_quad_shader;
         let mut fluid_reset = false;
         let fluid_params = &mut self.fluid_params;
         let interact_display = self.interaction.display_info();
@@ -701,13 +741,14 @@ impl App {
                             mesh_shader_supported,
                             egui::Checkbox::new(&mut use_mesh_shader, "Mesh Shader"),
                         );
+                        ui.checkbox(&mut use_quad_shader, "Quad Shader");
                         ui.checkbox(&mut fluid_enabled, "Fluid Sim");
                         ui.checkbox(&mut show_primitives, "Show Primitives");
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(format!(
-                            "FPS: {:.0}  |  {} tets  |  {}x{}",
-                            fps, tet_count, w, h
+                            "FPS: {:.0}  |  {} visible / {} tets  |  {}x{}",
+                            fps, visible_count, tet_count, w, h
                         ));
                     });
                 });
@@ -813,6 +854,7 @@ impl App {
             gpu.pending_reconfigure = true;
         }
         self.use_mesh_shader = use_mesh_shader;
+        self.use_quad_shader = use_quad_shader;
         self.fluid_enabled = fluid_enabled;
         self.show_primitives = show_primitives;
 
@@ -1022,6 +1064,7 @@ impl App {
                 gpu.tet_count,
                 &gpu.queue,
                 &gpu.primitive_targets.depth_view,
+                Some(&gpu.hw_compute_bg),
             );
         } else {
             rmesh_render::record_sorted_forward_pass(
@@ -1038,8 +1081,20 @@ impl App {
                 gpu.tet_count,
                 &gpu.queue,
                 &gpu.primitive_targets.depth_view,
+                Some(&gpu.hw_compute_bg),
+                self.use_quad_shader,
+                Some(&gpu.prepass_bg_a),
+                Some(&gpu.prepass_bg_b),
+                Some(&gpu.quad_render_bg),
             );
         }
+
+        // Copy instance_count (offset 4 in DrawIndirectArgs) to readback buffer
+        encoder.copy_buffer_to_buffer(
+            &gpu.buffers.indirect_args, 4,
+            &gpu.instance_count_readback, 0,
+            4,
+        );
 
         // 3. Blit directly — no compositor needed
         record_blit(&mut encoder, &gpu.blit_pipeline, &gpu.blit_bg, &view);
@@ -1064,6 +1119,17 @@ impl App {
         }
 
         gpu.queue.submit(std::iter::once(encoder.finish()));
+
+        // Readback visible instance count (blocking, but only 4 bytes)
+        {
+            let slice = gpu.instance_count_readback.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            gpu.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let data = slice.get_mapped_range();
+            gpu.visible_instance_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            drop(data);
+            gpu.instance_count_readback.unmap();
+        }
 
         // Free egui textures after submit
         for id in &full_output.textures_delta.free {
@@ -1178,6 +1244,12 @@ impl App {
                 &gpu.buffers,
                 &gpu.material_buffers,
             );
+            gpu.hw_compute_bg = create_hw_compute_bind_group(
+                &gpu.device,
+                &gpu.pipelines,
+                &gpu.buffers,
+                &gpu.material_buffers,
+            );
             gpu.render_bg = create_render_bind_group(
                 &gpu.device,
                 &gpu.pipelines,
@@ -1190,6 +1262,19 @@ impl App {
                 &gpu.buffers,
                 &gpu.material_buffers,
                 &gpu.sort_state.values_b,
+            );
+
+            // Recreate quad prepass + render bind groups
+            gpu.prepass_bg_a = create_prepass_bind_group(
+                &gpu.device, &gpu.pipelines, &gpu.buffers, &gpu.material_buffers,
+                &gpu.buffers.sort_values,
+            );
+            gpu.prepass_bg_b = create_prepass_bind_group(
+                &gpu.device, &gpu.pipelines, &gpu.buffers, &gpu.material_buffers,
+                &gpu.sort_state.values_b,
+            );
+            gpu.quad_render_bg = create_quad_render_bind_group(
+                &gpu.device, &gpu.pipelines, &gpu.buffers,
             );
 
             // Recreate mesh shader bind groups

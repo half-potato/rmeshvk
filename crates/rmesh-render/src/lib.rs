@@ -29,6 +29,9 @@ pub use rmesh_tile::{
 
 // WGSL shader sources, embedded from crate-local files.
 const PROJECT_COMPUTE_WGSL: &str = include_str!("wgsl/project_compute.wgsl");
+const PROJECT_COMPUTE_HW_WGSL: &str = include_str!("wgsl/project_compute_hw.wgsl");
+const FORWARD_VERTEX_QUAD_WGSL: &str = include_str!("wgsl/forward_vertex_quad.wgsl");
+const FORWARD_PREPASS_COMPUTE_WGSL: &str = include_str!("wgsl/forward_prepass_compute.wgsl");
 const FORWARD_VERTEX_WGSL: &str = include_str!("wgsl/forward_vertex.wgsl");
 const FORWARD_FRAGMENT_WGSL: &str = include_str!("wgsl/forward_fragment.wgsl");
 const TEX_TO_BUFFER_WGSL: &str = include_str!("wgsl/tex_to_buffer.wgsl");
@@ -67,6 +70,8 @@ pub struct SceneBuffers {
     pub compact_tet_ids: wgpu::Buffer,
     /// Mesh shader indirect dispatch args [3] u32 (x, y, z workgroup counts)
     pub mesh_indirect_args: wgpu::Buffer,
+    /// Precomputed per-tet data for quad renderer [M × 8] vec4<f32> (128 bytes/tet)
+    pub precomputed: wgpu::Buffer,
 }
 
 /// GPU buffers for per-tet material/appearance data (pluggable per rendering mode).
@@ -167,6 +172,14 @@ impl SceneBuffers {
                 | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Precomputed buffer: 10 × vec4<f32> = 160 bytes per tet
+        let precomputed = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("precomputed"),
+            size: m * 10 * 16, // 160 bytes per tet
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
         Self {
             vertices,
             indices,
@@ -179,6 +192,7 @@ impl SceneBuffers {
             tiles_touched,
             compact_tet_ids,
             mesh_indirect_args,
+            precomputed,
         }
     }
 }
@@ -234,8 +248,18 @@ impl MaterialBuffers {
 pub struct ForwardPipelines {
     pub compute_pipeline: wgpu::ComputePipeline,
     pub compute_bind_group_layout: wgpu::BindGroupLayout,
+    /// Lean HW-only projection compute (no tile counting)
+    pub hw_compute_pipeline: wgpu::ComputePipeline,
+    pub hw_compute_bind_group_layout: wgpu::BindGroupLayout,
     pub render_pipeline: wgpu::RenderPipeline,
     pub render_bind_group_layout: wgpu::BindGroupLayout,
+    /// Quad-based render pipeline (4 verts/tet via triangle strip, reads precomputed buffer)
+    pub quad_render_pipeline: wgpu::RenderPipeline,
+    /// Bind group layout for quad render (6 bindings: uniforms, precomputed, sorted_indices, colors, densities, color_grads)
+    pub quad_render_bg_layout: wgpu::BindGroupLayout,
+    /// Compute prepass pipeline (precomputes clip positions + normals for quad path)
+    pub prepass_compute_pipeline: wgpu::ComputePipeline,
+    pub prepass_bg_layout: wgpu::BindGroupLayout,
 }
 
 /// Helper: create N storage buffer layout entries for the given visibility.
@@ -300,6 +324,45 @@ impl ForwardPipelines {
                 label: Some("project_compute_pipeline"),
                 layout: Some(&compute_pipeline_layout),
                 module: &compute_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // ----- HW projection compute pipeline (9 bindings, no tile work) -----
+        // Bindings: uniforms(r), vertices(r), indices(r), circumdata(r),
+        //           sort_keys(rw), sort_values(rw), indirect_args(rw),
+        //           colors(rw), base_colors(r)
+        let hw_compute_read_only = [
+            true, true, true, true, // 0-3 read-only
+            false, false, false,    // 4-6 read-write
+            false, true,            // 7-8: colors(rw), base_colors(r)
+        ];
+        let hw_compute_entries = storage_entries(
+            9,
+            wgpu::ShaderStages::COMPUTE,
+            &hw_compute_read_only,
+        );
+        let hw_compute_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("hw_compute_bind_group_layout"),
+                entries: &hw_compute_entries,
+            });
+        let hw_compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("hw_compute_pipeline_layout"),
+                bind_group_layouts: &[&hw_compute_bind_group_layout],
+                immediate_size: 0,
+            });
+        let hw_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("project_compute_hw.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(PROJECT_COMPUTE_HW_WGSL.into()),
+        });
+        let hw_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("project_compute_hw_pipeline"),
+                layout: Some(&hw_compute_pipeline_layout),
+                module: &hw_compute_shader,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: None,
@@ -411,11 +474,140 @@ impl ForwardPipelines {
                 cache: None,
             });
 
+        // ----- Prepass compute pipeline (9 bindings) -----
+        // Bindings: uniforms(r), vertices(r), indices(r), sorted_indices(r),
+        //           indirect_args(r), precomputed(rw), colors(r), densities(r), color_grads(r)
+        let prepass_read_only = [
+            true, true, true, true, true, // 0-4 read-only
+            false,                         // 5 read-write (precomputed)
+            true, true, true,              // 6-8 read-only (colors, densities, color_grads)
+        ];
+        let prepass_entries = storage_entries(
+            9,
+            wgpu::ShaderStages::COMPUTE,
+            &prepass_read_only,
+        );
+        let prepass_bg_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("prepass_bg_layout"),
+                entries: &prepass_entries,
+            });
+        let prepass_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("prepass_pipeline_layout"),
+                bind_group_layouts: &[&prepass_bg_layout],
+                immediate_size: 0,
+            });
+        let prepass_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("forward_prepass_compute.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(FORWARD_PREPASS_COMPUTE_WGSL.into()),
+        });
+        let prepass_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("prepass_compute_pipeline"),
+                layout: Some(&prepass_pipeline_layout),
+                module: &prepass_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // ----- Quad render bind group layout (2 bindings, reads precomputed buffer) -----
+        // Bindings: uniforms(r), precomputed(r)
+        // Vertex shader reads only precomputed. Fragment shader reads uniforms for intrinsics.
+        let quad_render_read_only = [true; 2];
+        let quad_render_entries = storage_entries(
+            2,
+            wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            &quad_render_read_only,
+        );
+        let quad_render_bg_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("quad_render_bg_layout"),
+                entries: &quad_render_entries,
+            });
+        let quad_render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("quad_render_pipeline_layout"),
+                bind_group_layouts: &[&quad_render_bg_layout],
+                immediate_size: 0,
+            });
+
+        // Quad-based render pipeline (triangle strip, 4 verts/tet)
+        // Shares forward_fragment.wgsl — vertex output matches exactly.
+        let quad_vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("forward_vertex_quad.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(FORWARD_VERTEX_QUAD_WGSL.into()),
+        });
+        let quad_render_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("forward_quad_render_pipeline"),
+                layout: Some(&quad_render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &quad_vertex_shader,
+                    entry_point: Some("main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None, // No face culling — quad is screen-aligned
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &fragment_shader,
+                    entry_point: Some("main"),
+                    targets: &[
+                        Some(wgpu::ColorTargetState {
+                            format: color_format,
+                            blend: Some(premul_blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: color_format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: color_format,
+                            blend: Some(premul_blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: color_format,
+                            blend: Some(premul_blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                    ],
+                    compilation_options: Default::default(),
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+
         Self {
             compute_pipeline,
             compute_bind_group_layout,
+            hw_compute_pipeline,
+            hw_compute_bind_group_layout,
             render_pipeline,
             render_bind_group_layout,
+            quad_render_pipeline,
+            quad_render_bg_layout,
+            prepass_compute_pipeline,
+            prepass_bg_layout,
         }
     }
 }
@@ -906,6 +1098,34 @@ pub fn create_compute_bind_group(
     })
 }
 
+/// Create the HW projection compute bind group (7 bindings, no tile data).
+///
+/// Binding order matches `project_compute_hw.wgsl`:
+///   0: uniforms, 1: vertices, 2: indices, 3: circumdata,
+///   4: sort_keys, 5: sort_values, 6: indirect_args
+pub fn create_hw_compute_bind_group(
+    device: &wgpu::Device,
+    pipelines: &ForwardPipelines,
+    buffers: &SceneBuffers,
+    material: &MaterialBuffers,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hw_compute_bind_group"),
+        layout: &pipelines.hw_compute_bind_group_layout,
+        entries: &[
+            buf_entry(0, &buffers.uniforms),
+            buf_entry(1, &buffers.vertices),
+            buf_entry(2, &buffers.indices),
+            buf_entry(3, &buffers.circumdata),
+            buf_entry(4, &buffers.sort_keys),
+            buf_entry(5, &buffers.sort_values),
+            buf_entry(6, &buffers.indirect_args),
+            buf_entry(7, &material.colors),
+            buf_entry(8, &material.base_colors),
+        ],
+    })
+}
+
 /// Create the render bind group (7 bindings).
 ///
 /// Binding order matches `forward_vertex.wgsl`:
@@ -955,6 +1175,54 @@ pub fn create_render_bind_group_with_sort_values(
             buf_entry(4, &buffers.densities),
             buf_entry(5, &material.color_grads),
             buf_entry(6, sort_values),
+        ],
+    })
+}
+
+/// Create a prepass compute bind group (9 bindings).
+///
+/// Binding order matches `forward_prepass_compute.wgsl`:
+///   0: uniforms, 1: vertices, 2: indices, 3: sorted_indices,
+///   4: indirect_args, 5: precomputed, 6: colors, 7: densities, 8: color_grads
+pub fn create_prepass_bind_group(
+    device: &wgpu::Device,
+    pipelines: &ForwardPipelines,
+    buffers: &SceneBuffers,
+    material: &MaterialBuffers,
+    sorted_indices: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("prepass_bind_group"),
+        layout: &pipelines.prepass_bg_layout,
+        entries: &[
+            buf_entry(0, &buffers.uniforms),
+            buf_entry(1, &buffers.vertices),
+            buf_entry(2, &buffers.indices),
+            buf_entry(3, sorted_indices),
+            buf_entry(4, &buffers.indirect_args),
+            buf_entry(5, &buffers.precomputed),
+            buf_entry(6, &material.colors),
+            buf_entry(7, &buffers.densities),
+            buf_entry(8, &material.color_grads),
+        ],
+    })
+}
+
+/// Create a quad render bind group (2 bindings).
+///
+/// Binding order matches `forward_vertex_quad.wgsl`:
+///   0: uniforms, 1: precomputed
+pub fn create_quad_render_bind_group(
+    device: &wgpu::Device,
+    pipelines: &ForwardPipelines,
+    buffers: &SceneBuffers,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("quad_render_bind_group"),
+        layout: &pipelines.quad_render_bg_layout,
+        entries: &[
+            buf_entry(0, &buffers.uniforms),
+            buf_entry(1, &buffers.precomputed),
         ],
     })
 }
@@ -1296,10 +1564,15 @@ pub fn record_sorted_forward_pass(
     tet_count: u32,
     queue: &wgpu::Queue,
     depth_view: &wgpu::TextureView,
+    hw_compute_bg: Option<&wgpu::BindGroup>,
+    use_quad: bool,
+    prepass_bg_a: Option<&wgpu::BindGroup>,
+    prepass_bg_b: Option<&wgpu::BindGroup>,
+    quad_render_bg: Option<&wgpu::BindGroup>,
 ) {
     // ----- 1. Reset indirect args -----
     let reset_cmd = DrawIndirectCommand {
-        vertex_count: 12,
+        vertex_count: if use_quad { 4 } else { 12 },
         instance_count: 0,
         first_vertex: 0,
         first_instance: 0,
@@ -1313,13 +1586,19 @@ pub fn record_sorted_forward_pass(
     queue.write_buffer(&sort_state.num_keys_buf, 0, bytemuck::bytes_of(&n_pow2));
 
     // ----- 2. Compute pass -----
+    // Use lean HW projection shader when available (no tile counting work)
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("project_compute"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(&pipelines.compute_pipeline);
-        cpass.set_bind_group(0, compute_bg, &[]);
+        if let Some(hw_bg) = hw_compute_bg {
+            cpass.set_pipeline(&pipelines.hw_compute_pipeline);
+            cpass.set_bind_group(0, hw_bg, &[]);
+        } else {
+            cpass.set_pipeline(&pipelines.compute_pipeline);
+            cpass.set_bind_group(0, compute_bg, &[]);
+        }
 
         let workgroup_size = 64u32;
         let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
@@ -1335,8 +1614,36 @@ pub fn record_sorted_forward_pass(
         &buffers.sort_keys, &buffers.sort_values,
     );
 
+    // ----- 3.5. Compute prepass (quad path only) -----
+    if use_quad {
+        let prepass_bg = if result_in_b {
+            prepass_bg_b.expect("prepass_bg_b required for quad path")
+        } else {
+            prepass_bg_a.expect("prepass_bg_a required for quad path")
+        };
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("forward_prepass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipelines.prepass_compute_pipeline);
+        cpass.set_bind_group(0, prepass_bg, &[]);
+        // Dispatch enough threads: tet_count is upper bound on visible tets
+        let workgroup_size = 64u32;
+        let total_workgroups = (tet_count + workgroup_size - 1) / workgroup_size;
+        let max_per_dim = 65535u32;
+        let dispatch_x = total_workgroups.min(max_per_dim);
+        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    }
+
     // ----- 4. Render pass -----
-    let render_bg = if result_in_b { render_bg_b } else { render_bg_a };
+    let render_bg = if use_quad {
+        quad_render_bg.expect("quad_render_bg required for quad path")
+    } else if result_in_b {
+        render_bg_b
+    } else {
+        render_bg_a
+    };
     {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("forward_render"),
@@ -1417,7 +1724,11 @@ pub fn record_sorted_forward_pass(
             1.0,
         );
         rpass.set_scissor_rect(0, 0, targets.width, targets.height);
-        rpass.set_pipeline(&pipelines.render_pipeline);
+        if use_quad {
+            rpass.set_pipeline(&pipelines.quad_render_pipeline);
+        } else {
+            rpass.set_pipeline(&pipelines.render_pipeline);
+        }
         rpass.set_bind_group(0, render_bg, &[]);
 
         rpass.draw_indirect(&buffers.indirect_args, 0);
@@ -1448,6 +1759,7 @@ pub fn record_sorted_mesh_forward_pass(
     tet_count: u32,
     queue: &wgpu::Queue,
     depth_view: &wgpu::TextureView,
+    hw_compute_bg: Option<&wgpu::BindGroup>,
 ) {
     // ----- 1. Reset indirect args -----
     let reset_cmd = DrawIndirectCommand {
@@ -1473,8 +1785,13 @@ pub fn record_sorted_mesh_forward_pass(
             label: Some("project_compute"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(&fwd_pipelines.compute_pipeline);
-        cpass.set_bind_group(0, compute_bg, &[]);
+        if let Some(hw_bg) = hw_compute_bg {
+            cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
+            cpass.set_bind_group(0, hw_bg, &[]);
+        } else {
+            cpass.set_pipeline(&fwd_pipelines.compute_pipeline);
+            cpass.set_bind_group(0, compute_bg, &[]);
+        }
 
         let workgroup_size = 64u32;
         let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;

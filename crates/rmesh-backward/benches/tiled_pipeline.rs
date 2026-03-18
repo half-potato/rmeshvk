@@ -820,6 +820,9 @@ fn run_forward_hw_rasterize(s: &BenchState) {
         s.tet_count,
         &s.queue,
         &s.dummy_depth_view,
+        None,
+        false,
+        None, None, None,
     );
 
     s.queue.submit(std::iter::once(encoder.finish()));

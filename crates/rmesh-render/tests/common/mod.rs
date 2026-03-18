@@ -488,6 +488,9 @@ async fn gpu_render_scene_async(
         scene.tet_count,
         &queue,
         &dummy_depth_view,
+        None,
+        false,
+        None, None, None,
     );
 
     // Copy color texture to readback buffer
