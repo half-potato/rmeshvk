@@ -74,6 +74,7 @@ struct GpuTimings {
     sh_eval_ms: f32,
     project_ms: f32,
     sort_ms: f32,
+    prepass_ms: f32,
     render_ms: f32,
     total_ms: f32,
 }
@@ -116,6 +117,7 @@ struct GpuState {
     blit_pipeline: BlitPipeline,
     sort_pipelines: rmesh_sort::RadixSortPipelines,
     sort_state: rmesh_sort::RadixSortState,
+    sort_backend: rmesh_sort::SortBackend,
     buffers: SceneBuffers,
     material_buffers: MaterialBuffers,
     targets: RenderTargets,
@@ -157,11 +159,14 @@ struct GpuState {
     ts_resolve_buf: wgpu::Buffer,
     ts_readback: [wgpu::Buffer; 2],
     ts_readback_ready: [std::sync::Arc<std::sync::atomic::AtomicBool>; 2],
+    ts_readback_mapped: [std::sync::Arc<std::sync::atomic::AtomicBool>; 2],
     ts_frame: usize,
     ts_period_ns: f32,
     gpu_times_ms: GpuTimings,
     cpu_times_ms: CpuTimings,
     instance_count_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// True from map_async call until unmap — prevents copy_buffer_to_buffer to a mapped buffer
+    instance_count_mapped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct App {
@@ -351,7 +356,7 @@ impl App {
 
         let surface = instance.create_surface(window.clone()).unwrap();
 
-        let (adapter, device, queue, mesh_shader_supported) = pollster::block_on(async {
+        let (adapter, device, queue, mesh_shader_supported, subgroup_supported) = pollster::block_on(async {
             let adapter = instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::HighPerformance,
@@ -365,10 +370,10 @@ impl App {
 
             let adapter_features = adapter.features();
             let backend = adapter.get_info().backend;
-            let subgroup_supported = adapter_features.contains(wgpu::Features::SUBGROUP)
-                && backend != wgpu::Backend::Metal; // naga MSL doesn't support subgroups yet
+            let subgroup_supported = adapter_features.contains(wgpu::Features::SUBGROUP);
             let mesh_shader_supported = subgroup_supported
-                && adapter_features.contains(wgpu::Features::EXPERIMENTAL_MESH_SHADER);
+                && adapter_features.contains(wgpu::Features::EXPERIMENTAL_MESH_SHADER)
+                && backend != wgpu::Backend::Metal; // naga MSL backend doesn't implement mesh shaders
             log::info!("Subgroup support: {}", subgroup_supported);
             log::info!("Mesh shader support: {}", mesh_shader_supported);
 
@@ -420,7 +425,7 @@ impl App {
                 .await
                 .expect("Failed to create device");
 
-            (adapter, device, queue, mesh_shader_supported)
+            (adapter, device, queue, mesh_shader_supported, subgroup_supported)
         });
         self.mesh_shader_supported = mesh_shader_supported;
         self.use_mesh_shader = mesh_shader_supported;
@@ -487,12 +492,17 @@ impl App {
 
         let targets = RenderTargets::new(&device, size.width.max(1), size.height.max(1));
 
-        // Radix sort state
-        log::info!("Creating radix sort pipelines...");
+        // Radix sort state — use DRS (subgroup-based) when available, else Basic
+        let sort_backend = if subgroup_supported {
+            rmesh_sort::SortBackend::Drs
+        } else {
+            rmesh_sort::SortBackend::Basic
+        };
+        log::info!("Creating radix sort pipelines (backend: {:?})...", sort_backend);
         let t0 = std::time::Instant::now();
-        let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);
+        let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1, sort_backend);
         let n_pow2 = (self.scene_data.tet_count as u32).next_power_of_two();
-        let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
+        let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, sort_backend);
         sort_state.upload_configs(&queue);
         log::info!("Sort pipelines: {:.2}s", t0.elapsed().as_secs_f64());
 
@@ -571,6 +581,8 @@ impl App {
         });
         let ts_readback_ready: [std::sync::Arc<std::sync::atomic::AtomicBool>; 2] =
             std::array::from_fn(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let ts_readback_mapped: [std::sync::Arc<std::sync::atomic::AtomicBool>; 2] =
+            std::array::from_fn(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
         // egui setup
         let egui_renderer = egui_wgpu::Renderer::new(
@@ -598,6 +610,7 @@ impl App {
             blit_pipeline,
             sort_pipelines,
             sort_state,
+            sort_backend,
             buffers,
             material_buffers: material,
             targets,
@@ -630,11 +643,13 @@ impl App {
             ts_resolve_buf,
             ts_readback,
             ts_readback_ready,
+            ts_readback_mapped,
             ts_frame: 0,
             ts_period_ns,
             gpu_times_ms: GpuTimings::default(),
             cpu_times_ms: CpuTimings::default(),
             instance_count_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            instance_count_mapped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
     }
 
@@ -706,15 +721,26 @@ impl App {
                 let p = gpu.ts_period_ns as f64 / 1_000_000.0; // convert to ms
 
                 let project = (ts[1].wrapping_sub(ts[0])) as f64 * p;
-                let sort = (ts[2].wrapping_sub(ts[1])) as f64 * p;
+                let prepass = (ts[3].wrapping_sub(ts[2])) as f64 * p;
+                // Sort has no dedicated timestamps — infer from gap:
+                //   project ends at ts[1], prepass starts at ts[2] (if quad),
+                //   render starts at ts[4]. Sort fills the gap between project and prepass/render.
+                let sort = if ts[2] > ts[1] && ts[2] < ts[4] {
+                    // Prepass present: sort = project_end → prepass_start
+                    (ts[2].wrapping_sub(ts[1])) as f64 * p
+                } else {
+                    // No prepass: sort = project_end → render_start
+                    (ts[4].wrapping_sub(ts[1])) as f64 * p
+                };
                 let render = (ts[5].wrapping_sub(ts[4])) as f64 * p;
                 let sh = (ts[7].wrapping_sub(ts[6])) as f64 * p;
-                let total = (ts[5].wrapping_sub(ts[6])) as f64 * p; // SH start → render end
+                let total = sh + project + sort + prepass + render;
 
                 gpu.gpu_times_ms = GpuTimings {
                     sh_eval_ms: sh as f32,
                     project_ms: project as f32,
                     sort_ms: sort as f32,
+                    prepass_ms: prepass as f32,
                     render_ms: render as f32,
                     total_ms: total as f32,
                 };
@@ -722,6 +748,7 @@ impl App {
                 drop(data);
                 gpu.ts_readback[prev].unmap();
                 gpu.ts_readback_ready[prev].store(false, Ordering::Release);
+                gpu.ts_readback_mapped[prev].store(false, Ordering::Release);
             }
 
             // Read previous frame's instance count
@@ -732,6 +759,7 @@ impl App {
                 drop(data);
                 gpu.instance_count_readback.unmap();
                 gpu.instance_count_ready.store(false, Ordering::Release);
+                gpu.instance_count_mapped.store(false, Ordering::Release);
             }
         }
         let t_after_poll = std::time::Instant::now();
@@ -848,12 +876,13 @@ impl App {
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(format!(
-                            "FPS: {:.0}  |  {} vis / {} tets  |  GPU: {:.1}ms (SH:{:.1} Proj:{:.1} Sort:{:.1} Rend:{:.1})  |  CPU: {:.1}ms (Poll:{:.1} Acq:{:.1} Egui:{:.1} Enc:{:.1} Sub:{:.1} Pres:{:.1})",
+                            "FPS: {:.0}  |  {} vis / {} tets  |  GPU: {:.1}ms (SH:{:.1} Proj:{:.1} Sort:{:.1} Pre:{:.1} Rend:{:.1})  |  CPU: {:.1}ms (Poll:{:.1} Acq:{:.1} Egui:{:.1} Enc:{:.1} Sub:{:.1} Pres:{:.1})",
                             fps, visible_count, tet_count,
                             gpu_times.total_ms,
                             gpu_times.sh_eval_ms,
                             gpu_times.project_ms,
                             gpu_times.sort_ms,
+                            gpu_times.prepass_ms,
                             gpu_times.render_ms,
                             cpu_times.total_ms,
                             cpu_times.poll_readback_ms,
@@ -1202,12 +1231,14 @@ impl App {
             );
         }
 
-        // Copy instance_count (offset 4 in DrawIndirectArgs) to readback buffer
-        encoder.copy_buffer_to_buffer(
-            &gpu.buffers.indirect_args, 4,
-            &gpu.instance_count_readback, 0,
-            4,
-        );
+        // Copy instance_count to readback — skip if buffer has a pending/completed map
+        if !gpu.instance_count_mapped.load(std::sync::atomic::Ordering::Acquire) {
+            encoder.copy_buffer_to_buffer(
+                &gpu.buffers.indirect_args, 4,
+                &gpu.instance_count_readback, 0,
+                4,
+            );
+        }
 
         // 3. Blit directly — no compositor needed
         record_blit(&mut encoder, &gpu.blit_pipeline, &gpu.blit_bg, &view);
@@ -1231,27 +1262,31 @@ impl App {
             gpu.egui_renderer.render(&mut rpass, &paint_jobs, &screen_desc);
         }
 
-        // Resolve GPU timestamps and copy to readback buffer
+        // Resolve GPU timestamps and copy to readback buffer (skip if target still mapped/pending)
         let cur_rb = gpu.ts_frame % 2;
-        encoder.resolve_query_set(
-            &gpu.ts_query_set,
-            0..TS_QUERY_COUNT,
-            &gpu.ts_resolve_buf,
-            0,
-        );
-        encoder.copy_buffer_to_buffer(
-            &gpu.ts_resolve_buf, 0,
-            &gpu.ts_readback[cur_rb], 0,
-            (TS_QUERY_COUNT as u64) * 8,
-        );
+        let ts_buf_free = !gpu.ts_readback_mapped[cur_rb].load(std::sync::atomic::Ordering::Acquire);
+        if ts_buf_free {
+            encoder.resolve_query_set(
+                &gpu.ts_query_set,
+                0..TS_QUERY_COUNT,
+                &gpu.ts_resolve_buf,
+                0,
+            );
+            encoder.copy_buffer_to_buffer(
+                &gpu.ts_resolve_buf, 0,
+                &gpu.ts_readback[cur_rb], 0,
+                (TS_QUERY_COUNT as u64) * 8,
+            );
+        }
 
         let t_before_submit = std::time::Instant::now();
         gpu.queue.submit(std::iter::once(encoder.finish()));
         let t_after_submit = std::time::Instant::now();
 
         // Async map of this frame's timestamp readback (will be ready next frame)
-        {
+        if ts_buf_free {
             use std::sync::atomic::Ordering;
+            gpu.ts_readback_mapped[cur_rb].store(true, Ordering::Release);
             let ready = gpu.ts_readback_ready[cur_rb].clone();
             gpu.ts_readback[cur_rb]
                 .slice(..)
@@ -1260,12 +1295,15 @@ impl App {
                         ready.store(true, Ordering::Release);
                     }
                 });
-            gpu.ts_frame += 1;
         }
+        // Always advance frame counter so we alternate slots
+        gpu.ts_frame += 1;
 
         // Async map instance count readback (will be ready next frame)
-        {
+        // Only map if we actually copied data (i.e., buffer wasn't already mapped)
+        if !gpu.instance_count_mapped.load(std::sync::atomic::Ordering::Acquire) {
             use std::sync::atomic::Ordering;
+            gpu.instance_count_mapped.store(true, Ordering::Release);
             let ready = gpu.instance_count_ready.clone();
             gpu.instance_count_readback
                 .slice(..)
@@ -1387,7 +1425,7 @@ impl App {
 
             // Recreate sort state for new tet count
             let n_pow2 = (gpu.tet_count as u32).next_power_of_two();
-            gpu.sort_state = rmesh_sort::RadixSortState::new(&gpu.device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
+            gpu.sort_state = rmesh_sort::RadixSortState::new(&gpu.device, n_pow2, 32, 1, gpu.sort_backend);
             gpu.sort_state.upload_configs(&gpu.queue);
 
             // Recreate bind groups
