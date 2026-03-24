@@ -251,7 +251,7 @@ fn create_shared_state() -> Option<SharedState> {
     );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0, 0.01, 1000.0,
     );
     queue.write_buffer(&scene_buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -850,7 +850,7 @@ fn main() {
         // Update uniforms buffer with the correct tile_size for this run
         let (vp, c2w, intrinsics, eye) = setup_camera();
         let uniforms = rmesh_render::make_uniforms(
-            vp, c2w, intrinsics, eye, W as f32, H as f32, shared.tet_count, 0u32, tile_size, 0.0, 0,
+            vp, c2w, intrinsics, eye, W as f32, H as f32, shared.tet_count, 0u32, tile_size, 0.0, 0, 0.01, 1000.0,
         );
         shared.queue.write_buffer(
             &shared.scene_buffers.uniforms,

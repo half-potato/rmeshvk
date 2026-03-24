@@ -762,6 +762,8 @@ impl RMeshRenderer {
             self.tile_size,
             self.min_t,
             0,
+            0.01,
+            1000.0,
         );
 
         // Upload uniforms
@@ -870,6 +872,8 @@ impl RMeshRenderer {
             self.tile_size,
             self.min_t,
             0,
+            0.01,
+            1000.0,
         );
 
         // Upload uniforms
@@ -1050,6 +1054,8 @@ impl RMeshRenderer {
             self.tile_size,
             self.min_t,
             0,
+            0.01,
+            1000.0,
         );
 
         let has_custom_rays = ray_origins.is_some() && ray_dirs.is_some();
@@ -1839,6 +1845,8 @@ impl RMeshRenderer {
             self.tile_size,
             self.min_t,
             0,
+            0.01,
+            1000.0,
         );
 
         // Upload uniforms + ground truth

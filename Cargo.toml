@@ -14,7 +14,7 @@ members = [
     "crates/rmesh-compositor",
     "crates/rmesh-viewer",
     "crates/rmesh-viewer-web",
-    "wtet",
+    # "wtet",  # submodule not always available
 ]
 
 [workspace.dependencies]

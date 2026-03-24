@@ -183,6 +183,60 @@ fn test_four_tet_multi_angle() {
     }
 }
 
+/// Two-tet scene, camera outside — interval shading path.
+#[test]
+fn test_interval_two_tet_outside_view() {
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+    let scene = two_tet_scene(&mut rng);
+
+    let eye = Vec3::new(3.0, 0.4, 1.0);
+    let target = Vec3::new(0.5, 0.4, 0.0);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
+
+    let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
+
+    if let Some(gpu_image) = gpu_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
+        let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
+        eprintln!("interval_two_tet_outside: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
+        assert!(
+            mean_diff < ATOL,
+            "interval_two_tet_outside: mean_diff {mean_diff} >= {ATOL}"
+        );
+    } else {
+        eprintln!("Skipping GPU interval test (no adapter or no mesh shader support)");
+    }
+}
+
+/// Four-tet scene, multiple angles — interval shading path.
+#[test]
+fn test_interval_four_tet_multi_angle() {
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+    let scene = four_tet_scene(&mut rng);
+
+    let viewpoints = [
+        (Vec3::new(3.0, 0.0, 0.0), Vec3::ZERO),
+        (Vec3::new(0.0, 3.0, 0.0), Vec3::ZERO),
+        (Vec3::new(2.0, 2.0, 2.0), Vec3::ZERO),
+    ];
+
+    for (i, (eye, target)) in viewpoints.iter().enumerate() {
+        let (vp, c2w, intrinsics) = setup_camera(*eye, *target);
+        let cpu_image = cpu_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H);
+
+        if let Some(gpu_image) = gpu_interval_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H) {
+            let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
+            eprintln!("interval_four_tet angle {i}: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
+            assert!(
+                mean_diff < ATOL,
+                "interval_four_tet angle {i}: mean_diff {mean_diff} >= {ATOL}"
+            );
+        } else {
+            eprintln!("Skipping GPU interval test (no adapter or no mesh shader support)");
+            break;
+        }
+    }
+}
+
 /// Verify CPU sorting produces the same order as GPU.
 #[test]
 fn test_sort_order_matches() {

@@ -605,7 +605,9 @@ pub fn train(
                 ray_mode: 0,
                 min_t: 0.0,
                 sh_degree: 0,
-                _pad1: [0; 4],
+                near_plane: 0.01,
+                far_plane: 1000.0,
+                _pad1: [0; 2],
             };
 
             // Upload uniforms

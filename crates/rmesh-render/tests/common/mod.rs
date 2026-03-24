@@ -431,6 +431,8 @@ async fn gpu_render_scene_async(
         16,
         0.0,
         0,
+        0.01,
+        1000.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -650,7 +652,7 @@ async fn gpu_raytrace_scene_async(
 
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0, 12, 0.0, 0,
+        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0, 12, 0.0, 0, 0.01, 1000.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -766,7 +768,7 @@ async fn gpu_tiled_render_scene_async(
         rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0, 0,
+        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0, 0, 0.01, 1000.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -975,7 +977,7 @@ async fn gpu_tiled_render_with_stats_async(
         rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0, 0,
+        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0, 0, 0.01, 1000.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1138,6 +1140,250 @@ async fn gpu_tiled_render_with_stats_async(
     readback_dbg.unmap();
 
     Some((image, stats))
+}
+
+// ---------------------------------------------------------------------------
+// GPU interval shading pipeline runner (headless, requires mesh shaders)
+// ---------------------------------------------------------------------------
+
+/// Run the GPU interval shading pipeline and read back the color image.
+/// Returns None if no GPU adapter is available or mesh shaders not supported.
+///
+/// This uses the interval shading path (Tricard, HPG 2024):
+///   project_compute → radix sort → indirect_convert (TETS_PER_GROUP=16) → interval mesh render
+pub fn gpu_interval_render_scene(
+    scene: &SceneData,
+    cam_pos: Vec3,
+    vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
+    w: u32,
+    h: u32,
+) -> Option<Vec<[f32; 4]>> {
+    pollster::block_on(gpu_interval_render_scene_async(scene, cam_pos, vp, c2w, intrinsics, w, h))
+}
+
+async fn gpu_interval_render_scene_async(
+    scene: &SceneData,
+    cam_pos: Vec3,
+    vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
+    w: u32,
+    h: u32,
+) -> Option<Vec<[f32; 4]>> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
+        ..Default::default()
+    });
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .ok()?;
+
+    // Check adapter supports mesh shaders
+    let adapter_features = adapter.features();
+    if !adapter_features.contains(wgpu::Features::EXPERIMENTAL_MESH_SHADER) {
+        return None;
+    }
+
+    // Copy mesh shader limits from adapter (defaults are 0 = disabled)
+    let supported_limits = adapter.limits();
+    let mut limits = wgpu::Limits {
+        max_storage_buffers_per_shader_stage: 16,
+        max_storage_buffer_binding_size: 1 << 30,
+        max_buffer_size: 1 << 30,
+        ..wgpu::Limits::default()
+    };
+    limits.max_mesh_invocations_per_workgroup = supported_limits.max_mesh_invocations_per_workgroup;
+    limits.max_mesh_invocations_per_dimension = supported_limits.max_mesh_invocations_per_dimension;
+    limits.max_mesh_output_vertices = supported_limits.max_mesh_output_vertices;
+    limits.max_mesh_output_primitives = supported_limits.max_mesh_output_primitives;
+    limits.max_mesh_output_layers = supported_limits.max_mesh_output_layers;
+    limits.max_mesh_multiview_view_count = supported_limits.max_mesh_multiview_view_count;
+    limits.max_task_mesh_workgroup_total_count = supported_limits.max_task_mesh_workgroup_total_count;
+    limits.max_task_mesh_workgroups_per_dimension = supported_limits.max_task_mesh_workgroups_per_dimension;
+
+    // Mesh shaders are experimental — must opt in
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::SUBGROUP
+                    | wgpu::Features::SHADER_FLOAT32_ATOMIC
+                    | wgpu::Features::EXPERIMENTAL_MESH_SHADER,
+                required_limits: limits,
+                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()?;
+
+    let color_format = wgpu::TextureFormat::Rgba16Float;
+    let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
+    let (buffers, material, pipelines, targets, compute_bg, _render_bg) =
+        rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
+
+    // Interval shading pipelines
+    let interval_pipelines = rmesh_render::IntervalPipelines::new(&device, color_format);
+
+    // Sort infrastructure (32-bit keys)
+    let n_pow2 = scene.tet_count.next_power_of_two();
+    let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);
+    let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
+    sort_state.upload_configs(&queue);
+
+    // Interval bind groups (A and B for sort buffer swapping)
+    let interval_render_bg_a = rmesh_render::create_interval_render_bind_group(
+        &device, &interval_pipelines, &buffers, &material,
+    );
+    let interval_render_bg_b = rmesh_render::create_interval_render_bind_group_with_sort_values(
+        &device, &interval_pipelines, &buffers, &material, sort_state.values_b(),
+    );
+    let indirect_convert_bg = rmesh_render::create_interval_indirect_convert_bind_group(
+        &device, &interval_pipelines, &buffers,
+    );
+
+    // Write uniforms
+    let uniforms = rmesh_render::make_uniforms(
+        vp, c2w, intrinsics, cam_pos,
+        w as f32, h as f32,
+        scene.tet_count, 0, 16, 0.0, 0,
+        0.01, 1000.0,
+    );
+    queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+
+    // Depth texture for the render pass
+    let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("test_interval_depth"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+    // Record and submit
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("test_interval"),
+    });
+
+    // Clear color and depth
+    {
+        let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("test_interval_clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &targets.color_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+    }
+
+    rmesh_render::record_sorted_interval_forward_pass(
+        &mut encoder,
+        &device,
+        &pipelines,
+        &interval_pipelines,
+        &sort_pipelines,
+        &sort_state,
+        &buffers,
+        &targets,
+        &compute_bg,
+        &interval_render_bg_a,
+        &interval_render_bg_b,
+        &indirect_convert_bg,
+        scene.tet_count,
+        &queue,
+        &depth_view,
+        None,
+        None,
+    );
+
+    // Copy color texture to readback buffer
+    let bytes_per_pixel = 8u32; // Rgba16Float = 4 × f16 = 8 bytes
+    let bytes_per_row = w * bytes_per_pixel;
+    let aligned_bytes_per_row = (bytes_per_row + 255) & !255;
+
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: (aligned_bytes_per_row * h) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &targets.color_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(aligned_bytes_per_row),
+                rows_per_image: Some(h),
+            },
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // Map and read back
+    let slice = readback.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap();
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    receiver.recv().unwrap().ok()?;
+
+    let data = slice.get_mapped_range();
+    let mut image = vec![[0.0f32; 4]; (w * h) as usize];
+
+    for row in 0..h {
+        let row_start = (row * aligned_bytes_per_row) as usize;
+        for col in 0..w {
+            let pixel_start = row_start + (col * bytes_per_pixel) as usize;
+            let r = half::f16::from_le_bytes([data[pixel_start], data[pixel_start + 1]]).to_f32();
+            let g = half::f16::from_le_bytes([data[pixel_start + 2], data[pixel_start + 3]]).to_f32();
+            let b = half::f16::from_le_bytes([data[pixel_start + 4], data[pixel_start + 5]]).to_f32();
+            let a = half::f16::from_le_bytes([data[pixel_start + 6], data[pixel_start + 7]]).to_f32();
+            image[(row * w + col) as usize] = [r, g, b, a];
+        }
+    }
+
+    drop(data);
+    readback.unmap();
+
+    Some(image)
 }
 
 // ---------------------------------------------------------------------------

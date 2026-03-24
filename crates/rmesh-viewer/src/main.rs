@@ -33,10 +33,13 @@ use rayon::prelude::*;
 use rmesh_render::{
     create_compute_bind_group, create_hw_compute_bind_group, create_render_bind_group,
     create_render_bind_group_with_sort_values, BlitPipeline, ForwardPipelines, MaterialBuffers,
-    MeshForwardPipelines, RenderTargets, SceneBuffers, Uniforms, create_blit_bind_group,
+    MeshForwardPipelines, IntervalPipelines, RenderTargets, SceneBuffers, Uniforms,
+    create_blit_bind_group,
     create_indirect_convert_bind_group, create_mesh_render_bind_group,
     create_mesh_render_bind_group_with_sort_values, record_blit,
     create_prepass_bind_group, create_quad_render_bind_group,
+    create_interval_render_bind_group, create_interval_render_bind_group_with_sort_values,
+    create_interval_indirect_convert_bind_group,
 };
 use rmesh_compositor::{
     PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets,
@@ -136,6 +139,11 @@ struct GpuState {
     mesh_render_bg_a: Option<wgpu::BindGroup>,
     mesh_render_bg_b: Option<wgpu::BindGroup>,
     indirect_convert_bg: Option<wgpu::BindGroup>,
+    // Interval shading (optional, requires mesh shader support)
+    interval_pipelines: Option<IntervalPipelines>,
+    interval_render_bg_a: Option<wgpu::BindGroup>,
+    interval_render_bg_b: Option<wgpu::BindGroup>,
+    interval_indirect_convert_bg: Option<wgpu::BindGroup>,
     // Quad prepass bind groups (A/B for sort result location)
     prepass_bg_a: wgpu::BindGroup,
     prepass_bg_b: wgpu::BindGroup,
@@ -188,6 +196,7 @@ struct App {
     pending_load: Option<PathBuf>,
     vsync: bool,
     use_mesh_shader: bool,
+    use_interval_shader: bool,
     mesh_shader_supported: bool,
     // Fluid simulation
     fluid_enabled: bool,
@@ -228,6 +237,7 @@ impl App {
             pending_load: None,
             vsync: true,
             use_mesh_shader: false,
+            use_interval_shader: false,
             mesh_shader_supported: false,
             fluid_enabled: false,
             fluid_params: FluidParams::default(),
@@ -464,6 +474,12 @@ impl App {
         } else {
             None
         };
+        let interval_pipelines = if mesh_shader_supported {
+            log::info!("Compiling interval shading pipelines...");
+            Some(IntervalPipelines::new(&device, color_format))
+        } else {
+            None
+        };
         log::info!("Pipelines compiled: {:.2}s", t0.elapsed().as_secs_f64());
 
         log::info!("Uploading scene buffers ({} tets)...", self.scene_data.tet_count);
@@ -527,6 +543,19 @@ impl App {
                     &device, mp, &buffers, &material, sort_state.values_b(),
                 );
                 let ic = create_indirect_convert_bind_group(&device, mp, &buffers);
+                (Some(a), Some(b), Some(ic))
+            } else {
+                (None, None, None)
+            };
+
+        // Interval shading bind groups (if supported)
+        let (interval_render_bg_a, interval_render_bg_b, interval_indirect_convert_bg) =
+            if let Some(ref ip) = interval_pipelines {
+                let a = create_interval_render_bind_group(&device, ip, &buffers, &material);
+                let b = create_interval_render_bind_group_with_sort_values(
+                    &device, ip, &buffers, &material, sort_state.values_b(),
+                );
+                let ic = create_interval_indirect_convert_bind_group(&device, ip, &buffers);
                 (Some(a), Some(b), Some(ic))
             } else {
                 (None, None, None)
@@ -627,6 +656,10 @@ impl App {
             mesh_render_bg_a,
             mesh_render_bg_b,
             indirect_convert_bg,
+            interval_pipelines,
+            interval_render_bg_a,
+            interval_render_bg_b,
+            interval_indirect_convert_bg,
             prepass_bg_a,
             prepass_bg_b,
             quad_render_bg,
@@ -814,7 +847,9 @@ impl App {
             ray_mode: 0,
             min_t: 0.0,
             sh_degree: gpu.sh_degree,
-            _pad1: [0; 4],
+            near_plane: self.camera.near_z,
+            far_plane: self.camera.far_z,
+            _pad1: [0; 2],
         };
 
         gpu.queue
@@ -829,6 +864,7 @@ impl App {
         let mut open_file = false;
         let mut vsync = self.vsync;
         let mut use_mesh_shader = self.use_mesh_shader;
+        let mut use_interval_shader = self.use_interval_shader;
         let mesh_shader_supported = self.mesh_shader_supported;
         let mut fluid_enabled = self.fluid_enabled;
         let mut show_primitives = self.show_primitives;
@@ -871,6 +907,10 @@ impl App {
                             egui::Checkbox::new(&mut use_mesh_shader, "Mesh Shader"),
                         );
                         ui.checkbox(&mut use_quad_shader, "Quad Shader");
+                        ui.add_enabled(
+                            mesh_shader_supported,
+                            egui::Checkbox::new(&mut use_interval_shader, "Interval Shading"),
+                        );
                         ui.checkbox(&mut fluid_enabled, "Fluid Sim");
                         ui.checkbox(&mut show_primitives, "Show Primitives");
                     });
@@ -996,6 +1036,7 @@ impl App {
             gpu.pending_reconfigure = true;
         }
         self.use_mesh_shader = use_mesh_shader;
+        self.use_interval_shader = use_interval_shader;
         self.use_quad_shader = use_quad_shader;
         self.fluid_enabled = fluid_enabled;
         self.show_primitives = show_primitives;
@@ -1184,7 +1225,30 @@ impl App {
 
         // 2. Sorted forward pass: compute → radix sort → render
         //    Color uses LoadOp::Load (preserves primitive colors), depth test culls behind primitives
-        if self.use_mesh_shader
+        if self.use_interval_shader
+            && gpu.interval_pipelines.is_some()
+            && gpu.interval_render_bg_a.is_some()
+        {
+            rmesh_render::record_sorted_interval_forward_pass(
+                &mut encoder,
+                &gpu.device,
+                &gpu.pipelines,
+                gpu.interval_pipelines.as_ref().unwrap(),
+                &gpu.sort_pipelines,
+                &gpu.sort_state,
+                &gpu.buffers,
+                &gpu.targets,
+                &gpu.compute_bg,
+                gpu.interval_render_bg_a.as_ref().unwrap(),
+                gpu.interval_render_bg_b.as_ref().unwrap(),
+                gpu.interval_indirect_convert_bg.as_ref().unwrap(),
+                gpu.tet_count,
+                &gpu.queue,
+                &gpu.primitive_targets.depth_view,
+                Some(&gpu.hw_compute_bg),
+                Some(&gpu.ts_query_set),
+            );
+        } else if self.use_mesh_shader
             && gpu.mesh_pipelines.is_some()
             && gpu.mesh_render_bg_a.is_some()
         {
@@ -1481,6 +1545,20 @@ impl App {
                 ));
                 gpu.indirect_convert_bg = Some(create_indirect_convert_bind_group(
                     &gpu.device, mp, &gpu.buffers,
+                ));
+            }
+
+            // Recreate interval shading bind groups
+            if let Some(ref ip) = gpu.interval_pipelines {
+                gpu.interval_render_bg_a = Some(create_interval_render_bind_group(
+                    &gpu.device, ip, &gpu.buffers, &gpu.material_buffers,
+                ));
+                gpu.interval_render_bg_b = Some(create_interval_render_bind_group_with_sort_values(
+                    &gpu.device, ip, &gpu.buffers, &gpu.material_buffers,
+                    gpu.sort_state.values_b(),
+                ));
+                gpu.interval_indirect_convert_bg = Some(create_interval_indirect_convert_bind_group(
+                    &gpu.device, ip, &gpu.buffers,
                 ));
             }
 

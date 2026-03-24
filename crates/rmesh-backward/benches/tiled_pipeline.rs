@@ -124,6 +124,8 @@ fn create_bench_state() -> Option<BenchState> {
         TILE_SIZE,
         0.0,
         0,
+        0.01,
+        1000.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 

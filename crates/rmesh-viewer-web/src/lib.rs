@@ -272,7 +272,9 @@ impl WebViewer {
             ray_mode: 0,
             min_t: 0.0,
             sh_degree: scene.sh_degree,
-            _pad1: [0; 4],
+            near_plane: 0.01,
+            far_plane: 1000.0,
+            _pad1: [0; 2],
         };
 
         self.queue

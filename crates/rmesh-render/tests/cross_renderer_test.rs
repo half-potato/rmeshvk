@@ -29,14 +29,15 @@ fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat3, [f32; 4]) {
 }
 
 /// Helper: render a scene with all available renderers and return results.
-/// Returns (cpu, gpu_hw_raster, gpu_raytrace, gpu_tiled).
-/// GPU results are None if no adapter available.
+/// Returns (cpu, gpu_hw_raster, gpu_raytrace, gpu_tiled, gpu_interval).
+/// GPU results are None if no adapter available (or no mesh shader support for interval).
 fn render_all(
     scene: &rmesh_data::SceneData,
     eye: Vec3,
     target: Vec3,
 ) -> (
     Vec<[f32; 4]>,
+    Option<Vec<[f32; 4]>>,
     Option<Vec<[f32; 4]>>,
     Option<Vec<[f32; 4]>>,
     Option<Vec<[f32; 4]>>,
@@ -47,8 +48,9 @@ fn render_all(
     let hw_raster = gpu_render_scene(scene, eye, vp, c2w, intrinsics, W, H);
     let raytrace = gpu_raytrace_scene(scene, eye, vp, c2w, intrinsics, W, H);
     let tiled = gpu_tiled_render_scene(scene, eye, vp, c2w, intrinsics, W, H);
+    let interval = gpu_interval_render_scene(scene, eye, vp, c2w, intrinsics, W, H);
 
-    (cpu, hw_raster, raytrace, tiled)
+    (cpu, hw_raster, raytrace, tiled, interval)
 }
 
 /// Helper: print per-pixel details for the first N differing pixels.
@@ -96,7 +98,7 @@ fn test_single_tet_all_renderers_outside() {
     let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
     let eye = centroid + Vec3::new(2.0, 0.0, 0.0);
 
-    let (cpu, hw_raster, raytrace, tiled) = render_all(&scene, eye, centroid);
+    let (cpu, hw_raster, raytrace, tiled, interval) = render_all(&scene, eye, centroid);
 
     // CPU should have non-zero content
     let total_alpha: f32 = cpu.iter().map(|p| p[3]).sum();
@@ -152,6 +154,22 @@ fn test_single_tet_all_renderers_outside() {
         );
     }
 
+    if let Some(ref iv) = interval {
+        let (max_diff, mean_diff, _) = compare_images(&cpu, iv);
+        eprintln!("CPU vs interval:  max={max_diff:.6}, mean={mean_diff:.8}");
+        if max_diff > 0.002 {
+            print_pixel_diffs("cpu", "interval", &cpu, iv, 0.002, 10);
+        }
+        assert!(
+            mean_diff < 0.01,
+            "CPU vs interval: mean_diff {mean_diff} >= 0.01"
+        );
+        assert!(
+            max_diff < 0.002,
+            "CPU vs interval: max_diff {max_diff} >= 0.002"
+        );
+    }
+
     // GPU vs GPU comparisons (should be tighter than CPU vs GPU)
     if let (Some(ref rt), Some(ref ti)) = (&raytrace, &tiled) {
         let (max_diff, mean_diff, _) = compare_images(rt, ti);
@@ -182,6 +200,22 @@ fn test_single_tet_all_renderers_outside() {
             "HW raster vs tiled: max_diff {max_diff} >= 0.01"
         );
     }
+
+    if let (Some(ref ti), Some(ref iv)) = (&tiled, &interval) {
+        let (max_diff, mean_diff, _) = compare_images(ti, iv);
+        eprintln!("tiled vs interval: max={max_diff:.6}, mean={mean_diff:.8}");
+        if max_diff > 0.002 {
+            print_pixel_diffs("tiled", "interval", ti, iv, 0.002, 10);
+        }
+        assert!(
+            mean_diff < 0.005,
+            "tiled vs interval: mean_diff {mean_diff} >= 0.005"
+        );
+        assert!(
+            max_diff < 0.002,
+            "tiled vs interval: max_diff {max_diff} >= 0.002"
+        );
+    }
 }
 
 /// Known deterministic tet scene: all renderers should match tightly.
@@ -193,7 +227,7 @@ fn test_known_tet_all_renderers() {
     let eye = Vec3::new(3.0, 0.0, 0.0);
     let target = Vec3::ZERO;
 
-    let (cpu, _hw_raster, raytrace, tiled) = render_all(&scene, eye, target);
+    let (cpu, _hw_raster, raytrace, tiled, interval) = render_all(&scene, eye, target);
 
     let total_alpha: f32 = cpu.iter().map(|p| p[3]).sum();
     assert!(total_alpha > 0.1, "CPU image is all-zero for known tet");
@@ -229,6 +263,22 @@ fn test_known_tet_all_renderers() {
         assert!(
             max_diff < 0.002,
             "CPU vs raytrace (known tet): max_diff {max_diff} >= 0.002"
+        );
+    }
+
+    if let Some(ref iv) = interval {
+        let (max_diff, mean_diff, _) = compare_images(&cpu, iv);
+        eprintln!("CPU vs interval:  max={max_diff:.6}, mean={mean_diff:.8}");
+        if max_diff > 0.002 {
+            print_pixel_diffs("cpu", "interval", &cpu, iv, 0.002, 10);
+        }
+        assert!(
+            mean_diff < 0.01,
+            "CPU vs interval (known tet): mean_diff {mean_diff} >= 0.01"
+        );
+        assert!(
+            max_diff < 0.002,
+            "CPU vs interval (known tet): max_diff {max_diff} >= 0.002"
         );
     }
 
@@ -306,6 +356,22 @@ fn test_single_tet_multi_angle_cross_renderer() {
                 "{label}: CPU vs raytrace: max_diff {max_diff} >= 0.002"
             );
         }
+
+        if let Some(interval) = gpu_interval_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H) {
+            let (max_diff, mean_diff, _) = compare_images(&cpu, &interval);
+            eprintln!("{label}: CPU vs interval: max={max_diff:.6}, mean={mean_diff:.8}");
+            if max_diff > 0.002 {
+                print_pixel_diffs("cpu", "interval", &cpu, &interval, 0.002, 10);
+            }
+            assert!(
+                mean_diff < 0.01,
+                "{label}: CPU vs interval: mean_diff {mean_diff} >= 0.01"
+            );
+            assert!(
+                max_diff < 0.002,
+                "{label}: CPU vs interval: max_diff {max_diff} >= 0.002"
+            );
+        }
     }
 }
 
@@ -333,6 +399,7 @@ fn assert_all_renderers_match_cpu(
         ("HW raster", gpu_render_scene(scene, eye, vp, c2w, intrinsics, W, H), 0.05, 0.01),
         ("raytrace", gpu_raytrace_scene(scene, eye, vp, c2w, intrinsics, W, H), 0.01, 0.002),
         ("tiled", gpu_tiled_render_scene(scene, eye, vp, c2w, intrinsics, W, H), 0.01, 0.002),
+        ("interval", gpu_interval_render_scene(scene, eye, vp, c2w, intrinsics, W, H), 0.01, 0.002),
     ];
 
     // Print all comparisons before asserting (so we see ALL renderer results
@@ -488,6 +555,17 @@ fn test_four_tet_all_renderers() {
                 print_pixel_diffs("cpu", "hw", &cpu, hw, 0.5, 5);
             }
         }
+
+        // Interval
+        if let Some(ref iv) = gpu_interval_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H) {
+            let (max_diff, mean_diff, _) = compare_images(&cpu, iv);
+            eprintln!("{label}: CPU vs interval: max={max_diff:.6}, mean={mean_diff:.8}");
+            if max_diff > 0.002 {
+                print_pixel_diffs("cpu", "interval", &cpu, iv, 0.002, 10);
+            }
+            assert!(mean_diff < 0.01, "{label}: CPU vs interval: mean_diff {mean_diff} >= 0.01");
+            assert!(max_diff < 0.002, "{label}: CPU vs interval: max_diff {max_diff} >= 0.002");
+        }
     }
 }
 
@@ -573,6 +651,22 @@ fn test_two_tet_cross_renderer() {
             "Two-tet CPU vs raytrace: max_diff {max_diff} >= 0.002"
         );
     }
+
+    if let Some(interval) = gpu_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
+        let (max_diff, mean_diff, _) = compare_images(&cpu, &interval);
+        eprintln!("CPU vs interval:  max={max_diff:.6}, mean={mean_diff:.8}");
+        if max_diff > 0.002 {
+            print_pixel_diffs("cpu", "interval", &cpu, &interval, 0.002, 10);
+        }
+        assert!(
+            mean_diff < 0.01,
+            "Two-tet CPU vs interval: mean_diff {mean_diff} >= 0.01"
+        );
+        assert!(
+            max_diff < 0.002,
+            "Two-tet CPU vs interval: max_diff {max_diff} >= 0.002"
+        );
+    }
 }
 
 /// Four tets forming a larger shape — tiled vs CPU strict comparison.
@@ -653,6 +747,17 @@ fn test_four_tet_cross_renderer() {
             let (max_diff, mean_diff, _) = compare_images(&cpu, &raytrace);
             eprintln!("  {label}: CPU vs raytrace: max={max_diff:.6}, mean={mean_diff:.8} (non-watertight → logged only)");
         }
+
+        // Interval
+        if let Some(interval) = gpu_interval_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H) {
+            let (max_diff, mean_diff, _) = compare_images(&cpu, &interval);
+            eprintln!("  {label}: CPU vs interval: max={max_diff:.6}, mean={mean_diff:.8}");
+            if max_diff > 0.002 {
+                print_pixel_diffs("cpu", "interval", &cpu, &interval, 0.002, 10);
+            }
+            assert!(mean_diff < 0.01, "Four-tet {label}: CPU vs interval: mean_diff {mean_diff} >= 0.01");
+            assert!(max_diff < 0.002, "Four-tet {label}: CPU vs interval: max_diff {max_diff} >= 0.002");
+        }
     }
 }
 
@@ -691,6 +796,22 @@ fn test_tet_at_boundary_cross_renderer() {
     } else {
         eprintln!("Skipping GPU test (no adapter)");
     }
+
+    if let Some(interval) = gpu_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
+        let (max_diff, mean_diff, _) = compare_images(&cpu, &interval);
+        eprintln!("boundary: CPU vs interval: max={max_diff:.6}, mean={mean_diff:.8}");
+        if max_diff > 0.002 {
+            print_pixel_diffs("cpu", "interval", &cpu, &interval, 0.002, 10);
+        }
+        assert!(
+            mean_diff < 0.02,
+            "boundary: CPU vs interval: mean_diff {mean_diff} >= 0.02"
+        );
+        assert!(
+            max_diff < 0.002,
+            "boundary: CPU vs interval: max_diff {max_diff} >= 0.002"
+        );
+    }
 }
 
 /// Tet behind camera: should produce all-zero image in all renderers.
@@ -725,6 +846,14 @@ fn test_tet_behind_camera_cross_renderer() {
             "Raytrace should show nothing when tet is behind camera, alpha={rt_alpha}"
         );
     }
+
+    if let Some(interval) = gpu_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
+        let iv_alpha: f32 = interval.iter().map(|p| p[3]).sum();
+        assert!(
+            iv_alpha < 0.01,
+            "Interval should show nothing when tet is behind camera, alpha={iv_alpha}"
+        );
+    }
 }
 
 /// Far away tet: very small projected area.
@@ -748,6 +877,15 @@ fn test_distant_tet_cross_renderer() {
         assert!(
             mean_diff < 0.01,
             "distant: CPU vs tiled: mean_diff {mean_diff} >= 0.01"
+        );
+    }
+
+    if let Some(interval) = gpu_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
+        let (_, mean_diff, _) = compare_images(&cpu, &interval);
+        eprintln!("distant: CPU vs interval: mean={mean_diff:.8}");
+        assert!(
+            mean_diff < 0.01,
+            "distant: CPU vs interval: mean_diff {mean_diff} >= 0.01"
         );
     }
 }
@@ -829,6 +967,19 @@ fn test_center_pixel_cross_renderer() {
             );
         }
     }
+
+    if let Some(interval) = gpu_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
+        let iv_pixel = interval[center_idx];
+        eprintln!("Center pixel interval: RGBA={:.6?}", iv_pixel);
+        for ch in 0..4 {
+            let diff = (cpu_pixel[ch] - iv_pixel[ch]).abs();
+            assert!(
+                diff < 0.01,
+                "Center pixel ch{ch}: CPU={:.6} interval={:.6} diff={diff:.6}",
+                cpu_pixel[ch], iv_pixel[ch]
+            );
+        }
+    }
 }
 
 /// Scan across all pixels: find the pixel with maximum divergence between renderers.
@@ -875,9 +1026,35 @@ fn test_worst_pixel_divergence() {
 
         // Log overall stats
         let (max_diff, mean_diff, _) = compare_images(&cpu, &tiled);
-        eprintln!("Overall: max={max_diff:.6}, mean={mean_diff:.8}");
+        eprintln!("Overall (tiled): max={max_diff:.6}, mean={mean_diff:.8}");
     } else {
         eprintln!("Skipping GPU test (no adapter)");
+    }
+
+    if let Some(interval) = gpu_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
+        let mut worst_diff = 0.0f32;
+        let mut worst_idx = 0;
+
+        for (i, (c, iv)) in cpu.iter().zip(interval.iter()).enumerate() {
+            let max_ch = (0..4)
+                .map(|ch| (c[ch] - iv[ch]).abs())
+                .fold(0.0f32, f32::max);
+            if max_ch > worst_diff {
+                worst_diff = max_ch;
+                worst_idx = i;
+            }
+        }
+
+        let px = worst_idx as u32 % W;
+        let py = worst_idx as u32 / W;
+        eprintln!(
+            "Worst pixel divergence (CPU vs interval): ({px},{py}) diff={worst_diff:.6}"
+        );
+        eprintln!("  CPU:      {:?}", cpu[worst_idx]);
+        eprintln!("  Interval: {:?}", interval[worst_idx]);
+
+        let (max_diff, mean_diff, _) = compare_images(&cpu, &interval);
+        eprintln!("Overall (interval): max={max_diff:.6}, mean={mean_diff:.8}");
     }
 }
 

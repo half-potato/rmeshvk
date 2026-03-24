@@ -41,8 +41,12 @@ pub struct Uniforms {
     pub min_t: f32,
     /// SH degree for inline SH evaluation (0 = use base_colors path, 1-3 = eval SH).
     pub sh_degree: u32,
+    /// Near clip plane distance (positive, view-space Z).
+    pub near_plane: f32,
+    /// Far clip plane distance (positive, view-space Z).
+    pub far_plane: f32,
     /// Padding to maintain 192-byte struct size.
-    pub _pad1: [u32; 4],
+    pub _pad1: [u32; 2],
 }
 
 impl Uniforms {

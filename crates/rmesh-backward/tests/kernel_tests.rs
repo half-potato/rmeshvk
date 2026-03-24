@@ -580,7 +580,7 @@ fn test_tiled_forward_e2e() {
         rmesh_render::setup_forward(&device, &queue, &scene, &zero_base_colors, &scene.color_grads, W, H);
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0, 0.01, 1000.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -771,7 +771,7 @@ fn test_multi_tet_gradient_finite_diff() {
             rmesh_render::setup_forward(&device, &queue, scene_data, base_colors, &scene_data.color_grads, W, H);
 
         let uniforms = rmesh_render::make_uniforms(
-            vp, c2w, intrinsics, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0, 0,
+            vp, c2w, intrinsics, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0, 0, 0.01, 1000.0,
         );
         queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -886,7 +886,7 @@ fn test_multi_tet_gradient_finite_diff() {
             rmesh_render::setup_forward(&device, &queue, scene_data, base_colors, &scene_data.color_grads, W, H);
 
         let uniforms = rmesh_render::make_uniforms(
-            vp, c2w, intrinsics, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0, 0,
+            vp, c2w, intrinsics, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0, 0, 0.01, 1000.0,
         );
         queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1212,7 +1212,7 @@ fn test_single_tet_loss_decreases() {
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
         rmesh_render::setup_forward(&device, &queue, &scene, &zero_base_colors, &scene.color_grads, W, H);
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0, 0.01, 1000.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1642,7 +1642,7 @@ fn test_camera_gpu_visibility() {
         );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0, 0.01, 1000.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1700,7 +1700,7 @@ fn test_camera_tiled_forward_deterministic() {
         );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0, 0.01, 1000.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 

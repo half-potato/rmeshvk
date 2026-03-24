@@ -11,7 +11,7 @@ struct DrawIndirectArgs {
 @group(0) @binding(0) var<storage, read> indirect_args: DrawIndirectArgs;
 @group(0) @binding(1) var<storage, read_write> mesh_indirect: array<u32, 3>;
 
-const TETS_PER_GROUP: u32 = 8u;
+override TETS_PER_GROUP: u32 = 8u;
 
 @compute @workgroup_size(1)
 fn main() {
