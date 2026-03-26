@@ -43,6 +43,9 @@ const FORWARD_MESH_WGSL: &str = include_str!("wgsl/forward_mesh.wgsl");
 const INDIRECT_CONVERT_WGSL: &str = include_str!("wgsl/indirect_convert.wgsl");
 const INTERVAL_MESH_WGSL: &str = include_str!("wgsl/interval_mesh.wgsl");
 const INTERVAL_FRAGMENT_WGSL: &str = include_str!("wgsl/interval_fragment.wgsl");
+const INTERVAL_COMPUTE_WGSL: &str = include_str!("wgsl/interval_compute.wgsl");
+const INTERVAL_VERTEX_WGSL: &str = include_str!("wgsl/interval_vertex.wgsl");
+const INTERVAL_INDIRECT_CONVERT_WGSL: &str = include_str!("wgsl/interval_indirect_convert.wgsl");
 
 // ---------------------------------------------------------------------------
 // GPU Buffers
@@ -74,6 +77,14 @@ pub struct SceneBuffers {
     pub mesh_indirect_args: wgpu::Buffer,
     /// Precomputed per-tet data for quad renderer [M × 8] vec4<f32> (128 bytes/tet)
     pub precomputed: wgpu::Buffer,
+    /// Compute-interval vertex buffer [M × 5 × 2] vec4<f32> (160 bytes/tet)
+    pub interval_vertex_buf: wgpu::Buffer,
+    /// Compute-interval per-tet flat data [M] vec4<f32> (16 bytes/tet)
+    pub interval_tet_data_buf: wgpu::Buffer,
+    /// Static fan index buffer [12] u32 — shared across all tets via instanced draw
+    pub interval_fan_index_buf: wgpu::Buffer,
+    /// Combined compute dispatch + draw-indexed-indirect args [8] u32 (32 bytes)
+    pub interval_args_buf: wgpu::Buffer,
 }
 
 /// GPU buffers for per-tet material/appearance data (pluggable per rendering mode).
@@ -182,6 +193,52 @@ impl SceneBuffers {
             mapped_at_creation: false,
         });
 
+        // Compute-interval vertex buffer: 5 verts × 2 vec4s × 16 bytes = 160 bytes/tet
+        let interval_vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("interval_vertex_buf"),
+            size: m * 5 * 2 * 16,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        // Compute-interval per-tet flat data: 1 vec4 × 16 bytes = 16 bytes/tet
+        let interval_tet_data_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("interval_tet_data_buf"),
+            size: m * 16,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        // Static fan index buffer: M × 12 u32s, created once (never written per frame).
+        // Fan pattern per tet i: (i*5+0,i*5+1,i*5+4), (i*5+1,i*5+2,i*5+4),
+        //                        (i*5+2,i*5+3,i*5+4), (i*5+3,i*5+0,i*5+4)
+        let fan_indices: Vec<u32> = (0..m as u32)
+            .flat_map(|i| {
+                let b = i * 5;
+                [
+                    b, b + 1, b + 4,
+                    b + 1, b + 2, b + 4,
+                    b + 2, b + 3, b + 4,
+                    b + 3, b, b + 4,
+                ]
+            })
+            .collect();
+        let interval_fan_index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("interval_fan_index_buf"),
+            contents: bytemuck::cast_slice(&fan_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        // Combined dispatch + draw-indexed-indirect args: 8 × u32 = 32 bytes
+        let interval_args_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("interval_args_buf"),
+            size: 32,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             vertices,
             indices,
@@ -195,6 +252,10 @@ impl SceneBuffers {
             compact_tet_ids,
             mesh_indirect_args,
             precomputed,
+            interval_vertex_buf,
+            interval_tet_data_buf,
+            interval_fan_index_buf,
+            interval_args_buf,
         }
     }
 }
@@ -959,6 +1020,195 @@ impl IntervalPipelines {
 }
 
 // ---------------------------------------------------------------------------
+// Compute-Based Interval Shading Pipelines (no mesh shader required)
+// ---------------------------------------------------------------------------
+
+/// Compiled pipelines for compute-based interval shading.
+///
+/// Replaces mesh shader with compute → vertex/fragment draw, making interval
+/// shading available on all GPUs.
+pub struct ComputeIntervalPipelines {
+    pub gen_pipeline: wgpu::ComputePipeline,
+    pub gen_bg_layout: wgpu::BindGroupLayout,
+    pub render_pipeline: wgpu::RenderPipeline,
+    pub render_bg_layout: wgpu::BindGroupLayout,
+    pub indirect_convert_pipeline: wgpu::ComputePipeline,
+    pub indirect_convert_bg_layout: wgpu::BindGroupLayout,
+}
+
+impl ComputeIntervalPipelines {
+    pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
+        // ----- Gen compute pipeline (10 bindings) -----
+        // Bindings 0-7: read-only, 8-9: read-write
+        let gen_read_only = [
+            true, true, true, true, true, true, true, true, // 0-7 read-only
+            false, false, // 8-9 read-write (out_vertices, out_tet_data)
+        ];
+        let gen_entries = storage_entries(10, wgpu::ShaderStages::COMPUTE, &gen_read_only);
+        let gen_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("compute_interval_gen_bg_layout"),
+            entries: &gen_entries,
+        });
+        let gen_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("compute_interval_gen_pipeline_layout"),
+            bind_group_layouts: &[&gen_bg_layout],
+            immediate_size: 0,
+        });
+        let gen_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("interval_compute.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_COMPUTE_WGSL.into()),
+        });
+        let gen_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("compute_interval_gen_pipeline"),
+            layout: Some(&gen_pipeline_layout),
+            module: &gen_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // ----- Render pipeline (3 read-only storage bindings) -----
+        // 0: uniforms, 1: interval_vertex_buf, 2: interval_tet_data_buf
+        let render_read_only = [true; 3];
+        let render_entries = storage_entries(
+            3,
+            wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            &render_read_only,
+        );
+        let render_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("compute_interval_render_bg_layout"),
+            entries: &render_entries,
+        });
+        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("compute_interval_render_pipeline_layout"),
+            bind_group_layouts: &[&render_bg_layout],
+            immediate_size: 0,
+        });
+
+        let vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("interval_vertex.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_VERTEX_WGSL.into()),
+        });
+        let fragment_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("interval_fragment.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_FRAGMENT_WGSL.into()),
+        });
+
+        let premul_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("compute_interval_render_pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vertex_shader,
+                entry_point: Some("main"),
+                buffers: &[], // No vertex buffers — reads from storage
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None, // No face culling — interval triangles are screen-aligned
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &fragment_shader,
+                entry_point: Some("main"),
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // ----- Indirect convert compute pipeline (2 bindings) -----
+        let indirect_convert_bg_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("compute_interval_indirect_convert_bg_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let indirect_convert_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("compute_interval_indirect_convert_pipeline_layout"),
+                bind_group_layouts: &[&indirect_convert_bg_layout],
+                immediate_size: 0,
+            });
+        let indirect_convert_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("interval_indirect_convert.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(INTERVAL_INDIRECT_CONVERT_WGSL.into()),
+            });
+        let indirect_convert_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("compute_interval_indirect_convert_pipeline"),
+                layout: Some(&indirect_convert_layout),
+                module: &indirect_convert_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        Self {
+            gen_pipeline,
+            gen_bg_layout,
+            render_pipeline,
+            render_bg_layout,
+            indirect_convert_pipeline,
+            indirect_convert_bg_layout,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Render Targets
 // ---------------------------------------------------------------------------
 
@@ -1540,6 +1790,98 @@ pub fn create_interval_indirect_convert_bind_group(
         entries: &[
             buf_entry(0, &buffers.indirect_args),
             buf_entry(1, &buffers.mesh_indirect_args),
+        ],
+    })
+}
+
+/// Create the compute-interval gen bind group (10 bindings).
+///
+/// Binding order matches `interval_compute.wgsl`:
+///   0: uniforms, 1: vertices, 2: indices, 3: colors, 4: densities,
+///   5: color_grads, 6: sorted_indices (sort_values), 7: indirect_args,
+///   8: interval_vertex_buf, 9: interval_tet_data_buf
+pub fn create_compute_interval_gen_bind_group(
+    device: &wgpu::Device,
+    pipelines: &ComputeIntervalPipelines,
+    buffers: &SceneBuffers,
+    material: &MaterialBuffers,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("compute_interval_gen_bg"),
+        layout: &pipelines.gen_bg_layout,
+        entries: &[
+            buf_entry(0, &buffers.uniforms),
+            buf_entry(1, &buffers.vertices),
+            buf_entry(2, &buffers.indices),
+            buf_entry(3, &material.colors),
+            buf_entry(4, &buffers.densities),
+            buf_entry(5, &material.color_grads),
+            buf_entry(6, &buffers.sort_values), // sorted indices
+            buf_entry(7, &buffers.indirect_args),
+            buf_entry(8, &buffers.interval_vertex_buf),
+            buf_entry(9, &buffers.interval_tet_data_buf),
+        ],
+    })
+}
+
+/// Create a compute-interval gen bind group with an explicit sort_values buffer (B swap).
+pub fn create_compute_interval_gen_bind_group_with_sort_values(
+    device: &wgpu::Device,
+    pipelines: &ComputeIntervalPipelines,
+    buffers: &SceneBuffers,
+    material: &MaterialBuffers,
+    sort_values: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("compute_interval_gen_bg_sort_b"),
+        layout: &pipelines.gen_bg_layout,
+        entries: &[
+            buf_entry(0, &buffers.uniforms),
+            buf_entry(1, &buffers.vertices),
+            buf_entry(2, &buffers.indices),
+            buf_entry(3, &material.colors),
+            buf_entry(4, &buffers.densities),
+            buf_entry(5, &material.color_grads),
+            buf_entry(6, sort_values),
+            buf_entry(7, &buffers.indirect_args),
+            buf_entry(8, &buffers.interval_vertex_buf),
+            buf_entry(9, &buffers.interval_tet_data_buf),
+        ],
+    })
+}
+
+/// Create the compute-interval render bind group (3 bindings).
+///
+/// Binding order matches `interval_vertex.wgsl`:
+///   0: uniforms, 1: interval_vertex_buf, 2: interval_tet_data_buf
+pub fn create_compute_interval_render_bind_group(
+    device: &wgpu::Device,
+    pipelines: &ComputeIntervalPipelines,
+    buffers: &SceneBuffers,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("compute_interval_render_bg"),
+        layout: &pipelines.render_bg_layout,
+        entries: &[
+            buf_entry(0, &buffers.uniforms),
+            buf_entry(1, &buffers.interval_vertex_buf),
+            buf_entry(2, &buffers.interval_tet_data_buf),
+        ],
+    })
+}
+
+/// Create the compute-interval indirect convert bind group (2 bindings).
+pub fn create_compute_interval_indirect_convert_bind_group(
+    device: &wgpu::Device,
+    pipelines: &ComputeIntervalPipelines,
+    buffers: &SceneBuffers,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("compute_interval_indirect_convert_bg"),
+        layout: &pipelines.indirect_convert_bg_layout,
+        entries: &[
+            buf_entry(0, &buffers.indirect_args),
+            buf_entry(1, &buffers.interval_args_buf),
         ],
     })
 }
@@ -2310,6 +2652,160 @@ pub fn record_sorted_interval_forward_pass(
     }
 }
 
+/// Record a sorted forward pass using compute-based interval shading (no mesh shader needed).
+///
+/// Steps:
+///   1. Reset indirect args + interval_args_buf
+///   2. Compute pass (SH eval + cull + depth keys)
+///   3. Radix sort
+///   4. Indirect convert: writes both compute dispatch + draw-indexed-indirect args
+///   5. Compute pass: interval_compute generates vertices + per-tet data
+///   6. Render pass with instanced indexed draw + interval_fragment (single color output)
+pub fn record_sorted_compute_interval_forward_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    device: &wgpu::Device,
+    fwd_pipelines: &ForwardPipelines,
+    ci_pipelines: &ComputeIntervalPipelines,
+    sort_pipelines: &rmesh_sort::RadixSortPipelines,
+    sort_state: &rmesh_sort::RadixSortState,
+    buffers: &SceneBuffers,
+    targets: &RenderTargets,
+    compute_bg: &wgpu::BindGroup,
+    gen_bg_a: &wgpu::BindGroup,
+    gen_bg_b: &wgpu::BindGroup,
+    ci_render_bg: &wgpu::BindGroup,
+    ci_convert_bg: &wgpu::BindGroup,
+    tet_count: u32,
+    queue: &wgpu::Queue,
+    depth_view: &wgpu::TextureView,
+    hw_compute_bg: Option<&wgpu::BindGroup>,
+    profiler: Option<&wgpu::QuerySet>,
+) {
+    // ----- 1. Reset indirect args + interval_args_buf -----
+    let reset_cmd = DrawIndirectCommand {
+        vertex_count: 12,
+        instance_count: 0,
+        first_vertex: 0,
+        first_instance: 0,
+    };
+    queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
+    queue.write_buffer(
+        &buffers.interval_args_buf,
+        0,
+        bytemuck::cast_slice(&[0u32; 8]),
+    );
+
+    let n_pow2 = tet_count.next_power_of_two();
+    queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
+
+    // ----- 2. Compute pass (projection + SH eval) -----
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("project_compute"),
+            timestamp_writes: profiler.map(|qs| wgpu::ComputePassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(0),
+                end_of_pass_write_index: Some(1),
+            }),
+        });
+        if let Some(hw_bg) = hw_compute_bg {
+            cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
+            cpass.set_bind_group(0, hw_bg, &[]);
+        } else {
+            cpass.set_pipeline(&fwd_pipelines.compute_pipeline);
+            cpass.set_bind_group(0, compute_bg, &[]);
+        }
+
+        let workgroup_size = 64u32;
+        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+        let max_per_dim = 65535u32;
+        let dispatch_x = total_workgroups.min(max_per_dim);
+        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    }
+
+    // ----- 3. Radix sort -----
+    let result_in_b = rmesh_sort::record_radix_sort(
+        encoder, device, sort_pipelines, sort_state,
+        &buffers.sort_keys, &buffers.sort_values,
+    );
+
+    // ----- 4. Indirect convert → combined dispatch + draw args -----
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("compute_interval_indirect_convert"),
+            timestamp_writes: profiler.map(|qs| wgpu::ComputePassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(2),
+                end_of_pass_write_index: Some(3),
+            }),
+        });
+        cpass.set_pipeline(&ci_pipelines.indirect_convert_pipeline);
+        cpass.set_bind_group(0, ci_convert_bg, &[]);
+        cpass.dispatch_workgroups(1, 1, 1);
+    }
+
+    // ----- 5. Compute pass: generate interval vertices + indices -----
+    {
+        let gen_bg = if result_in_b { gen_bg_b } else { gen_bg_a };
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("compute_interval_gen"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&ci_pipelines.gen_pipeline);
+        cpass.set_bind_group(0, gen_bg, &[]);
+        cpass.dispatch_workgroups_indirect(&buffers.interval_args_buf, 0);
+    }
+
+    // ----- 6. Render pass (single color output) -----
+    {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("compute_interval_render"),
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
+            ],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: profiler.map(|qs| wgpu::RenderPassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(4),
+                end_of_pass_write_index: Some(5),
+            }),
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        rpass.set_viewport(
+            0.0,
+            0.0,
+            targets.width as f32,
+            targets.height as f32,
+            0.0,
+            1.0,
+        );
+        rpass.set_scissor_rect(0, 0, targets.width, targets.height);
+        rpass.set_pipeline(&ci_pipelines.render_pipeline);
+        rpass.set_bind_group(0, ci_render_bg, &[]);
+        rpass.set_index_buffer(buffers.interval_fan_index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        // draw-indexed-indirect args start at byte offset 12 (skip 3 dispatch u32s)
+        rpass.draw_indexed_indirect(&buffers.interval_args_buf, 12);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // High-level helpers
 // ---------------------------------------------------------------------------
@@ -2878,7 +3374,7 @@ pub struct RasterizeComputePipeline {
     /// Debug stats output buffer: [W x H x 4] u32 (ray_miss, ghost, occluded, useful)
     pub debug_image: wgpu::Buffer,
     /// Default aux bind group (group 1) with dummy aux_data + debug_image
-    aux_bind_group: wgpu::BindGroup,
+    pub aux_bind_group: wgpu::BindGroup,
     pub width: u32,
     pub height: u32,
     pub aux_dim: u32,

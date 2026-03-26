@@ -27,3 +27,7 @@ rmesh-util = { path = "../rmesh-util", features = ["test-util"] }
 [[bench]]
 name = "tiled_pipeline"
 harness = false
+
+[[bench]]
+name = "compute_interval"
+harness = false

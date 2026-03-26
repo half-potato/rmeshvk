@@ -289,3 +289,70 @@ fn test_cpu_reference_sanity() {
     let total_alpha: f32 = image.iter().map(|p| p[3]).sum();
     assert!(total_alpha > 0.1, "Image is all-zero");
 }
+
+/// Compute-interval shading: camera at the centroid of the tet, looking outward.
+/// Tests the compute-interval path for interior views (no mesh shader needed).
+#[test]
+fn test_compute_interval_center_view() {
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+    let scene = random_single_tet_scene(&mut rng, 0.3);
+
+    let verts = load_tet_verts(&scene, 0);
+    let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
+    let eye = centroid;
+    let target = centroid + Vec3::new(1.0, 0.0, 0.0);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
+
+    let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
+    let total_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
+    assert!(total_alpha > 0.01, "CPU image is all-zero");
+
+    if let Some(gpu_image) = gpu_compute_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
+        let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
+        eprintln!("compute_interval_center_view: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
+        let tol = ATOL + 0.3 * 0.6;
+        assert!(
+            mean_diff < tol,
+            "compute_interval_center_view: mean_diff {mean_diff} >= {tol}"
+        );
+    } else {
+        eprintln!("Skipping GPU compute-interval test (no adapter)");
+    }
+}
+
+/// Compute-interval shading: camera near a face of the tet, looking in.
+/// Tests standard outside-looking-in rendering via compute-interval path.
+#[test]
+fn test_compute_interval_face_view() {
+    let offsets = [0.1, 1.0, 5.0, 10.0];
+
+    for &offset in &offsets {
+        let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+        let scene = random_single_tet_scene(&mut rng, 0.3);
+
+        let verts = load_tet_verts(&scene, 0);
+        let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
+        let face_center = (verts[0] + verts[2] + verts[1]) / 3.0;
+        let face_normal = (face_center - centroid).normalize();
+
+        let eye = face_center + face_normal * offset;
+        let target = centroid;
+        let (vp, c2w, intrinsics) = setup_camera(eye, target);
+
+        let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
+
+        if let Some(gpu_image) = gpu_compute_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
+            let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
+            eprintln!(
+                "compute_interval_face_view offset={offset}: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}"
+            );
+            let tol = if offset < 1.0 { 0.03 } else { ATOL };
+            assert!(
+                mean_diff < tol,
+                "compute_interval offset={offset}: mean_diff {mean_diff} >= {tol}"
+            );
+        } else {
+            eprintln!("Skipping GPU compute-interval test (no adapter)");
+        }
+    }
+}

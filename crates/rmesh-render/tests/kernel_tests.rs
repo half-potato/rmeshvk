@@ -241,6 +241,55 @@ fn test_interval_forward_e2e() {
     }
 }
 
+/// Compute-interval pipeline creation test (no mesh shader needed).
+#[test]
+fn test_compute_interval_pipeline_creation() {
+    let (device, _queue) = match create_test_device() {
+        Some(dq) => dq,
+        None => {
+            eprintln!("Skipping test_compute_interval_pipeline_creation (no GPU)");
+            return;
+        }
+    };
+
+    let color_format = wgpu::TextureFormat::Rgba16Float;
+    let _ci = rmesh_render::ComputeIntervalPipelines::new(&device, color_format);
+    eprintln!("interval_compute.wgsl + interval_vertex.wgsl + interval_fragment.wgsl compiled successfully");
+}
+
+/// End-to-end compute-interval shading pass (no mesh shader needed).
+/// Compares GPU output against CPU reference.
+#[test]
+fn test_compute_interval_forward_e2e() {
+    const E2E_W: u32 = 64;
+    const E2E_H: u32 = 64;
+
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+    let scene = random_single_tet_scene(&mut rng, 0.3);
+
+    let verts = load_tet_verts(&scene, 0);
+    let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
+    let eye = centroid + Vec3::new(2.0, 0.0, 0.0);
+
+    let aspect = E2E_W as f32 / E2E_H as f32;
+    let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
+    let view = look_at(eye, centroid, Vec3::new(0.0, 0.0, 1.0));
+    let vp = proj * view;
+    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, centroid, std::f32::consts::FRAC_PI_2, E2E_W as f32, E2E_H as f32);
+
+    let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, E2E_W, E2E_H);
+    let total_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
+    assert!(total_alpha > 0.01, "CPU image is all-zero");
+
+    if let Some(gpu_image) = gpu_compute_interval_render_scene(&scene, eye, vp, c2w, intrinsics, E2E_W, E2E_H) {
+        let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
+        eprintln!("compute_interval_forward_e2e: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
+        assert!(mean_diff < 0.1, "mean_diff {mean_diff} >= 0.1");
+    } else {
+        eprintln!("Skipping GPU comparison (no adapter)");
+    }
+}
+
 /// End-to-end forward pass: compute → hardware rasterize.
 /// Verifies the legacy (non-tiled) pipeline produces output matching CPU.
 #[test]

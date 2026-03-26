@@ -1,7 +1,8 @@
 // Interval shading mesh shader.
 //
 // Decomposes each tet into 3-4 non-overlapping screen-space triangles with
-// interpolated front/back NDC depths. Each fragment is shaded exactly once.
+// interpolated front/back NDC depths for interval rendering.
+// Each fragment is shaded exactly once.
 //
 // 16 threads per workgroup → 1 thread per tet (16 tets per workgroup).
 // Max output: 16 × 15 = 240 vertices, 16 × 12 = 192 primitives.

@@ -8,7 +8,7 @@ use glam::{Mat4, Vec3};
 use rmesh_util::camera::{look_at, perspective_matrix};
 use rmesh_util::shared::{LossUniforms, TileUniforms};
 use rmesh_util::test_util::{
-    create_rw_buffer, create_timestamp_device, grid_tet_scene, print_timestamp_table,
+    grid_tet_scene, print_timestamp_table,
     TimestampRecorder,
 };
 use rmesh_train::{create_loss_bind_group, record_loss_pass, LossBuffers, LossPipeline};
@@ -87,8 +87,39 @@ struct BenchState {
     bwd_bg1: wgpu::BindGroup,
 }
 
+fn create_bench_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    pollster::block_on(async {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok()?;
+
+        let supported_limits = adapter.limits();
+        let limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 16,
+            ..supported_limits
+        };
+
+        adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::SUBGROUP
+                    | wgpu::Features::SHADER_FLOAT32_ATOMIC
+                    | wgpu::Features::TIMESTAMP_QUERY,
+                required_limits: limits,
+                ..Default::default()
+            })
+            .await
+            .ok()
+    })
+}
+
 fn create_bench_state() -> Option<BenchState> {
-    let (device, queue) = create_timestamp_device()?;
+    let (device, queue) = create_bench_device()?;
 
     eprintln!("Generating grid scene (grid_size={GRID_SIZE})...");
     let scene = grid_tet_scene(GRID_SIZE);
@@ -125,7 +156,7 @@ fn create_bench_state() -> Option<BenchState> {
         0.0,
         0,
         0.01,
-        1000.0,
+        100.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -723,6 +754,7 @@ fn print_forward_timestamp_breakdown(s: &BenchState) {
         });
         pass.set_pipeline(s.rasterize.pipeline());
         pass.set_bind_group(0, fwd_bg, &[]);
+        pass.set_bind_group(1, &s.rasterize.aux_bind_group, &[]);
         let (x, y) = rmesh_tile::dispatch_2d(s.tile_buffers.num_tiles);
         pass.dispatch_workgroups(x, y, 1);
     }
@@ -1032,6 +1064,7 @@ fn print_backward_timestamp_breakdown(s: &BenchState) {
         });
         pass.set_pipeline(s.rasterize.pipeline());
         pass.set_bind_group(0, fwd_bg, &[]);
+        pass.set_bind_group(1, &s.rasterize.aux_bind_group, &[]);
         let (x, y) = rmesh_tile::dispatch_2d(s.tile_buffers.num_tiles);
         pass.dispatch_workgroups(x, y, 1);
     }
@@ -1137,9 +1170,236 @@ fn bench_backward(c: &mut Criterion) {
     print_backward_timestamp_breakdown(&state);
 }
 
+// ---------------------------------------------------------------------------
+// Interval shading benchmark (mesh shaders — separate device)
+// ---------------------------------------------------------------------------
+
+/// GPU state for the interval shading benchmark.
+/// Separate from BenchState because it needs a device with mesh shader support.
+#[allow(dead_code)]
+struct IntervalBenchState {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    tet_count: u32,
+    buffers: rmesh_render::SceneBuffers,
+    material: rmesh_render::MaterialBuffers,
+    fwd_pipelines: rmesh_render::ForwardPipelines,
+    targets: rmesh_render::RenderTargets,
+    compute_bg: wgpu::BindGroup,
+    interval_pipelines: rmesh_render::IntervalPipelines,
+    sort_pipelines: rmesh_backward::RadixSortPipelines,
+    sort_state: rmesh_backward::RadixSortState,
+    interval_render_bg_a: wgpu::BindGroup,
+    interval_render_bg_b: wgpu::BindGroup,
+    indirect_convert_bg: wgpu::BindGroup,
+    depth_view: wgpu::TextureView,
+}
+
+fn create_interval_bench_state() -> Option<IntervalBenchState> {
+    let (device, queue) = pollster::block_on(async {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
+            ..Default::default()
+        });
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok()?;
+
+        let adapter_features = adapter.features();
+        if !adapter_features.contains(wgpu::Features::EXPERIMENTAL_MESH_SHADER) {
+            return None;
+        }
+
+        let supported_limits = adapter.limits();
+        let limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 16,
+            ..supported_limits
+        };
+
+        adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::SUBGROUP
+                    | wgpu::Features::SHADER_FLOAT32_ATOMIC
+                    | wgpu::Features::TIMESTAMP_QUERY
+                    | wgpu::Features::EXPERIMENTAL_MESH_SHADER,
+                required_limits: limits,
+                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+                ..Default::default()
+            })
+            .await
+            .ok()
+    })?;
+
+    eprintln!("Generating interval grid scene (grid_size={GRID_SIZE})...");
+    let scene = grid_tet_scene(GRID_SIZE);
+    eprintln!(
+        "Interval scene: {} vertices, {} tets",
+        scene.vertex_count, scene.tet_count
+    );
+
+    let (vp, c2w, intrinsics, eye) = setup_camera();
+
+    let color_format = wgpu::TextureFormat::Rgba16Float;
+    let base_colors = vec![0.5f32; scene.tet_count as usize * 3];
+    let (buffers, material, fwd_pipelines, targets, compute_bg, _render_bg) =
+        rmesh_render::setup_forward(
+            &device,
+            &queue,
+            &scene,
+            &base_colors,
+            &scene.color_grads,
+            W,
+            H,
+        );
+
+    let uniforms = rmesh_render::make_uniforms(
+        vp, c2w, intrinsics, eye,
+        W as f32, H as f32,
+        scene.tet_count, 0u32, 16, 0.0, 0,
+        0.01, 100.0,
+    );
+    queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+
+    // Interval shading pipelines
+    let interval_pipelines = rmesh_render::IntervalPipelines::new(&device, color_format);
+
+    // Sort infrastructure (32-bit keys, 1 payload — tet-level sort)
+    let n_pow2 = scene.tet_count.next_power_of_two();
+    let sort_pipelines =
+        rmesh_backward::RadixSortPipelines::new(&device, 1, rmesh_backward::SortBackend::Drs);
+    let sort_state = rmesh_backward::RadixSortState::new(
+        &device, n_pow2, 32, 1, rmesh_backward::SortBackend::Drs,
+    );
+    sort_state.upload_configs(&queue);
+
+    // Interval bind groups (A and B for sort buffer swapping)
+    let interval_render_bg_a = rmesh_render::create_interval_render_bind_group(
+        &device, &interval_pipelines, &buffers, &material,
+    );
+    let interval_render_bg_b = rmesh_render::create_interval_render_bind_group_with_sort_values(
+        &device, &interval_pipelines, &buffers, &material, sort_state.values_b(),
+    );
+    let indirect_convert_bg = rmesh_render::create_interval_indirect_convert_bind_group(
+        &device, &interval_pipelines, &buffers,
+    );
+
+    // Depth texture for the render pass
+    let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("bench_interval_depth"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+    Some(IntervalBenchState {
+        device,
+        queue,
+        tet_count: scene.tet_count,
+        buffers,
+        material,
+        fwd_pipelines,
+        targets,
+        compute_bg,
+        interval_pipelines,
+        sort_pipelines,
+        sort_state,
+        interval_render_bg_a,
+        interval_render_bg_b,
+        indirect_convert_bg,
+        depth_view,
+    })
+}
+
+/// Record and submit the full interval shading pipeline.
+fn run_forward_interval(s: &IntervalBenchState) {
+    let mut encoder = s
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+    // Clear color and depth
+    {
+        let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("bench_interval_clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &s.targets.color_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &s.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+    }
+
+    rmesh_render::record_sorted_interval_forward_pass(
+        &mut encoder,
+        &s.device,
+        &s.fwd_pipelines,
+        &s.interval_pipelines,
+        &s.sort_pipelines,
+        &s.sort_state,
+        &s.buffers,
+        &s.targets,
+        &s.compute_bg,
+        &s.interval_render_bg_a,
+        &s.interval_render_bg_b,
+        &s.indirect_convert_bg,
+        s.tet_count,
+        &s.queue,
+        &s.depth_view,
+        None,
+        None,
+    );
+
+    s.queue.submit(std::iter::once(encoder.finish()));
+    let _ = s.device.poll(wgpu::PollType::wait_indefinitely());
+}
+
+fn bench_interval(c: &mut Criterion) {
+    let state = match create_interval_bench_state() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping bench_interval (no GPU with MESH_SHADER + TIMESTAMP_QUERY)");
+            return;
+        }
+    };
+
+    // Warmup
+    run_forward_interval(&state);
+
+    c.bench_function("forward_interval_2M", |b| {
+        b.iter(|| run_forward_interval(&state));
+    });
+}
+
 criterion_group! {
     name = tiled_pipeline;
     config = Criterion::default().sample_size(20);
     targets = bench_forward, bench_backward
 }
-criterion_main!(tiled_pipeline);
+criterion_group! {
+    name = interval_pipeline;
+    config = Criterion::default().sample_size(20);
+    targets = bench_interval
+}
+criterion_main!(tiled_pipeline, interval_pipeline);
