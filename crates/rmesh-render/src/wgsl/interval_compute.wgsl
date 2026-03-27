@@ -331,13 +331,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
 
         // Slots 0-3: 4 silhouette vertices: ea.x, eb.x, ea.y, eb.y
+        // Reuse offsets already computed above for center interpolation.
         let sv = array<u32, 4>(ea.x, eb.x, ea.y, eb.y);
+        let sv_off = array<f32, 4>(off_ea_x, off_eb_x, off_ea_y, off_eb_y);
         for (var i = 0u; i < 4u; i++) {
-            let vi = sv[i];
-            let off = dot(grad, v_world[vi] - cam_pos);
-            write_vertex(v_base + u32(i), ndc_xy[vi],
-                         ndc_z[vi], ndc_z[vi],
-                         off, off);
+            write_vertex(v_base + u32(i), ndc_xy[sv[i]],
+                         ndc_z[sv[i]], ndc_z[sv[i]],
+                         sv_off[i], sv_off[i]);
         }
 
         // Slot 4: center vertex (intersection point)

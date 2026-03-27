@@ -60,9 +60,18 @@ struct ComputeIntervalBenchState {
     ci_render_bg: wgpu::BindGroup,
     ci_convert_bg: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
+    use_16bit_sort: bool,
 }
 
 fn create_bench_state() -> Option<ComputeIntervalBenchState> {
+    create_bench_state_with_bits(32)
+}
+
+fn create_bench_state_16bit() -> Option<ComputeIntervalBenchState> {
+    create_bench_state_with_bits(16)
+}
+
+fn create_bench_state_with_bits(sorting_bits: u32) -> Option<ComputeIntervalBenchState> {
     let (device, queue) = pollster::block_on(async {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = instance
@@ -124,12 +133,12 @@ fn create_bench_state() -> Option<ComputeIntervalBenchState> {
 
     let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, color_format);
 
-    // Sort infrastructure (32-bit keys, 1 payload — tet-level sort)
+    // Sort infrastructure (sorting_bits-bit keys, 1 payload — tet-level sort)
     let n_pow2 = scene.tet_count.next_power_of_two();
     let sort_pipelines =
         rmesh_backward::RadixSortPipelines::new(&device, 1, rmesh_backward::SortBackend::Drs);
     let sort_state = rmesh_backward::RadixSortState::new(
-        &device, n_pow2, 32, 1, rmesh_backward::SortBackend::Drs,
+        &device, n_pow2, sorting_bits, 1, rmesh_backward::SortBackend::Drs,
     );
     sort_state.upload_configs(&queue);
 
@@ -176,6 +185,7 @@ fn create_bench_state() -> Option<ComputeIntervalBenchState> {
         ci_render_bg,
         ci_convert_bg,
         depth_view,
+        use_16bit_sort: sorting_bits == 16,
     })
 }
 
@@ -228,6 +238,7 @@ fn run_forward(s: &ComputeIntervalBenchState) {
         &s.depth_view,
         None,
         None,
+        s.use_16bit_sort,
     );
 
     s.queue.submit(std::iter::once(encoder.finish()));
@@ -251,9 +262,26 @@ fn bench_compute_interval(c: &mut Criterion) {
     });
 }
 
+fn bench_compute_interval_16bit(c: &mut Criterion) {
+    let state = match create_bench_state_16bit() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping 16-bit bench (no GPU with SUBGROUP + TIMESTAMP_QUERY)");
+            return;
+        }
+    };
+
+    // Warmup
+    run_forward(&state);
+
+    c.bench_function("forward_compute_interval_16bit_2M", |b| {
+        b.iter(|| run_forward(&state));
+    });
+}
+
 criterion_group! {
     name = compute_interval;
     config = Criterion::default().sample_size(20);
-    targets = bench_compute_interval
+    targets = bench_compute_interval, bench_compute_interval_16bit
 }
 criterion_main!(compute_interval);

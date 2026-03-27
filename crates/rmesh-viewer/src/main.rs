@@ -144,6 +144,7 @@ struct GpuState {
     blit_pipeline: BlitPipeline,
     sort_pipelines: rmesh_sort::RadixSortPipelines,
     sort_state: rmesh_sort::RadixSortState,
+    sort_state_16bit: rmesh_sort::RadixSortState,
     sort_backend: rmesh_sort::SortBackend,
     buffers: SceneBuffers,
     material_buffers: MaterialBuffers,
@@ -172,6 +173,9 @@ struct GpuState {
     compute_interval_pipelines: ComputeIntervalPipelines,
     compute_interval_gen_bg_a: wgpu::BindGroup,
     compute_interval_gen_bg_b: wgpu::BindGroup,
+    // 16-bit sort: gen bind groups using sort_state_16bit's values_b
+    compute_interval_gen_bg_a_16bit: wgpu::BindGroup,
+    compute_interval_gen_bg_b_16bit: wgpu::BindGroup,
     compute_interval_render_bg: wgpu::BindGroup,
     compute_interval_convert_bg: wgpu::BindGroup,
     // Quad prepass bind groups (A/B for sort result location)
@@ -232,6 +236,7 @@ struct App {
     fluid_params: FluidParams,
     // Rendering options
     show_primitives: bool,
+    sort_16bit: bool,
     // Transform interaction
     interaction: TransformInteraction,
     primitives: Vec<Primitive>,
@@ -269,6 +274,7 @@ impl App {
             fluid_enabled: false,
             fluid_params: FluidParams::default(),
             show_primitives: false,
+            sort_16bit: false,
             interaction: TransformInteraction::new(),
             primitives: Vec::new(),
             next_primitive_id: 1,
@@ -547,6 +553,8 @@ impl App {
         let n_pow2 = (self.scene_data.tet_count as u32).next_power_of_two();
         let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, sort_backend);
         sort_state.upload_configs(&queue);
+        let sort_state_16bit = rmesh_sort::RadixSortState::new(&device, n_pow2, 16, 1, sort_backend);
+        sort_state_16bit.upload_configs(&queue);
         log::info!("Sort pipelines: {:.2}s", t0.elapsed().as_secs_f64());
 
         // Fluid simulation: lazily initialized when first enabled (saves ~500MB GPU memory)
@@ -594,6 +602,13 @@ impl App {
         );
         let compute_interval_gen_bg_b = create_compute_interval_gen_bind_group_with_sort_values(
             &device, &compute_interval_pipelines, &buffers, &material, sort_state.values_b(),
+        );
+        // 16-bit sort variant: gen bind groups use sort_state_16bit's values_b
+        let compute_interval_gen_bg_a_16bit = create_compute_interval_gen_bind_group(
+            &device, &compute_interval_pipelines, &buffers, &material,
+        );
+        let compute_interval_gen_bg_b_16bit = create_compute_interval_gen_bind_group_with_sort_values(
+            &device, &compute_interval_pipelines, &buffers, &material, sort_state_16bit.values_b(),
         );
         let compute_interval_render_bg = create_compute_interval_render_bind_group(
             &device, &compute_interval_pipelines, &buffers,
@@ -680,6 +695,7 @@ impl App {
             blit_pipeline,
             sort_pipelines,
             sort_state,
+            sort_state_16bit,
             sort_backend,
             buffers,
             material_buffers: material,
@@ -704,6 +720,8 @@ impl App {
             compute_interval_pipelines,
             compute_interval_gen_bg_a,
             compute_interval_gen_bg_b,
+            compute_interval_gen_bg_a_16bit,
+            compute_interval_gen_bg_b_16bit,
             compute_interval_render_bg,
             compute_interval_convert_bg,
             prepass_bg_a,
@@ -913,6 +931,7 @@ impl App {
         let mesh_shader_supported = self.mesh_shader_supported;
         let mut fluid_enabled = self.fluid_enabled;
         let mut show_primitives = self.show_primitives;
+        let mut sort_16bit = self.sort_16bit;
         let mut fluid_reset = false;
         let fluid_params = &mut self.fluid_params;
         let interact_display = self.interaction.display_info();
@@ -958,6 +977,9 @@ impl App {
                             });
                         ui.checkbox(&mut fluid_enabled, "Fluid Sim");
                         ui.checkbox(&mut show_primitives, "Show Primitives");
+                        if render_mode == RenderMode::IntervalShader {
+                            ui.checkbox(&mut sort_16bit, "16-bit Sort");
+                        }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(format!(
@@ -1083,6 +1105,7 @@ impl App {
         self.render_mode = render_mode;
         self.fluid_enabled = fluid_enabled;
         self.show_primitives = show_primitives;
+        self.sort_16bit = sort_16bit;
 
         // Handle primitive add/delete/selection
         if let Some(kind) = add_primitive {
@@ -1270,18 +1293,23 @@ impl App {
         //    Color uses LoadOp::Load (preserves primitive colors), depth test culls behind primitives
         match self.render_mode {
             RenderMode::IntervalShader => {
+                let (sort_st, gen_a, gen_b) = if self.sort_16bit {
+                    (&gpu.sort_state_16bit, &gpu.compute_interval_gen_bg_a_16bit, &gpu.compute_interval_gen_bg_b_16bit)
+                } else {
+                    (&gpu.sort_state, &gpu.compute_interval_gen_bg_a, &gpu.compute_interval_gen_bg_b)
+                };
                 rmesh_render::record_sorted_compute_interval_forward_pass(
                     &mut encoder,
                     &gpu.device,
                     &gpu.pipelines,
                     &gpu.compute_interval_pipelines,
                     &gpu.sort_pipelines,
-                    &gpu.sort_state,
+                    sort_st,
                     &gpu.buffers,
                     &gpu.targets,
                     &gpu.compute_bg,
-                    &gpu.compute_interval_gen_bg_a,
-                    &gpu.compute_interval_gen_bg_b,
+                    gen_a,
+                    gen_b,
                     &gpu.compute_interval_render_bg,
                     &gpu.compute_interval_convert_bg,
                     gpu.tet_count,
@@ -1289,6 +1317,7 @@ impl App {
                     &gpu.primitive_targets.depth_view,
                     Some(&gpu.hw_compute_bg),
                     Some(&gpu.ts_query_set),
+                    self.sort_16bit,
                 );
             }
             RenderMode::MeshShader
@@ -1536,6 +1565,8 @@ impl App {
             let n_pow2 = (gpu.tet_count as u32).next_power_of_two();
             gpu.sort_state = rmesh_sort::RadixSortState::new(&gpu.device, n_pow2, 32, 1, gpu.sort_backend);
             gpu.sort_state.upload_configs(&gpu.queue);
+            gpu.sort_state_16bit = rmesh_sort::RadixSortState::new(&gpu.device, n_pow2, 16, 1, gpu.sort_backend);
+            gpu.sort_state_16bit.upload_configs(&gpu.queue);
 
             // Recreate bind groups
             gpu.compute_bg = create_compute_bind_group(
@@ -1614,6 +1645,13 @@ impl App {
             gpu.compute_interval_gen_bg_b = create_compute_interval_gen_bind_group_with_sort_values(
                 &gpu.device, &gpu.compute_interval_pipelines, &gpu.buffers, &gpu.material_buffers,
                 gpu.sort_state.values_b(),
+            );
+            gpu.compute_interval_gen_bg_a_16bit = create_compute_interval_gen_bind_group(
+                &gpu.device, &gpu.compute_interval_pipelines, &gpu.buffers, &gpu.material_buffers,
+            );
+            gpu.compute_interval_gen_bg_b_16bit = create_compute_interval_gen_bind_group_with_sort_values(
+                &gpu.device, &gpu.compute_interval_pipelines, &gpu.buffers, &gpu.material_buffers,
+                gpu.sort_state_16bit.values_b(),
             );
             gpu.compute_interval_render_bg = create_compute_interval_render_bind_group(
                 &gpu.device, &gpu.compute_interval_pipelines, &gpu.buffers,

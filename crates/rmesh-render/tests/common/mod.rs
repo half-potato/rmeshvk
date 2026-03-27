@@ -1588,6 +1588,7 @@ async fn gpu_compute_interval_render_scene_async(
         &depth_view,
         None,
         None,
+        false,
     );
 
     // Copy color texture to readback buffer

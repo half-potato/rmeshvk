@@ -46,6 +46,7 @@ const INTERVAL_FRAGMENT_WGSL: &str = include_str!("wgsl/interval_fragment.wgsl")
 const INTERVAL_COMPUTE_WGSL: &str = include_str!("wgsl/interval_compute.wgsl");
 const INTERVAL_VERTEX_WGSL: &str = include_str!("wgsl/interval_vertex.wgsl");
 const INTERVAL_INDIRECT_CONVERT_WGSL: &str = include_str!("wgsl/interval_indirect_convert.wgsl");
+const PROJECT_COMPUTE_16BIT_WGSL: &str = include_str!("wgsl/project_compute_16bit.wgsl");
 
 // ---------------------------------------------------------------------------
 // GPU Buffers
@@ -310,6 +311,8 @@ impl MaterialBuffers {
 /// Compiled pipelines for the forward pass.
 pub struct ForwardPipelines {
     pub compute_pipeline: wgpu::ComputePipeline,
+    /// 16-bit linear sort key variant of compute_pipeline (same layout).
+    pub compute_pipeline_16bit: wgpu::ComputePipeline,
     pub compute_bind_group_layout: wgpu::BindGroupLayout,
     /// Lean HW-only projection compute (no tile counting)
     pub hw_compute_pipeline: wgpu::ComputePipeline,
@@ -389,6 +392,21 @@ impl ForwardPipelines {
                 label: Some("project_compute_pipeline"),
                 layout: Some(&compute_pipeline_layout),
                 module: &compute_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // ----- 16-bit linear sort key variant (same layout, different shader) -----
+        let compute_shader_16bit = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("project_compute_16bit.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(PROJECT_COMPUTE_16BIT_WGSL.into()),
+        });
+        let compute_pipeline_16bit =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("project_compute_16bit_pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &compute_shader_16bit,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: None,
@@ -666,6 +684,7 @@ impl ForwardPipelines {
 
         Self {
             compute_pipeline,
+            compute_pipeline_16bit,
             compute_bind_group_layout,
             hw_compute_pipeline,
             hw_compute_bind_group_layout,
@@ -2680,6 +2699,7 @@ pub fn record_sorted_compute_interval_forward_pass(
     depth_view: &wgpu::TextureView,
     hw_compute_bg: Option<&wgpu::BindGroup>,
     profiler: Option<&wgpu::QuerySet>,
+    use_16bit_sort: bool,
 ) {
     // ----- 1. Reset indirect args + interval_args_buf -----
     let reset_cmd = DrawIndirectCommand {
@@ -2708,7 +2728,11 @@ pub fn record_sorted_compute_interval_forward_pass(
                 end_of_pass_write_index: Some(1),
             }),
         });
-        if let Some(hw_bg) = hw_compute_bg {
+        if use_16bit_sort {
+            // 16-bit linear key shader needs full 14-binding layout (accesses far_plane)
+            cpass.set_pipeline(&fwd_pipelines.compute_pipeline_16bit);
+            cpass.set_bind_group(0, compute_bg, &[]);
+        } else if let Some(hw_bg) = hw_compute_bg {
             cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
             cpass.set_bind_group(0, hw_bg, &[]);
         } else {
