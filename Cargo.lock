@@ -3562,6 +3562,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmesh-dsm"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "rmesh-render",
+ "rmesh-util",
+ "wgpu",
+]
+
+[[package]]
 name = "rmesh-error"
 version = "0.1.0"
 dependencies = [

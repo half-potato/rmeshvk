@@ -124,7 +124,7 @@ impl App {
             gpu.surface_config.present_mode = if self.vsync {
                 wgpu::PresentMode::Fifo
             } else {
-                wgpu::PresentMode::Mailbox
+                wgpu::PresentMode::Immediate
             };
             log::info!("Reconfiguring surface: present_mode={:?} frame_latency={}",
                 gpu.surface_config.present_mode,
@@ -198,6 +198,7 @@ impl App {
         let mut delete_selected = false;
         let primitives_ref = &self.primitives;
         let has_pbr = gpu.has_pbr_data;
+        let rt_locate_ms = self.rt_locate_ms;
         let mut deferred_enabled = self.deferred_enabled;
         let mut ambient = self.ambient;
         let mut deferred_debug_mode = self.deferred_debug_mode;
@@ -226,16 +227,14 @@ impl App {
                     });
                     ui.menu_button("Settings", |ui| {
                         ui.checkbox(&mut vsync, "Vsync");
-                        egui::ComboBox::from_label("Renderer")
-                            .selected_text(format!("{}", render_mode))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut render_mode, RenderMode::Regular, "Regular");
-                                ui.selectable_value(&mut render_mode, RenderMode::Quad, "Quad");
-                                if mesh_shader_supported {
-                                    ui.selectable_value(&mut render_mode, RenderMode::MeshShader, "Mesh Shader");
-                                }
-                                ui.selectable_value(&mut render_mode, RenderMode::IntervalShader, "Interval Shader");
-                            });
+                        ui.label("Renderer");
+                        ui.radio_value(&mut render_mode, RenderMode::Regular, "Regular");
+                        ui.radio_value(&mut render_mode, RenderMode::Quad, "Quad");
+                        if mesh_shader_supported {
+                            ui.radio_value(&mut render_mode, RenderMode::MeshShader, "Mesh Shader");
+                        }
+                        ui.radio_value(&mut render_mode, RenderMode::IntervalShader, "Interval Shader");
+                        ui.radio_value(&mut render_mode, RenderMode::RayTrace, "Ray Trace");
                         ui.checkbox(&mut fluid_enabled, "Fluid Sim");
                         ui.checkbox(&mut show_primitives, "Show Primitives");
                         if render_mode == RenderMode::IntervalShader {
@@ -251,19 +250,21 @@ impl App {
                                 "Diffuse", "Shadow", "Retro", "Lambda",
                                 "Plaster", "Alpha",
                             ];
-                            let current_label = debug_labels.get(deferred_debug_mode as usize).unwrap_or(&"Final");
-                            egui::ComboBox::from_label("Debug Layer")
-                                .selected_text(*current_label)
-                                .show_ui(ui, |ui| {
-                                    for (i, label) in debug_labels.iter().enumerate() {
-                                        ui.selectable_value(&mut deferred_debug_mode, i as u32, *label);
-                                    }
-                                });
+                            ui.separator();
+                            ui.label("Debug Layer");
+                            for (i, label) in debug_labels.iter().enumerate() {
+                                ui.radio_value(&mut deferred_debug_mode, i as u32, *label);
+                            }
                         }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let rt_info = if render_mode == RenderMode::RayTrace {
+                            format!("  |  Locate:{:.2}ms", rt_locate_ms)
+                        } else {
+                            String::new()
+                        };
                         ui.label(format!(
-                            "FPS: {:.0}  |  {} vis / {} tets  |  GPU: {:.1}ms (SH:{:.1} Proj:{:.1} Sort:{:.1} Pre:{:.1} Rend:{:.1})  |  CPU: {:.1}ms (Poll:{:.1} Acq:{:.1} Egui:{:.1} Enc:{:.1} Sub:{:.1} Pres:{:.1})",
+                            "FPS: {:.0}  |  {} vis / {} tets  |  GPU: {:.1}ms (SH:{:.1} Proj:{:.1} Sort:{:.1} Pre:{:.1} Rend:{:.1})  |  CPU: {:.1}ms (Poll:{:.1} Acq:{:.1} Egui:{:.1} Enc:{:.1} Sub:{:.1} Pres:{:.1}){}",
                             fps, visible_count, tet_count,
                             gpu_times.total_ms,
                             gpu_times.sh_eval_ms,
@@ -278,6 +279,7 @@ impl App {
                             cpu_times.encode_ms,
                             cpu_times.submit_ms,
                             cpu_times.present_ms,
+                            rt_info,
                         ));
                     });
                 });
@@ -574,6 +576,7 @@ impl App {
 
         // 2. Sorted forward pass: compute → radix sort → render
         //    Color uses LoadOp::Load (preserves primitive colors), depth test culls behind primitives
+        let mrt_enabled = self.deferred_enabled && gpu.has_pbr_data;
         match self.render_mode {
             RenderMode::IntervalShader => {
                 let (sort_st, gen_a, gen_b) = if self.sort_16bit {
@@ -601,6 +604,7 @@ impl App {
                     Some(&gpu.hw_compute_bg),
                     Some(&gpu.ts_query_set),
                     self.sort_16bit,
+                    mrt_enabled,
                 );
             }
             RenderMode::MeshShader
@@ -625,6 +629,80 @@ impl App {
                     &gpu.primitive_targets.depth_view,
                     Some(&gpu.hw_compute_bg),
                     Some(&gpu.ts_query_set),
+                    mrt_enabled,
+                );
+            }
+            RenderMode::RayTrace => {
+                // Update start_tet for current camera position
+                let t_locate = std::time::Instant::now();
+                let hint = if self.rt_start_tet_hint >= 0 { self.rt_start_tet_hint as usize } else { 0 };
+                let new_start = rmesh_render::find_containing_tet_walk(
+                    &self.scene_data.vertices,
+                    &self.scene_data.indices,
+                    &self.rt_neighbors_cpu,
+                    self.scene_data.tet_count as usize,
+                    self.camera.position,
+                    hint,
+                ).map(|t| t as i32).unwrap_or(-1);
+                let locate_ms = t_locate.elapsed().as_secs_f32() * 1000.0;
+                let alpha = 0.1f32;
+                self.rt_locate_ms = self.rt_locate_ms * (1.0 - alpha) + locate_ms * alpha;
+                self.rt_start_tet_hint = new_start;
+                gpu.queue.write_buffer(&gpu.rt_buffers.start_tet, 0, bytemuck::cast_slice(&[new_start]));
+
+                // Forward compute (SH eval + color computation)
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("rt_project_compute"),
+                        timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                            query_set: &gpu.ts_query_set,
+                            beginning_of_pass_write_index: Some(0),
+                            end_of_pass_write_index: Some(1),
+                        }),
+                    });
+                    cpass.set_pipeline(&gpu.pipelines.compute_pipeline);
+                    cpass.set_bind_group(0, &gpu.compute_bg, &[]);
+                    let n_pow2 = gpu.tet_count.next_power_of_two();
+                    let wgs = (n_pow2 + 63) / 64;
+                    cpass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
+                }
+
+                // Clear raytrace output
+                encoder.clear_buffer(&gpu.rt_pipeline.rendered_image, 0, None);
+
+                // Ray trace compute pass (timestamped)
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("raytrace"),
+                        timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                            query_set: &gpu.ts_query_set,
+                            beginning_of_pass_write_index: Some(4),
+                            end_of_pass_write_index: Some(5),
+                        }),
+                    });
+                    cpass.set_pipeline(gpu.rt_pipeline.pipeline());
+                    cpass.set_bind_group(0, &gpu.rt_bg, &[]);
+                    cpass.set_bind_group(1, &gpu.rt_pipeline.aux_bind_group, &[]);
+                    cpass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+                }
+
+                // Copy raytrace buffer → Rgba32Float texture for blitting
+                encoder.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &gpu.rt_pipeline.rendered_image,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(w * 16), // 4 channels * 4 bytes/f32
+                            rows_per_image: Some(h),
+                        },
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.rt_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                 );
             }
             _ => {
@@ -648,6 +726,7 @@ impl App {
                     Some(&gpu.prepass_bg_b),
                     Some(&gpu.quad_render_bg),
                     Some(&gpu.ts_query_set),
+                    mrt_enabled,
                 );
             }
         }
@@ -661,8 +740,16 @@ impl App {
             );
         }
 
-        // 3. Deferred shading pass (if enabled + PBR data present)
+        // Submit forward pass before deferred to avoid read-after-write stall on hw depth
         let use_deferred = self.deferred_enabled && gpu.deferred_pipeline.is_some();
+        if use_deferred {
+            gpu.queue.submit(std::iter::once(encoder.finish()));
+            encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("deferred+blit"),
+            });
+        }
+
+        // 3. Deferred shading pass (if enabled + PBR data present)
         if use_deferred {
             if let (Some(ref deferred), Some(ref bg), Some(ref out_view)) =
                 (&gpu.deferred_pipeline, &gpu.deferred_bg, &gpu.deferred_output_view)
@@ -716,6 +803,9 @@ impl App {
                     height: h,
                     ambient: self.ambient,
                     debug_mode: self.deferred_debug_mode,
+                    near_plane: self.camera.near_z,
+                    far_plane: self.camera.far_z,
+                    _pad: [0.0; 2],
                 };
                 gpu.queue.write_buffer(
                     &deferred.uniforms_buf, 0,
@@ -729,13 +819,19 @@ impl App {
             }
         }
 
-        // 4. Blit to swapchain — from deferred output if active, else from color_view
-        let blit_bg = if use_deferred {
-            gpu.deferred_blit_bg.as_ref().unwrap_or(&gpu.blit_bg)
+        // 4. Blit to swapchain — from raytrace output, deferred output, or color_view
+        if self.render_mode == RenderMode::RayTrace {
+            rmesh_render::record_blit_nf(
+                &mut encoder, &gpu.rt_blit_pipeline, &gpu.rt_blit_bg, &view,
+            );
         } else {
-            &gpu.blit_bg
-        };
-        record_blit(&mut encoder, &gpu.blit_pipeline, blit_bg, &view);
+            let blit_bg = if use_deferred {
+                gpu.deferred_blit_bg.as_ref().unwrap_or(&gpu.blit_bg)
+            } else {
+                &gpu.blit_bg
+            };
+            record_blit(&mut encoder, &gpu.blit_pipeline, blit_bg, &view);
+        }
 
         // egui render pass (overlay on swapchain)
         {

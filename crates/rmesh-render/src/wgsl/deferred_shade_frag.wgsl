@@ -1,8 +1,11 @@
 // Deferred PBR shading — fullscreen triangle render pass.
 //
-// Reads MRT textures from the forward rasterization pass (plaster, aux0,
-// normals, depth+albedo), computes per-pixel lighting, outputs lit color
-// in linear space (blit handles sRGB conversion).
+// Reads MRT textures from the forward rasterization pass:
+//   color_tex:   plaster.rgb * a, a
+//   aux0_tex:    roughness * a, env_f0 * a, env_f1 * a, a
+//   normals_tex: oct_normal.xy * a, pack(env_f2,env_f3) * a, a
+//   albedo_tex:  albedo.rgb * a, a
+// Plus hw depth buffer for world-position reconstruction.
 //
 // Phase A: Lambertian diffuse only (no neural specular, no shadows).
 
@@ -14,6 +17,9 @@ struct DeferredUniforms {
     height: u32,
     ambient: f32,
     debug_mode: u32,
+    near_plane: f32,
+    far_plane: f32,
+    _pad: vec2f,
 }
 
 struct Light {
@@ -30,11 +36,12 @@ struct Light {
 }
 
 @group(0) @binding(0) var<uniform> uniforms: DeferredUniforms;
-@group(0) @binding(1) var color_tex: texture_2d<f32>;    // plaster RGBA (premul alpha)
-@group(0) @binding(2) var aux0_tex: texture_2d<f32>;     // roughness, env_feat[0..2]
-@group(0) @binding(3) var normals_tex: texture_2d<f32>;  // normal.xyz * alpha, env_feat[3] * alpha
-@group(0) @binding(4) var depth_tex: texture_2d<f32>;    // depth * alpha, albedo.rgb * alpha
+@group(0) @binding(1) var color_tex: texture_2d<f32>;     // plaster RGBA
+@group(0) @binding(2) var aux0_tex: texture_2d<f32>;      // roughness, env_f0, env_f1, alpha
+@group(0) @binding(3) var normals_tex: texture_2d<f32>;   // oct_normal.xy, env_f2f3_packed, alpha
+@group(0) @binding(4) var albedo_tex: texture_2d<f32>;    // albedo.rgb, alpha
 @group(0) @binding(5) var<storage, read> lights: array<Light>;
+@group(0) @binding(6) var hw_depth_tex: texture_depth_2d; // hardware depth buffer
 
 // Debug mode constants
 const DBG_FINAL:       u32 = 0u;
@@ -44,8 +51,30 @@ const DBG_NORMALS:     u32 = 3u;
 const DBG_ROUGHNESS:   u32 = 4u;
 const DBG_ENV_FEATURE: u32 = 5u;
 const DBG_DEPTH:       u32 = 6u;
+const DBG_SPECULAR:    u32 = 7u;
+const DBG_DIFFUSE:     u32 = 8u;
+const DBG_SHADOW:      u32 = 9u;
+const DBG_RETRO:       u32 = 10u;
+const DBG_LAMBDA:      u32 = 11u;
 const DBG_PLASTER:     u32 = 12u;
 const DBG_ALPHA:       u32 = 13u;
+
+// Octahedral normal decoding: [0,1]^2 → unit sphere
+fn oct_decode(e: vec2f) -> vec3f {
+    let p = e * 2.0 - 1.0;
+    var n = vec3f(p.xy, 1.0 - abs(p.x) - abs(p.y));
+    if (n.z < 0.0) {
+        n = vec3f((1.0 - abs(n.yx)) * sign(n.xy), n.z);
+    }
+    return normalize(n);
+}
+
+// Unpack two [0,1] values from one float (inverse of pack_2f)
+fn unpack_2f(v: f32) -> vec2f {
+    let a = floor(v) / 255.0;
+    let b = v - floor(v);
+    return vec2f(a, b);
+}
 
 struct VsOut {
     @builtin(position) pos: vec4f,
@@ -53,7 +82,6 @@ struct VsOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
-    // Fullscreen triangle: 3 vertices cover clip space [-1,1]^2.
     let x = f32(i32(vid & 1u) * 4 - 1);
     let y = f32(i32(vid >> 1u) * 4 - 1);
     var out: VsOut;
@@ -69,11 +97,10 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let color_raw = textureLoad(color_tex, coords, 0);
     let aux0_raw = textureLoad(aux0_tex, coords, 0);
     let normals_raw = textureLoad(normals_tex, coords, 0);
-    let depth_raw = textureLoad(depth_tex, coords, 0);
+    let albedo_raw = textureLoad(albedo_tex, coords, 0);
+    let hw_depth = textureLoad(hw_depth_tex, coords, 0);
 
-    // Alpha from plaster (premultiplied — .a channel is alpha directly for Rgba16Float blend)
-    // The forward pass uses premultiplied alpha blending: rgb *= alpha, a = alpha.
-    // After all tets are blended, total_alpha = 1 - product(1 - alpha_i) is in .a.
+    // Alpha from any target (all have alpha in .a via premul blend)
     let alpha = color_raw.a;
 
     if (alpha < 0.01) {
@@ -84,19 +111,34 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let inv_alpha = 1.0 / max(alpha, 1e-6);
     let plaster = color_raw.rgb * inv_alpha;
     let roughness = aux0_raw.r * inv_alpha;
-    let env_feat = vec4f(aux0_raw.gba * inv_alpha, normals_raw.a * inv_alpha);
-    let normal = normalize(normals_raw.rgb * inv_alpha);
-    let depth = depth_raw.r * inv_alpha;
-    let raw_albedo = depth_raw.gba * inv_alpha;
+    let env_f0 = aux0_raw.g * inv_alpha;
+    let env_f1 = aux0_raw.b * inv_alpha;
+
+    // Decode octahedral normal
+    let oct_n = normals_raw.rg * inv_alpha;
+    let normal = oct_decode(oct_n);
+
+    // Unpack env_f2 + env_f3
+    let env_packed = normals_raw.b * inv_alpha;
+    let env_23 = unpack_2f(env_packed);
+    let env_feat = vec4f(env_f0, env_f1, env_23.x, env_23.y);
+
+    let raw_albedo = albedo_raw.rgb * inv_alpha;
+
+    // Reconstruct depth from hardware depth buffer (NDC → linear view-space Z)
+    let near = uniforms.near_plane;
+    let far = uniforms.far_plane;
+    let ndc_depth = hw_depth;
+    let depth = near * far / (far - ndc_depth * (far - near));
 
     // Recover true albedo by dividing out plaster (env lighting)
     let plaster_lum = max(0.2126 * plaster.r + 0.7152 * plaster.g + 0.0722 * plaster.b, 1e-3);
     let albedo = raw_albedo / plaster_lum;
 
-    // Reconstruct world position from depth + inverse VP
+    // Reconstruct world position from hw depth + inverse VP
     let ndc_x = (frag_coord.x + 0.5) / f32(uniforms.width) * 2.0 - 1.0;
     let ndc_y = 1.0 - (frag_coord.y + 0.5) / f32(uniforms.height) * 2.0;
-    let clip_pos = vec4f(ndc_x, ndc_y, depth, 1.0);
+    let clip_pos = vec4f(ndc_x, ndc_y, ndc_depth, 1.0);
     let world_h = uniforms.inv_vp * clip_pos;
     let world_pos = world_h.xyz / world_h.w;
 
@@ -108,17 +150,16 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
         var to_light: vec3f;
         var atten: f32;
 
-        if (light.light_type == 2u) {  // directional
+        if (light.light_type == 2u) {
             to_light = normalize(-light.direction);
             atten = 1.0;
-        } else {  // point or spot
+        } else {
             let to_light_raw = light.position - world_pos;
             let dist = max(length(to_light_raw), 1e-6);
             to_light = to_light_raw / dist;
             atten = 1.0 / (dist * dist);
         }
 
-        // Spot falloff
         if (light.light_type == 1u) {
             let l_fwd = normalize(light.direction);
             let cos_a = dot(-to_light, l_fwd);
@@ -130,8 +171,6 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
 
         let NdotL = max(dot(normal, to_light), 0.0);
         let l_color = light.color * light.intensity;
-
-        // Phase A: pure Lambertian, no shadow, no specular
         total_contribution += albedo * NdotL * atten * l_color;
     }
 
@@ -145,9 +184,13 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     else if (dm == DBG_ROUGHNESS)   { final_color = vec3f(roughness); }
     else if (dm == DBG_ENV_FEATURE) { final_color = env_feat.xyz * 0.5 + 0.5; }
     else if (dm == DBG_DEPTH)       { final_color = vec3f(depth * 0.1); }
+    else if (dm == DBG_SPECULAR)    { final_color = vec3f(0.0); }
+    else if (dm == DBG_DIFFUSE)     { final_color = total_contribution; }
+    else if (dm == DBG_SHADOW)      { final_color = vec3f(0.0); }
+    else if (dm == DBG_RETRO)       { final_color = vec3f(0.0); }
+    else if (dm == DBG_LAMBDA)      { final_color = vec3f(0.0); }
     else if (dm == DBG_PLASTER)     { final_color = plaster; }
     else if (dm == DBG_ALPHA)       { final_color = vec3f(alpha); }
 
-    // Output linear — blit handles sRGB conversion
     return vec4f(max(final_color, vec3f(0.0)), alpha);
 }

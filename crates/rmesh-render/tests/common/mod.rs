@@ -495,6 +495,7 @@ async fn gpu_render_scene_async(
         false,
         None, None, None,
         None,
+        true,
     );
 
     // Copy color texture to readback buffer
@@ -1814,6 +1815,7 @@ async fn gpu_compute_interval_render_scene_async(
         None,
         None,
         false,
+        true,
     );
 
     // Copy color texture to readback buffer
@@ -1880,4 +1882,269 @@ async fn gpu_compute_interval_render_scene_async(
     readback.unmap();
 
     Some(image)
+}
+
+// ---------------------------------------------------------------------------
+// MRT compositing: CPU reference + GPU readback
+// ---------------------------------------------------------------------------
+
+/// Per-tet auxiliary data for MRT testing.
+pub struct MrtAuxData {
+    /// Packed [M * 8]: roughness, env_f0..3, albedo_r, albedo_g, albedo_b
+    pub aux_flat: Vec<f32>,
+    /// Per-vertex normals [V * 3]
+    pub vertex_normals: Vec<f32>,
+}
+
+/// MRT image set.
+pub struct MrtImages {
+    pub color: Vec<[f32; 4]>,
+    pub aux0: Vec<[f32; 4]>,
+    pub normals: Vec<[f32; 4]>,
+    pub albedo: Vec<[f32; 4]>,
+}
+
+fn oct_encode_cpu(n: Vec3) -> [f32; 2] {
+    let s = n.x.abs() + n.y.abs() + n.z.abs();
+    if s < 1e-12 { return [0.5, 0.5]; }
+    let mut px = n.x / s;
+    let mut py = n.y / s;
+    if n.z < 0.0 {
+        let ox = px; let oy = py;
+        px = (1.0 - oy.abs()) * if ox >= 0.0 { 1.0 } else { -1.0 };
+        py = (1.0 - ox.abs()) * if oy >= 0.0 { 1.0 } else { -1.0 };
+    }
+    [px * 0.5 + 0.5, py * 0.5 + 0.5]
+}
+
+fn pack_2f_cpu(a: f32, b: f32) -> f32 {
+    (a.clamp(0.0, 1.0) * 255.0).floor() + b.clamp(0.0, 1.0)
+}
+
+/// CPU reference renderer with MRT aux channels.
+pub fn cpu_render_scene_with_mrt(
+    scene: &SceneData,
+    aux: &MrtAuxData,
+    cam_pos: Vec3, vp: Mat4, c2w: Mat3, intrinsics: [f32; 4], w: u32, h: u32,
+) -> MrtImages {
+    let n = scene.tet_count as usize;
+    let sorted = sort_tets_back_to_front(scene, cam_pos);
+
+    struct TD { verts: [Vec3; 4], color: Vec3, grad: Vec3, density: f32 }
+    let tets: Vec<TD> = (0..n).map(|i| TD {
+        verts: load_tet_verts(scene, i),
+        color: compute_tet_color(scene, i, cam_pos),
+        grad: load_color_grad(scene, i),
+        density: scene.densities[i],
+    }).collect();
+
+    let visible: Vec<bool> = (0..n).map(|i| {
+        let td = &tets[i];
+        let (mut mn_x, mut mx_x) = (f32::INFINITY, f32::NEG_INFINITY);
+        let (mut mn_y, mut mx_y) = (f32::INFINITY, f32::NEG_INFINITY);
+        let mut mn_z = f32::INFINITY;
+        for v in &td.verts {
+            let clip = vp * Vec4::new(v.x, v.y, v.z, 1.0);
+            let iw = 1.0 / (clip.w + 1e-6);
+            let nd = clip.truncate() * iw;
+            mn_x = mn_x.min(nd.x); mx_x = mx_x.max(nd.x);
+            mn_y = mn_y.min(nd.y); mx_y = mx_y.max(nd.y);
+            mn_z = mn_z.min(nd.z);
+        }
+        !(mx_x < -1.0 || mn_x > 1.0 || mx_y < -1.0 || mn_y > 1.0 || mn_z > 1.0)
+            && (mx_x - mn_x) * w as f32 * (mx_y - mn_y) * h as f32 >= 1.0
+    }).collect();
+
+    let npix = (w * h) as usize;
+    let mut col = vec![[0.0f32; 4]; npix];
+    let mut a0 = vec![[0.0f32; 4]; npix];
+    let mut nm = vec![[0.0f32; 4]; npix];
+    let mut al = vec![[0.0f32; 4]; npix];
+
+    for py in 0..h {
+        for px in 0..w {
+            let ray = pixel_ray_dir(c2w, intrinsics, cam_pos, px as f32, py as f32);
+            let pi = (py * w + px) as usize;
+            for &tid in &sorted {
+                let ti = tid as usize;
+                if !visible[ti] { continue; }
+                let td = &tets[ti];
+                let off = td.grad.dot(cam_pos - td.verts[0]);
+                let bc = td.color + Vec3::splat(off);
+                let [cr, cg, cb, ca] = render_tet_pixel(cam_pos, ray, &td.verts, td.density, bc, td.grad);
+                if ca < 1e-7 { continue; }
+
+                let ab = ti * 8;
+                let g = |i: usize| if ab + i < aux.aux_flat.len() { aux.aux_flat[ab + i] } else { 0.0 };
+
+                let i0 = scene.indices[ti*4] as usize;
+                let i1 = scene.indices[ti*4+1] as usize;
+                let i2 = scene.indices[ti*4+2] as usize;
+                let i3 = scene.indices[ti*4+3] as usize;
+                let vn = |vi: usize| -> Vec3 {
+                    if vi*3+2 < aux.vertex_normals.len() {
+                        Vec3::new(aux.vertex_normals[vi*3], aux.vertex_normals[vi*3+1], aux.vertex_normals[vi*3+2])
+                    } else { Vec3::ZERO }
+                };
+                let normal = (vn(i0)+vn(i1)+vn(i2)+vn(i3)).normalize_or_zero();
+                let [ox, oy] = oct_encode_cpu(normal);
+                let ep = pack_2f_cpu(g(3), g(4));
+
+                let blend = |acc: &mut [f32; 4], s: [f32; 4]| {
+                    let a = s[3];
+                    for c in 0..4 { acc[c] = s[c] + acc[c] * (1.0 - a); }
+                };
+                blend(&mut col[pi], [cr, cg, cb, ca]);
+                blend(&mut a0[pi], [g(0)*ca, g(1)*ca, g(2)*ca, ca]);
+                blend(&mut nm[pi], [ox*ca, oy*ca, ep*ca, ca]);
+                blend(&mut al[pi], [g(5)*ca, g(6)*ca, g(7)*ca, ca]);
+            }
+        }
+    }
+    MrtImages { color: col, aux0: a0, normals: nm, albedo: al }
+}
+
+/// GPU compute-interval render with MRT, returning all 4 targets.
+pub fn gpu_compute_interval_render_scene_with_mrt(
+    scene: &SceneData, aux: &MrtAuxData,
+    cam_pos: Vec3, vp: Mat4, c2w: Mat3, intrinsics: [f32; 4], w: u32, h: u32,
+) -> Option<MrtImages> {
+    pollster::block_on(gpu_ci_mrt_async(scene, aux, cam_pos, vp, c2w, intrinsics, w, h))
+}
+
+async fn gpu_ci_mrt_async(
+    scene: &SceneData, aux: &MrtAuxData,
+    cam_pos: Vec3, vp: Mat4, c2w: Mat3, intrinsics: [f32; 4], w: u32, h: u32,
+) -> Option<MrtImages> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
+        ..Default::default()
+    });
+    let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None, force_fallback_adapter: false,
+    }).await.ok()?;
+    let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
+        required_limits: wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 20,
+            max_storage_buffer_binding_size: 1 << 30,
+            max_buffer_size: 1 << 30,
+            ..wgpu::Limits::default()
+        },
+        ..Default::default()
+    }).await.ok()?;
+
+    let color_format = wgpu::TextureFormat::Rgba16Float;
+    let base_colors = vec![0.5f32; scene.tet_count as usize * 3];
+    let (buffers, material, pipelines, targets, compute_bg, _) =
+        rmesh_render::setup_forward(&device, &queue, scene, &base_colors, &scene.color_grads, w, h);
+    let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, color_format);
+
+    let n_pow2 = scene.tet_count.next_power_of_two();
+    let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);
+    let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
+    sort_state.upload_configs(&queue);
+
+    use wgpu::util::DeviceExt;
+    let aux_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("test_aux"), contents: bytemuck::cast_slice(&aux.aux_flat),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    queue.write_buffer(&buffers.vertex_normals, 0, bytemuck::cast_slice(&aux.vertex_normals));
+
+    let gen_bg_a = rmesh_render::create_compute_interval_gen_bind_group(&device, &ci_pipelines, &buffers, &material);
+    let gen_bg_b = rmesh_render::create_compute_interval_gen_bind_group_with_sort_values(
+        &device, &ci_pipelines, &buffers, &material, sort_state.values_b(),
+    );
+    let ci_render_bg = rmesh_render::create_compute_interval_render_bind_group_pbr(
+        &device, &ci_pipelines, &buffers, &aux_buf, &buffers.indices,
+    );
+    let ci_convert_bg = rmesh_render::create_compute_interval_indirect_convert_bind_group(&device, &ci_pipelines, &buffers);
+
+    let uniforms = rmesh_render::make_uniforms(vp, c2w, intrinsics, cam_pos, w as f32, h as f32,
+        scene.tet_count, 0, 16, 0.0, 0, 0.01, 100.0);
+    queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+
+    let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("test_mrt_depth"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+    });
+    let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test_mrt") });
+    {
+        let clear = wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store };
+        let _rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("mrt_clear"),
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment { view: &targets.color_view, resolve_target: None, ops: clear, depth_slice: None }),
+                Some(wgpu::RenderPassColorAttachment { view: &targets.aux0_view, resolve_target: None, ops: clear, depth_slice: None }),
+                Some(wgpu::RenderPassColorAttachment { view: &targets.normals_view, resolve_target: None, ops: clear, depth_slice: None }),
+                Some(wgpu::RenderPassColorAttachment { view: &targets.depth_view, resolve_target: None, ops: clear, depth_slice: None }),
+            ],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+    }
+
+    rmesh_render::record_sorted_compute_interval_forward_pass(
+        &mut encoder, &device, &pipelines, &ci_pipelines,
+        &sort_pipelines, &sort_state, &buffers, &targets, &compute_bg,
+        &gen_bg_a, &gen_bg_b, &ci_render_bg, &ci_convert_bg,
+        scene.tet_count, &queue, &depth_view, None, None, false, true,
+    );
+
+    let tex_list = [&targets.color_texture, &targets.aux0_texture, &targets.normals_texture, &targets.depth_texture];
+    let bpp = 8u32;
+    let abpr = ((w * bpp) + 255) & !255;
+    let bsz = (abpr * h) as u64;
+
+    let rbs: Vec<wgpu::Buffer> = (0..4).map(|i| device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(&format!("rb{i}")), size: bsz,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    })).collect();
+
+    for (i, tex) in tex_list.iter().enumerate() {
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &rbs[i], layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(abpr), rows_per_image: Some(h) } },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+    }
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let mut imgs: Vec<Vec<[f32; 4]>> = Vec::new();
+    for rb in &rbs {
+        let slice = rb.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().unwrap().ok()?;
+        let data = slice.get_mapped_range();
+        let mut img = vec![[0.0f32; 4]; (w*h) as usize];
+        for row in 0..h {
+            let rs = (row * abpr) as usize;
+            for col in 0..w {
+                let ps = rs + (col * bpp) as usize;
+                let r = half::f16::from_le_bytes([data[ps], data[ps+1]]).to_f32();
+                let g = half::f16::from_le_bytes([data[ps+2], data[ps+3]]).to_f32();
+                let b = half::f16::from_le_bytes([data[ps+4], data[ps+5]]).to_f32();
+                let a = half::f16::from_le_bytes([data[ps+6], data[ps+7]]).to_f32();
+                img[(row*w+col) as usize] = [r, g, b, a];
+            }
+        }
+        drop(data);
+        rb.unmap();
+        imgs.push(img);
+    }
+    Some(MrtImages { color: imgs.remove(0), aux0: imgs.remove(0), normals: imgs.remove(0), albedo: imgs.remove(0) })
 }

@@ -262,8 +262,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     }
 
     // --- 4. Color evaluation ---
-    if (uniforms.sh_degree > 0u) {
-        // Inline SH evaluation (only for visible tets, reuses already-loaded vertices)
+    // sh_degree >= 0 all have SH coefficients to evaluate (degree 0 = DC only).
+    // The else branch (base_colors copy) is for training when SH coeffs aren't loaded.
+    if (arrayLength(&sh_coeffs) > 1u) {
         let centroid = (v0 + v1 + v2 + v3) * 0.25;
         let cam = uniforms.cam_pos_pad.xyz;
         let raw_dir = centroid - cam;

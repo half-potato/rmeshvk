@@ -156,7 +156,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     atomicAdd(&indirect_args.instance_count, 1u);
 
     // --- 4. Color evaluation (only for visible tets) ---
-    if (uniforms.sh_degree > 0u) {
+    // sh_degree >= 0 all need SH eval (degree 0 = DC only). Else branch is training-only.
+    if (arrayLength(&sh_coeffs) > 1u) {
         let centroid = (v0 + v1 + v2 + v3) * 0.25;
         let cam = uniforms.cam_pos_pad.xyz;
         let raw_dir = centroid - cam;

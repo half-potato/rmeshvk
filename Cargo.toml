@@ -16,6 +16,7 @@ members = [
     "crates/rmesh-viewer-web",
     "crates/rmesh-python",
     "crates/rmesh-neural",
+    "crates/rmesh-dsm",
     # "wtet",  # submodule not always available
 ]
 

@@ -1,3 +1,4 @@
+import os
 import tinyplypy
 import numpy as np
 import argparse
@@ -232,9 +233,9 @@ def _process_ply_to_rmesh_buffer(ply_file_path, starting_cam, out_deg):
     indices = indices[~mask]
     vertices = vertices # Vertices are not filtered in your original logic, keeping consistent
 
-    # Compress
-    # k=16 components
-    k_components = 12
+    # Compress — cap k to actual dimensionality (degree 0 → total_dims=3, can't have 12 components)
+    total_dims = ((out_deg + 1) ** 2) * 3
+    k_components = min(12, total_dims)
     sh_weights, sh_basis, sh_mean = compress_matrix(sh_dat, k=k_components)
 
     N = vertices.shape[0]
@@ -274,11 +275,11 @@ def _process_ply_to_rmesh_buffer(ply_file_path, starting_cam, out_deg):
 
     buffer.write(grd_t.tobytes())
 
-    return buffer
+    return buffer, mask
 
 
 def process_ply_to_rmesh(ply_file_path, starting_cam, out_deg):
-    buffer = _process_ply_to_rmesh_buffer(ply_file_path, starting_cam, out_deg)
+    buffer, _ = _process_ply_to_rmesh_buffer(ply_file_path, starting_cam, out_deg)
     compressed_bytes = gzip.compress(buffer.getvalue(), compresslevel=9)
     return compressed_bytes
 
@@ -370,7 +371,7 @@ def process_pbr_to_rmesh(ply_file_path, pbr_dir, starting_cam, out_deg):
     import torch
 
     # Base rmesh buffer (uncompressed)
-    buffer = _process_ply_to_rmesh_buffer(ply_file_path, starting_cam, out_deg)
+    buffer, tet_mask = _process_ply_to_rmesh_buffer(ply_file_path, starting_cam, out_deg)
 
     _align4(buffer)
 
@@ -381,13 +382,33 @@ def process_pbr_to_rmesh(ply_file_path, pbr_dir, starting_cam, out_deg):
 
     # Load checkpoint data
     ckpt = torch.load(pbr_dir / "ckpt.pth", map_location='cpu', weights_only=False)
-    brdf_sd = torch.load(pbr_dir / "brdf_model.pt", map_location='cpu', weights_only=False)
     ref_sd = torch.load(pbr_dir / "ref_renderer.pt", map_location='cpu', weights_only=False)
+    brdf_sd = {k.removeprefix("brdf_model."): v for k, v in ref_sd.items() if k.startswith("brdf_model.")}
 
-    # Pre-baked per-tet material channels (.npy files from bake step)
-    roughness = np.load(pbr_dir / "roughness.npy")       # [M]
-    env_feature = np.load(pbr_dir / "env_feature.npy")   # [M, 4]
-    albedo = np.load(pbr_dir / "albedo.npy")              # [M, 3]
+    # Per-tet material channels — load from .npy if available, otherwise bake from checkpoint
+    if (pbr_dir / "roughness.npy").exists():
+        roughness = np.load(pbr_dir / "roughness.npy")[~tet_mask]
+        env_feature = np.load(pbr_dir / "env_feature.npy")[~tet_mask]
+        albedo = np.load(pbr_dir / "albedo.npy")[~tet_mask]
+    else:
+        print("  Baking material .npy files from checkpoint...")
+        import sys
+        sys.path.insert(1, os.path.join(os.path.dirname(__file__), 'radiance_meshes'))
+        from radiance_meshes.models.ingp_color import Model
+        from renderer.ref_renderer import activate_aux
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = Model.load_ckpt(pbr_dir, device)
+        model.current_sh_deg = 0
+        # Minimal camera — only camera_center is used for SH evaluation direction
+        cam_center = model.center.to(device)
+        dummy_cam = type('Cam', (), {'camera_center': cam_center})()
+        with torch.no_grad():
+            _, cell_values = model.get_cell_values(dummy_cam)
+            activated = activate_aux(cell_values)
+            roughness = activated[:, 7].cpu().numpy()[~tet_mask]
+            env_feature = activated[:, 8:12].cpu().numpy()[~tet_mask]
+            albedo = activated[:, 12:15].cpu().numpy()[~tet_mask]
+        del model
 
     # Vertex normals from checkpoint
     if 'interior_vertex_normals' in ckpt:
@@ -509,27 +530,35 @@ def main():
         "--degree", "-d", type=int, default=3, help="The degree of the final mesh"
     )
     parser.add_argument(
-        "--pbr-dir", default=None,
-        help="Path to PBR checkpoint directory for extended export. "
-             "Expects: ckpt.pth, brdf_model.pt, ref_renderer.pt, "
-             "roughness.npy, env_feature.npy, albedo.npy"
+        "--pbr", action="store_true",
+        help="Enable PBR export (expects PBR checkpoint files in the input directory)"
     )
     args = parser.parse_args()
     for input_file in args.input_files:
-        print(f"Processing {input_file}...")
-        transform = np.loadtxt((Path(input_file).parent / "transform.txt"))
-        with (Path(input_file).parent / "config.json").open('r') as f:
+        input_path = Path(input_file)
+        if input_path.is_dir():
+            ckpt_dir = input_path
+            ply_file = ckpt_dir / "ckpt.ply"
+            meta_dir = ckpt_dir
+        else:
+            ply_file = input_path
+            ckpt_dir = input_path.parent
+            meta_dir = input_path.parent
+
+        print(f"Processing {ply_file}...")
+        transform = np.loadtxt(meta_dir / "transform.txt")
+        with (meta_dir / "config.json").open('r') as f:
             js = json.load(f)
             path = Path(js['dataset_path']) / "sparse/0/images.bin"
             extrinsics = read_extrinsics_binary(str(path), transform)
 
-        if args.pbr_dir:
-            print(f"  PBR export from {args.pbr_dir}")
+        if args.pbr:
+            print(f"  PBR export from {ckpt_dir}")
             rmesh_data = process_pbr_to_rmesh(
-                input_file, args.pbr_dir, extrinsics[0], args.degree
+                str(ply_file), str(ckpt_dir), extrinsics[0], args.degree
             )
         else:
-            rmesh_data = process_ply_to_rmesh(input_file, extrinsics[0], args.degree)
+            rmesh_data = process_ply_to_rmesh(str(ply_file), extrinsics[0], args.degree)
 
         output_file = (
             args.output if len(args.input_files) == 1 else input_file + ".rmesh"

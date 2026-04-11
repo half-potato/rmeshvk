@@ -52,6 +52,22 @@ mod gpu_state;
 mod render;
 use gpu_state::*;
 
+/// Create an Rgba32Float texture for copying the raytrace buffer output to blit.
+fn create_rt_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("rt_output_texture"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
@@ -87,6 +103,10 @@ struct App {
     deferred_debug_mode: u32,
     ambient: f32,
     pbr_data: Option<rmesh_data::PbrData>,
+    // Ray trace CPU-side state
+    rt_neighbors_cpu: Vec<i32>,
+    rt_start_tet_hint: i32,
+    rt_locate_ms: f32,
 }
 
 impl App {
@@ -128,6 +148,9 @@ impl App {
             deferred_debug_mode: 0,
             ambient: 0.05,
             pbr_data: pbr,
+            rt_neighbors_cpu: Vec::new(),
+            rt_start_tet_hint: -1,
+            rt_locate_ms: 0.0,
         }
     }
 
@@ -468,7 +491,7 @@ impl App {
         let (deferred_pipeline, deferred_bg, deferred_output, deferred_output_view, deferred_blit_bg) = if has_pbr {
             log::info!("Creating deferred PBR shading pipeline...");
             let dp = rmesh_render::DeferredShadePipeline::new(&device, color_format);
-            let bg = rmesh_render::create_deferred_bind_group(&device, &dp, &targets);
+            let bg = rmesh_render::create_deferred_bind_group(&device, &dp, &targets, &primitive_targets.depth_view);
             // Separate output texture (can't read+write color_view in same pass)
             let out_tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("deferred_output"),
@@ -486,6 +509,43 @@ impl App {
         } else {
             (None, None, None, None, None)
         };
+
+        // Ray trace pipeline
+        log::info!("Building ray trace data...");
+        let t0 = std::time::Instant::now();
+        let rt_neighbors = rmesh_render::compute_tet_neighbors(
+            &self.scene_data.indices,
+            self.scene_data.tet_count as usize,
+        );
+        let rt_bvh = rmesh_render::build_boundary_bvh(
+            &self.scene_data.vertices,
+            &self.scene_data.indices,
+            &rt_neighbors,
+            self.scene_data.tet_count as usize,
+        );
+        let rt_pipeline = rmesh_render::RayTracePipeline::new(
+            &device,
+            size.width.max(1),
+            size.height.max(1),
+            0,
+        );
+        let rt_buffers = rmesh_render::RayTraceBuffers::new(&device, &rt_neighbors, &rt_bvh);
+        let start_tet = rmesh_render::find_containing_tet(
+            &self.scene_data.vertices,
+            &self.scene_data.indices,
+            self.scene_data.tet_count as usize,
+            self.camera.position,
+        ).map(|t| t as i32).unwrap_or(-1);
+        queue.write_buffer(&rt_buffers.start_tet, 0, bytemuck::cast_slice(&[start_tet]));
+        self.rt_neighbors_cpu = rt_neighbors;
+        self.rt_start_tet_hint = start_tet;
+        let rt_bg = rmesh_render::create_raytrace_bind_group(
+            &device, &rt_pipeline, &buffers, &material, &rt_buffers,
+        );
+        let (rt_texture, rt_texture_view) = create_rt_texture(&device, size.width.max(1), size.height.max(1));
+        let rt_blit_pipeline = rmesh_render::BlitPipelineNonFiltering::new(&device, surface_format);
+        let rt_blit_bg = rmesh_render::create_blit_nf_bind_group(&device, &rt_blit_pipeline, &rt_texture_view);
+        log::info!("Ray trace data: {:.2}s", t0.elapsed().as_secs_f64());
 
         log::info!("GPU init total: {:.2}s", t_total.elapsed().as_secs_f64());
 
@@ -557,6 +617,13 @@ impl App {
             deferred_output_view,
             deferred_blit_bg,
             has_pbr_data: has_pbr,
+            rt_pipeline,
+            rt_buffers,
+            rt_bg,
+            rt_texture,
+            rt_texture_view,
+            rt_blit_pipeline,
+            rt_blit_bg,
         });
     }
 
@@ -767,7 +834,7 @@ impl App {
                 // Recreate deferred pipeline
                 let color_format = wgpu::TextureFormat::Rgba16Float;
                 let dp = rmesh_render::DeferredShadePipeline::new(&gpu.device, color_format);
-                gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(&gpu.device, &dp, &gpu.targets));
+                gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(&gpu.device, &dp, &gpu.targets, &gpu.primitive_targets.depth_view));
                 let w = gpu.surface_config.width;
                 let h = gpu.surface_config.height;
                 let out_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -832,6 +899,34 @@ impl App {
             self.fluid_params = fluid_sim.default_params_for_mesh();
             gpu.fluid_sim = Some(fluid_sim);
             gpu.tet_neighbors_buf = Some(tet_neighbors_buf);
+
+            // Recreate ray trace state (reuse neighbors from fluid sim)
+            let rt_bvh = rmesh_render::build_boundary_bvh(
+                &self.scene_data.vertices,
+                &self.scene_data.indices,
+                &neighbors,
+                self.scene_data.tet_count as usize,
+            );
+            let w = gpu.surface_config.width;
+            let h = gpu.surface_config.height;
+            gpu.rt_pipeline = rmesh_render::RayTracePipeline::new(&gpu.device, w, h, 0);
+            gpu.rt_buffers = rmesh_render::RayTraceBuffers::new(&gpu.device, &neighbors, &rt_bvh);
+            let start_tet = rmesh_render::find_containing_tet(
+                &self.scene_data.vertices,
+                &self.scene_data.indices,
+                self.scene_data.tet_count as usize,
+                self.camera.position,
+            ).map(|t| t as i32).unwrap_or(-1);
+            gpu.queue.write_buffer(&gpu.rt_buffers.start_tet, 0, bytemuck::cast_slice(&[start_tet]));
+            self.rt_neighbors_cpu = neighbors.clone();
+            self.rt_start_tet_hint = start_tet;
+            gpu.rt_bg = rmesh_render::create_raytrace_bind_group(
+                &gpu.device, &gpu.rt_pipeline, &gpu.buffers, &gpu.material_buffers, &gpu.rt_buffers,
+            );
+            let (rt_tex, rt_view) = create_rt_texture(&gpu.device, w, h);
+            gpu.rt_blit_bg = rmesh_render::create_blit_nf_bind_group(&gpu.device, &gpu.rt_blit_pipeline, &rt_view);
+            gpu.rt_texture = rt_tex;
+            gpu.rt_texture_view = rt_view;
         }
 
         // Update window title
@@ -866,7 +961,7 @@ impl App {
             // Recreate deferred resources since MRT texture views changed
             if let Some(ref dp) = gpu.deferred_pipeline {
                 gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(
-                    &gpu.device, dp, &gpu.targets,
+                    &gpu.device, dp, &gpu.targets, &gpu.primitive_targets.depth_view,
                 ));
                 let out_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("deferred_output"),
@@ -883,6 +978,18 @@ impl App {
                 gpu.deferred_output = Some(out_tex);
                 gpu.deferred_output_view = Some(out_view);
             }
+
+            // Recreate ray trace pipeline + texture for new size
+            gpu.rt_pipeline = rmesh_render::RayTracePipeline::new(
+                &gpu.device, new_size.width, new_size.height, 0,
+            );
+            gpu.rt_bg = rmesh_render::create_raytrace_bind_group(
+                &gpu.device, &gpu.rt_pipeline, &gpu.buffers, &gpu.material_buffers, &gpu.rt_buffers,
+            );
+            let (rt_tex, rt_view) = create_rt_texture(&gpu.device, new_size.width, new_size.height);
+            gpu.rt_blit_bg = rmesh_render::create_blit_nf_bind_group(&gpu.device, &gpu.rt_blit_pipeline, &rt_view);
+            gpu.rt_texture = rt_tex;
+            gpu.rt_texture_view = rt_view;
         }
     }
 }

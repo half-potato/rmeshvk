@@ -271,6 +271,7 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
 
     // Densities [M] u8, log-encoded → parallel decode
     let t0 = std::time::Instant::now();
+    log::debug!("Parse offsets: after verts+indices = {} / {} bytes", offset, data.len());
     let densities_u8 = &data[offset..offset + tet_count as usize];
     offset += tet_count as usize;
     let mut densities = vec![0.0f32; tet_count as usize];
@@ -285,26 +286,52 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     offset = (offset + 3) & !3;
 
     // SH data: PCA-compressed
+    log::debug!("Parse offsets: after densities+align = {} / {} bytes", offset, data.len());
     let num_coeffs = ((sh_degree + 1) * (sh_degree + 1)) as usize;
     let total_dims = num_coeffs * 3;
 
+    // PCA can only produce min(k, total_dims) components — old files may claim k=12 with total_dims=3
+    let effective_k = (k_components as usize).min(total_dims);
+    log::debug!("SH: num_coeffs={}, total_dims={}, k={} (effective={})", num_coeffs, total_dims, k_components, effective_k);
+
     // SH Mean + Basis are small, Weights + Grads are large → parallel f16 conversion
     let mean = slice_f16_to_f32(data, &mut offset, total_dims);
-    let basis = slice_f16_to_f32(data, &mut offset, k_components as usize * total_dims);
-    let weights = slice_f16_to_f32(data, &mut offset, tet_count as usize * k_components as usize);
+    let basis = slice_f16_to_f32(data, &mut offset, effective_k * total_dims);
+    let weights = slice_f16_to_f32(data, &mut offset, tet_count as usize * effective_k);
+    log::debug!("Parse offsets: after SH weights = {} / {} bytes ({:.1} MB remaining)",
+        offset, data.len(), (data.len() - offset) as f64 / 1e6);
 
     offset = (offset + 3) & !3;
-    let color_grads = slice_f16_to_f32(data, &mut offset, tet_count as usize * 3);
+    let color_grads_count = tet_count as usize * 3;
+    let color_grads_bytes = color_grads_count * 2;
+    // Check if tagged PBR sections start here (before color_grads)
+    let has_tagged_here = offset + 4 <= data.len()
+        && u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) == TAGGED_MAGIC;
+    let color_grads = if has_tagged_here {
+        log::info!("Tagged sections found at offset {} (before color_grads). Using zeros for color_grads.", offset);
+        vec![0.0f32; color_grads_count]
+    } else if offset + color_grads_bytes <= data.len() {
+        slice_f16_to_f32(data, &mut offset, color_grads_count)
+    } else {
+        log::warn!(
+            "Partial color_grads in file (need {} bytes at offset {}, but data len is {}). Reading what's available.",
+            color_grads_bytes, offset, data.len()
+        );
+        let available = (data.len() - offset) / 2; // number of f16 values available
+        let mut grads = slice_f16_to_f32(data, &mut offset, available);
+        grads.resize(color_grads_count, 0.0);
+        grads
+    };
     log::info!("Densities + SH + gradients: {:.2}s", t0.elapsed().as_secs_f64());
 
     // --- Parallel PCA decompression ---
     // result[tet][feat] = mean[feat] + Σ_k(weight[tet][k] * basis[k][feat])
     log::info!(
         "Decompressing PCA ({} tets × {} dims × {} components)...",
-        tet_count, total_dims, k_components
+        tet_count, total_dims, effective_k
     );
     let t0 = std::time::Instant::now();
-    let k = k_components as usize;
+    let k = effective_k;
     let mut sh_coeffs = vec![0.0f32; tet_count as usize * total_dims];
 
     par_chunks_for_each!(sh_coeffs, total_dims, |(tet, chunk): (usize, &mut [f32])| {

@@ -239,6 +239,7 @@ fn run_forward(s: &ComputeIntervalBenchState) {
         None,
         None,
         s.use_16bit_sort,
+        true,
     );
 
     s.queue.submit(std::iter::once(encoder.finish()));

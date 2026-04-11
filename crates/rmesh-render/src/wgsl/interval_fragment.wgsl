@@ -3,11 +3,11 @@
 // Linearizes interpolated NDC depths to view-space Z, computes ray segment
 // distance, and evaluates the volume rendering integral.
 //
-// MRT outputs (all Rgba16Float):
-//   location(0): premultiplied color (RGBA) — plaster/diffuse
-//   location(1): roughness, env_feature[0..2] (premul alpha)
-//   location(2): normal.xyz, env_feature[3] (premul alpha)
-//   location(3): depth, albedo.rgb (premul alpha)
+// MRT outputs (all Rgba16Float, .a = alpha for correct hardware blend):
+//   location(0): plaster.rgb * a, a
+//   location(1): roughness * a, env_f0 * a, env_f1 * a, a
+//   location(2): oct_normal.xy * a, pack(env_f2,env_f3) * a, a
+//   location(3): albedo.rgb * a, a
 
 struct Uniforms {
     vp_col0: vec4<f32>,
@@ -51,8 +51,23 @@ struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) aux0: vec4<f32>,
     @location(2) normals: vec4<f32>,
-    @location(3) depth_albedo: vec4<f32>,
+    @location(3) albedo: vec4<f32>,
 };
+
+// Octahedral normal encoding: unit sphere → [0,1]^2
+fn oct_encode(n: vec3f) -> vec2f {
+    let s = abs(n.x) + abs(n.y) + abs(n.z);
+    var p = n.xy / s;
+    if (n.z < 0.0) {
+        p = (1.0 - abs(p.yx)) * sign(p);
+    }
+    return p * 0.5 + 0.5;
+}
+
+// Pack two [0,1] values into one float: a gets 8-bit integer part, b gets fractional part
+fn pack_2f(a: f32, b: f32) -> f32 {
+    return floor(clamp(a, 0.0, 1.0) * 255.0) + clamp(b, 0.0, 1.0);
+}
 
 // phi(x) = (1 - exp(-x)) / x
 // Taylor with 4 terms for |x| < 0.02 avoids catastrophic cancellation.
@@ -134,10 +149,14 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     let n3 = vec3f(vertex_normals[i3*3u], vertex_normals[i3*3u+1u], vertex_normals[i3*3u+2u]);
     let normal = normalize(n0 + n1 + n2 + n3);
 
-    // Premultiply by alpha for correct back-to-front blending
-    out.aux0 = vec4f(roughness, env_f0, env_f1, env_f2) * alpha;
-    out.normals = vec4f(normal * alpha, env_f3 * alpha);
-    out.depth_albedo = vec4f(z_f * alpha, alb_r * alpha, alb_g * alpha, alb_b * alpha);
+    // Octahedral-encode normal, pack env_f2+f3 into single channel
+    let oct_n = oct_encode(normal);
+    let env_packed = pack_2f(env_f2, env_f3);
+
+    // Premultiply by alpha — .a = alpha for correct hardware OneMinusSrcAlpha blend
+    out.aux0 = vec4f(roughness * alpha, env_f0 * alpha, env_f1 * alpha, alpha);
+    out.normals = vec4f(oct_n * alpha, env_packed * alpha, alpha);
+    out.albedo = vec4f(alb_r * alpha, alb_g * alpha, alb_b * alpha, alpha);
 
     return out;
 }

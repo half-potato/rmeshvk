@@ -85,6 +85,9 @@ struct BenchState {
     bwd_bg0_a: wgpu::BindGroup,
     bwd_bg0_b: wgpu::BindGroup,
     bwd_bg1: wgpu::BindGroup,
+    // Ray trace
+    rt_pipeline: rmesh_render::RayTracePipeline,
+    rt_bg: wgpu::BindGroup,
 }
 
 fn create_bench_device() -> Option<(wgpu::Device, wgpu::Queue)> {
@@ -359,6 +362,19 @@ fn create_bench_state() -> Option<BenchState> {
         &tile_buffers.tile_uniforms,
     );
 
+    // Ray trace
+    let neighbors = rmesh_render::compute_tet_neighbors(&scene.indices, scene.tet_count as usize);
+    let bvh = rmesh_render::build_boundary_bvh(
+        &scene.vertices, &scene.indices, &neighbors, scene.tet_count as usize,
+    );
+    let rt_pipeline = rmesh_render::RayTracePipeline::new(&device, W, H, 0);
+    let rt_buffers = rmesh_render::RayTraceBuffers::new(&device, &neighbors, &bvh);
+    let start_tet = rmesh_render::find_containing_tet(
+        &scene.vertices, &scene.indices, scene.tet_count as usize, eye,
+    ).map(|t| t as i32).unwrap_or(-1);
+    queue.write_buffer(&rt_buffers.start_tet, 0, bytemuck::cast_slice(&[start_tet]));
+    let rt_bg = rmesh_render::create_raytrace_bind_group(&device, &rt_pipeline, &buffers, &material, &rt_buffers);
+
     Some(BenchState {
         device,
         queue,
@@ -397,6 +413,8 @@ fn create_bench_state() -> Option<BenchState> {
         bwd_bg0_a,
         bwd_bg0_b,
         bwd_bg1,
+        rt_pipeline,
+        rt_bg,
     })
 }
 
@@ -875,6 +893,7 @@ fn run_forward_hw_rasterize(s: &BenchState) {
         false,
         None, None, None,
         None,
+        true,
     );
 
     s.queue.submit(std::iter::once(encoder.finish()));
@@ -1252,6 +1271,11 @@ fn create_interval_bench_state() -> Option<IntervalBenchState> {
             return None;
         }
 
+        // naga's MSL backend doesn't support mesh shader translation — skip on Metal
+        if adapter.get_info().backend == wgpu::Backend::Metal {
+            return None;
+        }
+
         let supported_limits = adapter.limits();
         let limits = wgpu::Limits {
             max_storage_buffers_per_shader_stage: 20,
@@ -1416,7 +1440,7 @@ fn bench_interval(c: &mut Criterion) {
     let state = match create_interval_bench_state() {
         Some(s) => s,
         None => {
-            eprintln!("Skipping bench_interval (no GPU with MESH_SHADER + TIMESTAMP_QUERY)");
+            eprintln!("Skipping bench_interval (no GPU with working mesh shader support)");
             return;
         }
     };
@@ -1806,6 +1830,52 @@ fn bench_interval_tiled(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Ray trace benchmark
+// ---------------------------------------------------------------------------
+
+fn run_raytrace(s: &BenchState) {
+    let mut encoder = s
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+    // Forward compute (color eval)
+    rmesh_render::record_project_compute(
+        &mut encoder,
+        &s.fwd_pipelines,
+        &s.buffers,
+        &s.compute_bg,
+        s.tet_count,
+        &s.queue,
+    );
+
+    // Clear output
+    encoder.clear_buffer(&s.rt_pipeline.rendered_image, 0, None);
+
+    // Ray trace
+    rmesh_render::record_raytrace(&mut encoder, &s.rt_pipeline, &s.rt_bg, W, H);
+
+    s.queue.submit(std::iter::once(encoder.finish()));
+    let _ = s.device.poll(wgpu::PollType::wait_indefinitely());
+}
+
+fn bench_raytrace(c: &mut Criterion) {
+    let state = match create_bench_state() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping bench_raytrace (no GPU with SUBGROUP + TIMESTAMP_QUERY)");
+            return;
+        }
+    };
+
+    // Warmup
+    run_raytrace(&state);
+
+    c.bench_function("raytrace_2M", |b| {
+        b.iter(|| run_raytrace(&state));
+    });
+}
+
 criterion_group! {
     name = tiled_pipeline;
     config = Criterion::default().sample_size(20);
@@ -1821,4 +1891,9 @@ criterion_group! {
     config = Criterion::default().sample_size(20);
     targets = bench_interval_tiled
 }
-criterion_main!(tiled_pipeline, interval_pipeline, interval_tiled_pipeline);
+criterion_group! {
+    name = raytrace_pipeline;
+    config = Criterion::default().sample_size(20);
+    targets = bench_raytrace
+}
+criterion_main!(tiled_pipeline, interval_pipeline, interval_tiled_pipeline, raytrace_pipeline);

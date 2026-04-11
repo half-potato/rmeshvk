@@ -1,0 +1,10 @@
+[package]
+name = "rmesh-dsm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rmesh-util = { path = "../rmesh-util" }
+rmesh-render = { path = "../rmesh-render" }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }

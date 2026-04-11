@@ -82,6 +82,9 @@ pub struct DeferredUniforms {
     pub height: u32,
     pub ambient: f32,
     pub debug_mode: u32,
+    pub near_plane: f32,
+    pub far_plane: f32,
+    pub _pad: [f32; 2],
 }
 
 /// Maximum number of lights supported.
@@ -370,9 +373,13 @@ pub struct ForwardPipelines {
     pub hw_compute_pipeline: wgpu::ComputePipeline,
     pub hw_compute_bind_group_layout: wgpu::BindGroupLayout,
     pub render_pipeline: wgpu::RenderPipeline,
+    /// Color-only render pipeline (no MRT — skips aux/normals/depth targets for perf)
+    pub render_pipeline_color_only: wgpu::RenderPipeline,
     pub render_bind_group_layout: wgpu::BindGroupLayout,
     /// Quad-based render pipeline (4 verts/tet via triangle strip, reads precomputed buffer)
     pub quad_render_pipeline: wgpu::RenderPipeline,
+    /// Color-only quad render pipeline (no MRT)
+    pub quad_render_pipeline_color_only: wgpu::RenderPipeline,
     /// Bind group layout for quad render (6 bindings: uniforms, precomputed, sorted_indices, colors, densities, color_grads)
     pub quad_render_bg_layout: wgpu::BindGroupLayout,
     /// Compute prepass pipeline (precomputes clip positions + normals for quad path)
@@ -585,10 +592,10 @@ impl ForwardPipelines {
                             blend: Some(premul_blend),
                             write_mask: wgpu::ColorWrites::ALL,
                         }),
-                        // Color attachment 1 (aux): no blending
+                        // Color attachment 1 (aux): premultiplied alpha blend
                         Some(wgpu::ColorTargetState {
                             format: color_format,
-                            blend: None,
+                            blend: Some(premul_blend),
                             write_mask: wgpu::ColorWrites::ALL,
                         }),
                         // Color attachment 2 (normals): premultiplied alpha blend
@@ -714,7 +721,7 @@ impl ForwardPipelines {
                         }),
                         Some(wgpu::ColorTargetState {
                             format: color_format,
-                            blend: None,
+                            blend: Some(premul_blend),
                             write_mask: wgpu::ColorWrites::ALL,
                         }),
                         Some(wgpu::ColorTargetState {
@@ -734,6 +741,92 @@ impl ForwardPipelines {
                 cache: None,
             });
 
+        // ----- Color-only pipeline variants (no MRT — single color target) -----
+        let color_only_targets: &[Option<wgpu::ColorTargetState>] = &[
+            Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(premul_blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            }),
+            None,
+            None,
+            None,
+        ];
+
+        let render_pipeline_color_only =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("forward_render_pipeline_color_only"),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &vertex_shader,
+                    entry_point: Some("main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &fragment_shader,
+                    entry_point: Some("main"),
+                    targets: color_only_targets,
+                    compilation_options: Default::default(),
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let quad_render_pipeline_color_only =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("forward_quad_render_pipeline_color_only"),
+                layout: Some(&quad_render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &quad_vertex_shader,
+                    entry_point: Some("main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &fragment_shader,
+                    entry_point: Some("main"),
+                    targets: color_only_targets,
+                    compilation_options: Default::default(),
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+
         Self {
             compute_pipeline,
             compute_pipeline_16bit,
@@ -741,8 +834,10 @@ impl ForwardPipelines {
             hw_compute_pipeline,
             hw_compute_bind_group_layout,
             render_pipeline,
+            render_pipeline_color_only,
             render_bind_group_layout,
             quad_render_pipeline,
+            quad_render_pipeline_color_only,
             quad_render_bg_layout,
             prepass_compute_pipeline,
             prepass_bg_layout,
@@ -757,6 +852,8 @@ impl ForwardPipelines {
 /// Compiled pipelines for the mesh shader forward pass.
 pub struct MeshForwardPipelines {
     pub mesh_render_pipeline: wgpu::RenderPipeline,
+    /// Color-only mesh render pipeline (no MRT)
+    pub mesh_render_pipeline_color_only: wgpu::RenderPipeline,
     pub mesh_render_bg_layout: wgpu::BindGroupLayout,
     pub indirect_convert_pipeline: wgpu::ComputePipeline,
     pub indirect_convert_bg_layout: wgpu::BindGroupLayout,
@@ -846,7 +943,7 @@ impl MeshForwardPipelines {
                         }),
                         Some(wgpu::ColorTargetState {
                             format: color_format,
-                            blend: None,
+                            blend: Some(premul_blend),
                             write_mask: wgpu::ColorWrites::ALL,
                         }),
                         Some(wgpu::ColorTargetState {
@@ -914,8 +1011,57 @@ impl MeshForwardPipelines {
                 cache: None,
             });
 
+        let color_only_targets: &[Option<wgpu::ColorTargetState>] = &[
+            Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(premul_blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            }),
+            None,
+            None,
+            None,
+        ];
+
+        let mesh_render_pipeline_color_only =
+            device.create_mesh_pipeline(&wgpu::MeshPipelineDescriptor {
+                label: Some("mesh_forward_render_pipeline_color_only"),
+                layout: Some(&mesh_pipeline_layout),
+                task: None,
+                mesh: wgpu::MeshState {
+                    module: &mesh_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &fragment_shader,
+                    entry_point: Some("main"),
+                    targets: color_only_targets,
+                    compilation_options: Default::default(),
+                }),
+                multiview: None,
+                cache: None,
+            });
+
         Self {
             mesh_render_pipeline,
+            mesh_render_pipeline_color_only,
             mesh_render_bg_layout,
             indirect_convert_pipeline,
             indirect_convert_bg_layout,
@@ -1102,6 +1248,8 @@ pub struct ComputeIntervalPipelines {
     pub gen_pipeline: wgpu::ComputePipeline,
     pub gen_bg_layout: wgpu::BindGroupLayout,
     pub render_pipeline: wgpu::RenderPipeline,
+    /// Color-only render pipeline (no MRT)
+    pub render_pipeline_color_only: wgpu::RenderPipeline,
     pub render_bg_layout: wgpu::BindGroupLayout,
     pub indirect_convert_pipeline: wgpu::ComputePipeline,
     pub indirect_convert_bg_layout: wgpu::BindGroupLayout,
@@ -1288,10 +1436,58 @@ impl ComputeIntervalPipelines {
                 cache: None,
             });
 
+        let color_only_targets: &[Option<wgpu::ColorTargetState>] = &[
+            Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(premul_blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            }),
+            None,
+            None,
+            None,
+        ];
+
+        let render_pipeline_color_only = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("compute_interval_render_pipeline_color_only"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vertex_shader,
+                entry_point: Some("main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &fragment_shader,
+                entry_point: Some("main"),
+                targets: color_only_targets,
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             gen_pipeline,
             gen_bg_layout,
             render_pipeline,
+            render_pipeline_color_only,
             render_bg_layout,
             indirect_convert_pipeline,
             indirect_convert_bg_layout,
@@ -2282,6 +2478,7 @@ pub fn record_sorted_forward_pass(
     prepass_bg_b: Option<&wgpu::BindGroup>,
     quad_render_bg: Option<&wgpu::BindGroup>,
     profiler: Option<&wgpu::QuerySet>,
+    mrt_enabled: bool,
 ) {
     // ----- 1. Reset indirect args -----
     let reset_cmd = DrawIndirectCommand {
@@ -2365,64 +2562,56 @@ pub fn record_sorted_forward_pass(
     } else {
         render_bg_a
     };
+
+    let color_attachment = Some(wgpu::RenderPassColorAttachment {
+        view: &targets.color_view,
+        resolve_target: None,
+        ops: wgpu::Operations {
+            load: wgpu::LoadOp::Load,
+            store: wgpu::StoreOp::Store,
+        },
+        depth_slice: None,
+    });
+
+    let mrt_clear = wgpu::Operations {
+        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+        store: wgpu::StoreOp::Store,
+    };
+
+    let mrt_attachments;
+    let color_only_attachments;
+    let color_attachments: &[Option<wgpu::RenderPassColorAttachment>] = if mrt_enabled {
+        mrt_attachments = [
+            color_attachment,
+            Some(wgpu::RenderPassColorAttachment {
+                view: &targets.aux0_view,
+                resolve_target: None,
+                ops: mrt_clear,
+                depth_slice: None,
+            }),
+            Some(wgpu::RenderPassColorAttachment {
+                view: &targets.normals_view,
+                resolve_target: None,
+                ops: mrt_clear,
+                depth_slice: None,
+            }),
+            Some(wgpu::RenderPassColorAttachment {
+                view: &targets.depth_view,
+                resolve_target: None,
+                ops: mrt_clear,
+                depth_slice: None,
+            }),
+        ];
+        &mrt_attachments
+    } else {
+        color_only_attachments = [color_attachment, None, None, None];
+        &color_only_attachments
+    };
+
     {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("forward_render"),
-            color_attachments: &[
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.color_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.aux0_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 0.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-                // Attachment 2: normals (premultiplied alpha blend)
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.normals_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 0.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-                // Attachment 3: depth (premultiplied alpha blend)
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.depth_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 0.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-            ],
+            color_attachments,
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_view,
                 depth_ops: Some(wgpu::Operations {
@@ -2450,9 +2639,15 @@ pub fn record_sorted_forward_pass(
         );
         rpass.set_scissor_rect(0, 0, targets.width, targets.height);
         if use_quad {
-            rpass.set_pipeline(&pipelines.quad_render_pipeline);
-        } else {
+            if mrt_enabled {
+                rpass.set_pipeline(&pipelines.quad_render_pipeline);
+            } else {
+                rpass.set_pipeline(&pipelines.quad_render_pipeline_color_only);
+            }
+        } else if mrt_enabled {
             rpass.set_pipeline(&pipelines.render_pipeline);
+        } else {
+            rpass.set_pipeline(&pipelines.render_pipeline_color_only);
         }
         rpass.set_bind_group(0, render_bg, &[]);
 
@@ -2486,6 +2681,7 @@ pub fn record_sorted_mesh_forward_pass(
     depth_view: &wgpu::TextureView,
     hw_compute_bg: Option<&wgpu::BindGroup>,
     profiler: Option<&wgpu::QuerySet>,
+    mrt_enabled: bool,
 ) {
     // ----- 1. Reset indirect args -----
     let reset_cmd = DrawIndirectCommand {
@@ -2554,53 +2750,56 @@ pub fn record_sorted_mesh_forward_pass(
 
     // ----- 4. Mesh shader render pass -----
     let mesh_bg = if result_in_b { mesh_render_bg_b } else { mesh_render_bg_a };
+
+    let color_attachment = Some(wgpu::RenderPassColorAttachment {
+        view: &targets.color_view,
+        resolve_target: None,
+        ops: wgpu::Operations {
+            load: wgpu::LoadOp::Load,
+            store: wgpu::StoreOp::Store,
+        },
+        depth_slice: None,
+    });
+
+    let mrt_clear = wgpu::Operations {
+        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+        store: wgpu::StoreOp::Store,
+    };
+
+    let mrt_attachments;
+    let color_only_attachments;
+    let color_attachments: &[Option<wgpu::RenderPassColorAttachment>] = if mrt_enabled {
+        mrt_attachments = [
+            color_attachment,
+            Some(wgpu::RenderPassColorAttachment {
+                view: &targets.aux0_view,
+                resolve_target: None,
+                ops: mrt_clear,
+                depth_slice: None,
+            }),
+            Some(wgpu::RenderPassColorAttachment {
+                view: &targets.normals_view,
+                resolve_target: None,
+                ops: mrt_clear,
+                depth_slice: None,
+            }),
+            Some(wgpu::RenderPassColorAttachment {
+                view: &targets.depth_view,
+                resolve_target: None,
+                ops: mrt_clear,
+                depth_slice: None,
+            }),
+        ];
+        &mrt_attachments
+    } else {
+        color_only_attachments = [color_attachment, None, None, None];
+        &color_only_attachments
+    };
+
     {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("mesh_forward_render"),
-            color_attachments: &[
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.color_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.aux0_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0, g: 0.0, b: 0.0, a: 0.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.normals_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0, g: 0.0, b: 0.0, a: 0.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.depth_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0, g: 0.0, b: 0.0, a: 0.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-            ],
+            color_attachments,
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_view,
                 depth_ops: Some(wgpu::Operations {
@@ -2627,7 +2826,11 @@ pub fn record_sorted_mesh_forward_pass(
             1.0,
         );
         rpass.set_scissor_rect(0, 0, targets.width, targets.height);
-        rpass.set_pipeline(&mesh_pipelines.mesh_render_pipeline);
+        if mrt_enabled {
+            rpass.set_pipeline(&mesh_pipelines.mesh_render_pipeline);
+        } else {
+            rpass.set_pipeline(&mesh_pipelines.mesh_render_pipeline_color_only);
+        }
         rpass.set_bind_group(0, mesh_bg, &[]);
 
         rpass.draw_mesh_tasks_indirect(&buffers.mesh_indirect_args, 0);
@@ -2804,6 +3007,7 @@ pub fn record_sorted_compute_interval_forward_pass(
     hw_compute_bg: Option<&wgpu::BindGroup>,
     profiler: Option<&wgpu::QuerySet>,
     use_16bit_sort: bool,
+    mrt_enabled: bool,
 ) {
     // ----- 1. Reset indirect args + interval_args_buf -----
     let reset_cmd = DrawIndirectCommand {
@@ -2886,39 +3090,56 @@ pub fn record_sorted_compute_interval_forward_pass(
     }
 
     // ----- 6. Render pass (MRT: color + aux0 + normals + depth_albedo) -----
+    let color_ops = wgpu::Operations {
+        load: wgpu::LoadOp::Load, // preserve primitive pass output
+        store: wgpu::StoreOp::Store,
+    };
+    let mrt_clear = wgpu::Operations {
+        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+        store: wgpu::StoreOp::Store,
+    };
+
+    let color_attachment = Some(wgpu::RenderPassColorAttachment {
+        view: &targets.color_view,
+        resolve_target: None,
+        ops: color_ops,
+        depth_slice: None,
+    });
+
+    let mrt_attachments;
+    let color_only_attachments;
+    let color_attachments: &[Option<wgpu::RenderPassColorAttachment>] = if mrt_enabled {
+        mrt_attachments = [
+            color_attachment,
+            Some(wgpu::RenderPassColorAttachment {
+                view: &targets.aux0_view,
+                resolve_target: None,
+                ops: mrt_clear,
+                depth_slice: None,
+            }),
+            Some(wgpu::RenderPassColorAttachment {
+                view: &targets.normals_view,
+                resolve_target: None,
+                ops: mrt_clear,
+                depth_slice: None,
+            }),
+            Some(wgpu::RenderPassColorAttachment {
+                view: &targets.depth_view,
+                resolve_target: None,
+                ops: mrt_clear,
+                depth_slice: None,
+            }),
+        ];
+        &mrt_attachments
+    } else {
+        color_only_attachments = [color_attachment, None, None, None];
+        &color_only_attachments
+    };
+
     {
-        let mrt_ops = wgpu::Operations {
-            load: wgpu::LoadOp::Load,
-            store: wgpu::StoreOp::Store,
-        };
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("compute_interval_render"),
-            color_attachments: &[
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.color_view,
-                    resolve_target: None,
-                    ops: mrt_ops,
-                    depth_slice: None,
-                }),
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.aux0_view,
-                    resolve_target: None,
-                    ops: mrt_ops,
-                    depth_slice: None,
-                }),
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.normals_view,
-                    resolve_target: None,
-                    ops: mrt_ops,
-                    depth_slice: None,
-                }),
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.depth_view,
-                    resolve_target: None,
-                    ops: mrt_ops,
-                    depth_slice: None,
-                }),
-            ],
+            color_attachments,
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_view,
                 depth_ops: Some(wgpu::Operations {
@@ -2945,7 +3166,11 @@ pub fn record_sorted_compute_interval_forward_pass(
             1.0,
         );
         rpass.set_scissor_rect(0, 0, targets.width, targets.height);
-        rpass.set_pipeline(&ci_pipelines.render_pipeline);
+        if mrt_enabled {
+            rpass.set_pipeline(&ci_pipelines.render_pipeline);
+        } else {
+            rpass.set_pipeline(&ci_pipelines.render_pipeline_color_only);
+        }
         rpass.set_bind_group(0, ci_render_bg, &[]);
         rpass.set_index_buffer(buffers.interval_fan_index_buf.slice(..), wgpu::IndexFormat::Uint32);
         // draw-indexed-indirect args start at byte offset 12 (skip 3 dispatch u32s)
@@ -3291,7 +3516,7 @@ pub struct RayTracePipeline {
     /// Auxiliary output buffer: [W x H x AUX_STRIDE] f32
     pub aux_image: wgpu::Buffer,
     /// Default aux bind group (group 1) with dummy aux_data
-    aux_bind_group: wgpu::BindGroup,
+    pub aux_bind_group: wgpu::BindGroup,
     pub width: u32,
     pub height: u32,
     pub aux_dim: u32,
@@ -4001,6 +4226,131 @@ impl BlitPipeline {
     }
 }
 
+const BLIT_NF_WGSL: &str = "
+// Fullscreen triangle blit using textureLoad (no sampler, works with non-filterable formats).
+
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
+    let x = f32(i32(vid & 1u) * 4 - 1);
+    let y = f32(i32(vid >> 1u) * 4 - 1);
+    var out: VsOut;
+    out.pos = vec4<f32>(x, y, 0.0, 1.0);
+    return out;
+}
+
+fn linear_to_srgb(c: f32) -> f32 {
+    if (c <= 0.0031308) {
+        return c * 12.92;
+    }
+    return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let coord = vec2<i32>(in.pos.xy);
+    let color = textureLoad(src_tex, coord, 0);
+    return vec4<f32>(
+        linear_to_srgb(color.r),
+        linear_to_srgb(color.g),
+        linear_to_srgb(color.b),
+        1.0,
+    );
+}
+";
+
+/// A blit pipeline for non-filterable textures (e.g. Rgba32Float) using `textureLoad`.
+pub struct BlitPipelineNonFiltering {
+    pub pipeline: wgpu::RenderPipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl BlitPipelineNonFiltering {
+    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit_nf.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(BLIT_NF_WGSL.into()),
+        });
+
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("blit_nf_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blit_nf_pl"),
+            bind_group_layouts: &[&bind_group_layout],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blit_nf_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        Self { pipeline, bind_group_layout }
+    }
+}
+
+/// Create a bind group for the non-filtering blit pipeline.
+pub fn create_blit_nf_bind_group(
+    device: &wgpu::Device,
+    blit: &BlitPipelineNonFiltering,
+    source_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("blit_nf_bg"),
+        layout: &blit.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(source_view),
+            },
+        ],
+    })
+}
+
 /// Create a bind group for the blit pipeline from a source texture view.
 pub fn create_blit_bind_group(
     device: &wgpu::Device,
@@ -4047,6 +4397,32 @@ pub fn record_blit(
     rpass.set_pipeline(&blit.pipeline);
     rpass.set_bind_group(0, bind_group, &[]);
     rpass.draw(0..3, 0..1); // fullscreen triangle
+}
+
+/// Record a blit render pass using the non-filtering pipeline.
+pub fn record_blit_nf(
+    encoder: &mut wgpu::CommandEncoder,
+    blit: &BlitPipelineNonFiltering,
+    bind_group: &wgpu::BindGroup,
+    target_view: &wgpu::TextureView,
+) {
+    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("blit_nf"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    });
+    rpass.set_pipeline(&blit.pipeline);
+    rpass.set_bind_group(0, bind_group, &[]);
+    rpass.draw(0..3, 0..1);
 }
 
 // ===========================================================================
@@ -4135,6 +4511,17 @@ impl DeferredShadePipeline {
                     },
                     count: None,
                 },
+                // 6: hardware depth buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -4196,6 +4583,7 @@ pub fn create_deferred_bind_group(
     device: &wgpu::Device,
     deferred: &DeferredShadePipeline,
     targets: &RenderTargets,
+    hw_depth_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("deferred_shade_bg"),
@@ -4224,6 +4612,10 @@ pub fn create_deferred_bind_group(
             wgpu::BindGroupEntry {
                 binding: 5,
                 resource: deferred.light_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(hw_depth_view),
             },
         ],
     })

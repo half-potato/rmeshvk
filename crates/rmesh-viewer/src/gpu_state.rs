@@ -17,6 +17,7 @@ pub enum RenderMode {
     Quad,
     MeshShader,
     IntervalShader,
+    RayTrace,
 }
 
 impl std::fmt::Display for RenderMode {
@@ -26,6 +27,7 @@ impl std::fmt::Display for RenderMode {
             RenderMode::Quad => write!(f, "Quad"),
             RenderMode::MeshShader => write!(f, "Mesh Shader"),
             RenderMode::IntervalShader => write!(f, "Interval Shader"),
+            RenderMode::RayTrace => write!(f, "Ray Trace"),
         }
     }
 }
@@ -151,4 +153,13 @@ pub struct GpuState {
     /// Blit bind group pointing to deferred output (swapped when deferred is active)
     pub deferred_blit_bg: Option<wgpu::BindGroup>,
     pub has_pbr_data: bool,
+    // Ray trace
+    pub rt_pipeline: rmesh_render::RayTracePipeline,
+    pub rt_buffers: rmesh_render::RayTraceBuffers,
+    pub rt_bg: wgpu::BindGroup,
+    /// Rgba32Float texture for copying raytrace buffer output for blitting
+    pub rt_texture: wgpu::Texture,
+    pub rt_texture_view: wgpu::TextureView,
+    pub rt_blit_pipeline: rmesh_render::BlitPipelineNonFiltering,
+    pub rt_blit_bg: wgpu::BindGroup,
 }

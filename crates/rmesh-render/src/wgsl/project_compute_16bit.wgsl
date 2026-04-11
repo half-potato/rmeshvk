@@ -268,7 +268,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     }
 
     // --- 4. Color evaluation ---
-    if (uniforms.sh_degree > 0u) {
+    if (arrayLength(&sh_coeffs) > 1u) {
         // Inline SH evaluation (only for visible tets, reuses already-loaded vertices)
         let centroid = (v0 + v1 + v2 + v3) * 0.25;
         let cam = uniforms.cam_pos_pad.xyz;

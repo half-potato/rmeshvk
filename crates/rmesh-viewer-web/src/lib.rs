@@ -332,6 +332,7 @@ impl WebViewer {
             false,
             None, None, None,
             None,
+            false,
         );
 
         // Blit directly — no compositor needed
