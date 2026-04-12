@@ -58,16 +58,31 @@ pub struct CpuTimings {
 pub const TS_QUERY_COUNT: u32 = 8;
 
 /// Pack f32 SH coefficients into f16 pairs stored as u32 (matching WGSL `unpack2x16float` layout).
-pub fn pack_sh_coeffs_f16(coeffs: &[f32]) -> Vec<u32> {
-    let mut packed = vec![0u32; (coeffs.len() + 1) / 2];
-    for i in (0..coeffs.len()).step_by(2) {
-        let lo = half::f16::from_f32(coeffs[i]);
-        let hi = if i + 1 < coeffs.len() {
-            half::f16::from_f32(coeffs[i + 1])
-        } else {
-            half::f16::ZERO
-        };
-        packed[i / 2] = (lo.to_bits() as u32) | ((hi.to_bits() as u32) << 16);
+/// Pack SH coefficients as f16 pairs into u32 words.
+///
+/// The GPU shader indexes per-tet with stride `((num_coeffs*3 + 1) / 2)` u32 words,
+/// so each tet's data must be padded to an even number of f16 values (u32-aligned).
+/// `total_dims` = `num_coeffs * 3` (e.g. 3 for degree 0, 48 for degree 3).
+pub fn pack_sh_coeffs_f16(coeffs: &[f32], total_dims: usize) -> Vec<u32> {
+    if total_dims == 0 {
+        return vec![];
+    }
+    let tet_count = coeffs.len() / total_dims;
+    // Words per tet: ceil(total_dims / 2) — matches WGSL: (stride + 1) / 2
+    let words_per_tet = (total_dims + 1) / 2;
+    let mut packed = vec![0u32; tet_count * words_per_tet];
+    for t in 0..tet_count {
+        let src_base = t * total_dims;
+        let dst_base = t * words_per_tet;
+        for i in (0..total_dims).step_by(2) {
+            let lo = half::f16::from_f32(coeffs[src_base + i]);
+            let hi = if i + 1 < total_dims {
+                half::f16::from_f32(coeffs[src_base + i + 1])
+            } else {
+                half::f16::ZERO
+            };
+            packed[dst_base + i / 2] = (lo.to_bits() as u32) | ((hi.to_bits() as u32) << 16);
+        }
     }
     packed
 }

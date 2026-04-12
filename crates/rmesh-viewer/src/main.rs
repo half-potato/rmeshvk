@@ -297,7 +297,8 @@ impl App {
         );
 
         // Upload SH coefficients to GPU as f16-packed u32 array
-        let sh_coeffs_packed = pack_sh_coeffs_f16(&self.sh_coeffs.coeffs);
+        let sh_total_dims = ((self.sh_coeffs.degree + 1) * (self.sh_coeffs.degree + 1)) as usize * 3;
+        let sh_coeffs_packed = pack_sh_coeffs_f16(&self.sh_coeffs.coeffs, sh_total_dims);
         let sh_coeffs_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sh_coeffs"),
             contents: bytemuck::cast_slice(&sh_coeffs_packed),
@@ -702,7 +703,8 @@ impl App {
             gpu.tet_count = self.scene_data.tet_count;
 
             // Recreate SH coeffs buffer (f16-packed)
-            let sh_coeffs_packed = pack_sh_coeffs_f16(&self.sh_coeffs.coeffs);
+            let sh_total_dims = ((self.sh_coeffs.degree + 1) * (self.sh_coeffs.degree + 1)) as usize * 3;
+        let sh_coeffs_packed = pack_sh_coeffs_f16(&self.sh_coeffs.coeffs, sh_total_dims);
             gpu.sh_coeffs_buf =
                 gpu.device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
