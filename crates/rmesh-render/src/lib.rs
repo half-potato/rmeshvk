@@ -50,7 +50,6 @@ const PROJECT_COMPUTE_16BIT_WGSL: &str = include_str!("wgsl/project_compute_16bi
 const INTERVAL_GENERATE_WGSL: &str = include_str!("wgsl/interval_generate.wgsl");
 const INTERVAL_TILED_RASTERIZE_WGSL: &str = include_str!("wgsl/interval_tiled_rasterize.wgsl");
 const SHADOW_RAY_GEN_WGSL: &str = include_str!("wgsl/shadow_ray_gen.wgsl");
-const DEFERRED_SHADE_WGSL: &str = include_str!("wgsl/deferred_shade.wgsl");
 const DEFERRED_SHADE_FRAG_WGSL: &str = include_str!("wgsl/deferred_shade_frag.wgsl");
 
 // ---------------------------------------------------------------------------
@@ -241,7 +240,7 @@ impl SceneBuffers {
         // Compute-interval vertex buffer: 5 verts × 3 vec4s × 16 bytes = 240 bytes/tet
         let interval_vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("interval_vertex_buf"),
-            size: m * 5 * 3 * 16,
+            size: m * 5 * 4 * 16, // 5 verts × 4 vec4 × 16 bytes (pos+z, offsets, n_front, n_back)
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -2576,8 +2575,9 @@ pub fn record_sorted_forward_pass(
         depth_slice: None,
     });
 
-    let mrt_clear = wgpu::Operations {
-        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+    // MRT targets use LoadOp::Load to preserve primitive MRT data written earlier
+    let mrt_load = wgpu::Operations {
+        load: wgpu::LoadOp::Load,
         store: wgpu::StoreOp::Store,
     };
 
@@ -2589,19 +2589,19 @@ pub fn record_sorted_forward_pass(
             Some(wgpu::RenderPassColorAttachment {
                 view: &targets.aux0_view,
                 resolve_target: None,
-                ops: mrt_clear,
+                ops: mrt_load,
                 depth_slice: None,
             }),
             Some(wgpu::RenderPassColorAttachment {
                 view: &targets.normals_view,
                 resolve_target: None,
-                ops: mrt_clear,
+                ops: mrt_load,
                 depth_slice: None,
             }),
             Some(wgpu::RenderPassColorAttachment {
                 view: &targets.depth_view,
                 resolve_target: None,
-                ops: mrt_clear,
+                ops: mrt_load,
                 depth_slice: None,
             }),
         ];
@@ -2764,8 +2764,9 @@ pub fn record_sorted_mesh_forward_pass(
         depth_slice: None,
     });
 
-    let mrt_clear = wgpu::Operations {
-        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+    // MRT targets use LoadOp::Load to preserve primitive MRT data written earlier
+    let mrt_load = wgpu::Operations {
+        load: wgpu::LoadOp::Load,
         store: wgpu::StoreOp::Store,
     };
 
@@ -2777,19 +2778,19 @@ pub fn record_sorted_mesh_forward_pass(
             Some(wgpu::RenderPassColorAttachment {
                 view: &targets.aux0_view,
                 resolve_target: None,
-                ops: mrt_clear,
+                ops: mrt_load,
                 depth_slice: None,
             }),
             Some(wgpu::RenderPassColorAttachment {
                 view: &targets.normals_view,
                 resolve_target: None,
-                ops: mrt_clear,
+                ops: mrt_load,
                 depth_slice: None,
             }),
             Some(wgpu::RenderPassColorAttachment {
                 view: &targets.depth_view,
                 resolve_target: None,
-                ops: mrt_clear,
+                ops: mrt_load,
                 depth_slice: None,
             }),
         ];
@@ -3097,8 +3098,9 @@ pub fn record_sorted_compute_interval_forward_pass(
         load: wgpu::LoadOp::Load, // preserve primitive pass output
         store: wgpu::StoreOp::Store,
     };
-    let mrt_clear = wgpu::Operations {
-        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+    // MRT targets use LoadOp::Load to preserve primitive MRT data written earlier
+    let mrt_load = wgpu::Operations {
+        load: wgpu::LoadOp::Load,
         store: wgpu::StoreOp::Store,
     };
 
@@ -3117,19 +3119,19 @@ pub fn record_sorted_compute_interval_forward_pass(
             Some(wgpu::RenderPassColorAttachment {
                 view: &targets.aux0_view,
                 resolve_target: None,
-                ops: mrt_clear,
+                ops: mrt_load,
                 depth_slice: None,
             }),
             Some(wgpu::RenderPassColorAttachment {
                 view: &targets.normals_view,
                 resolve_target: None,
-                ops: mrt_clear,
+                ops: mrt_load,
                 depth_slice: None,
             }),
             Some(wgpu::RenderPassColorAttachment {
                 view: &targets.depth_view,
                 resolve_target: None,
-                ops: mrt_clear,
+                ops: mrt_load,
                 depth_slice: None,
             }),
         ];
@@ -4439,6 +4441,7 @@ pub struct DeferredShadePipeline {
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub uniforms_buf: wgpu::Buffer,
     pub light_buf: wgpu::Buffer,
+    pub tone_curve_buf: wgpu::Buffer,
 }
 
 impl DeferredShadePipeline {
@@ -4525,6 +4528,17 @@ impl DeferredShadePipeline {
                     },
                     count: None,
                 },
+                // 7: tone curve spline parameters
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -4577,7 +4591,29 @@ impl DeferredShadePipeline {
             mapped_at_creation: false,
         });
 
-        Self { pipeline, bind_group_layout, uniforms_buf, light_buf }
+        // Default identity tone curve: 2 y-knots [0, 1], slope=0, intercept=0, intercept_bias=0
+        let default_tone: [f32; 5] = [0.0, 1.0, 0.0, 0.0, 0.0];
+        let tone_curve_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("deferred_tone_curve"),
+            contents: bytemuck::cast_slice(&default_tone),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        Self { pipeline, bind_group_layout, uniforms_buf, light_buf, tone_curve_buf }
+    }
+
+    /// Upload tone curve spline data. Recreates the buffer if the size changed.
+    pub fn update_tone_curve(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[f32]) {
+        let byte_len = (data.len() * std::mem::size_of::<f32>()) as u64;
+        if self.tone_curve_buf.size() != byte_len {
+            self.tone_curve_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("deferred_tone_curve"),
+                contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+        } else {
+            queue.write_buffer(&self.tone_curve_buf, 0, bytemuck::cast_slice(data));
+        }
     }
 }
 
@@ -4619,6 +4655,10 @@ pub fn create_deferred_bind_group(
             wgpu::BindGroupEntry {
                 binding: 6,
                 resource: wgpu::BindingResource::TextureView(hw_depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: deferred.tone_curve_buf.as_entire_binding(),
             },
         ],
     })

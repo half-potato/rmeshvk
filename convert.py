@@ -233,9 +233,9 @@ def _process_ply_to_rmesh_buffer(ply_file_path, starting_cam, out_deg):
     indices = indices[~mask]
     vertices = vertices # Vertices are not filtered in your original logic, keeping consistent
 
-    # Compress — cap k to actual dimensionality (degree 0 → total_dims=3, can't have 12 components)
-    total_dims = ((out_deg + 1) ** 2) * 3
-    k_components = min(12, total_dims)
+    # Compress
+    # k=16 components
+    k_components = 12
     sh_weights, sh_basis, sh_mean = compress_matrix(sh_dat, k=k_components)
 
     N = vertices.shape[0]
@@ -385,21 +385,22 @@ def process_pbr_to_rmesh(ply_file_path, pbr_dir, starting_cam, out_deg):
     ref_sd = torch.load(pbr_dir / "ref_renderer.pt", map_location='cpu', weights_only=False)
     brdf_sd = {k.removeprefix("brdf_model."): v for k, v in ref_sd.items() if k.startswith("brdf_model.")}
 
-    # Per-tet material channels — load from .npy if available, otherwise bake from checkpoint
+    # Load model for material baking and vertex normal computation
+    import sys
+    sys.path.insert(1, os.path.join(os.path.dirname(__file__), 'radiance_meshes'))
+    from radiance_meshes.models.ingp_color import Model
+    from renderer.ref_renderer import activate_aux
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = Model.load_ckpt(pbr_dir, device)
+
+    # Per-tet material channels — load from .npy if available, otherwise bake
     if (pbr_dir / "roughness.npy").exists():
         roughness = np.load(pbr_dir / "roughness.npy")[~tet_mask]
         env_feature = np.load(pbr_dir / "env_feature.npy")[~tet_mask]
         albedo = np.load(pbr_dir / "albedo.npy")[~tet_mask]
     else:
-        print("  Baking material .npy files from checkpoint...")
-        import sys
-        sys.path.insert(1, os.path.join(os.path.dirname(__file__), 'radiance_meshes'))
-        from radiance_meshes.models.ingp_color import Model
-        from renderer.ref_renderer import activate_aux
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model = Model.load_ckpt(pbr_dir, device)
+        print("  Baking material channels from checkpoint...")
         model.current_sh_deg = 0
-        # Minimal camera — only camera_center is used for SH evaluation direction
         cam_center = model.center.to(device)
         dummy_cam = type('Cam', (), {'camera_center': cam_center})()
         with torch.no_grad():
@@ -408,19 +409,16 @@ def process_pbr_to_rmesh(ply_file_path, pbr_dir, starting_cam, out_deg):
             roughness = activated[:, 7].cpu().numpy()[~tet_mask]
             env_feature = activated[:, 8:12].cpu().numpy()[~tet_mask]
             albedo = activated[:, 12:15].cpu().numpy()[~tet_mask]
-        del model
 
-    # Vertex normals from checkpoint
-    if 'interior_vertex_normals' in ckpt:
-        vn = ckpt['interior_vertex_normals'].float().cpu().numpy()
-    elif 'vertex_normals' in ckpt:
-        vn = ckpt['vertex_normals'].float().cpu().numpy()
-    else:
-        n_verts = ckpt['vertices'].shape[0] if 'vertices' in ckpt else roughness.shape[0]
-        vn = np.zeros((n_verts, 3), dtype=np.float32)
+    # Full vertex normals: geometric (density-weighted tet face normals) + learned offsets
+    with torch.no_grad():
+        vn_full = model.compute_geometric_vertex_normals() + torch.cat([
+            model.interior_vertex_normals, model.ext_vertex_normals])
+        vn = vn_full.float().cpu().numpy()
+    del model
 
-    # Count sections: roughness, env_feature, albedo, vertex_normals, brdf_mlp, retro_head
-    num_sections = 6
+    # Count sections: roughness, env_feature, albedo, vertex_normals, brdf_mlp, retro_head, tone_curve
+    num_sections = 7
     buffer.write(np.array([num_sections], dtype=np.uint32).tobytes())
 
     # Material sections (f16)
@@ -437,6 +435,21 @@ def process_pbr_to_rmesh(ply_file_path, pbr_dir, starting_cam, out_deg):
     retro_b = ref_sd['retro_head.bias'].float().cpu().numpy().flatten()    # [1]
     retro_combined = np.concatenate([retro_w, retro_b])
     write_tagged_section(buffer, "retro_head", retro_combined, 0)
+
+    # Monotonic spline tone curve: [y_knots..., slope, intercept, intercept_bias]
+    # Viewer reconstructs knots_x = linspace(0, 1, n_knots) where n_knots = len - 3
+    spline_sd = {k.removeprefix("spatial_spline."): v for k, v in ref_sd.items()
+                 if k.startswith("spatial_spline.")}
+    log_dy = spline_sd['log_dy'].float()
+    dy = torch.nn.functional.softplus(log_dy)
+    y_cumsum = torch.cumsum(dy, dim=0)
+    y_knots = torch.cat([torch.zeros(1), y_cumsum])
+    y_knots = (y_knots / y_knots[-1:].clamp(min=1e-6)).numpy()
+    slope = spline_sd['slope'].float().numpy().flatten()
+    intercept = spline_sd['intercept'].float().numpy().flatten()
+    intercept_bias = np.array([spline_sd['intercept_bias'].item()])
+    tone_curve = np.concatenate([y_knots, slope, intercept, intercept_bias])
+    write_tagged_section(buffer, "tone_curve", tone_curve, 0)
 
     compressed = gzip.compress(buffer.getvalue(), compresslevel=9)
     return compressed
@@ -551,11 +564,12 @@ def main():
             js = json.load(f)
             path = Path(js['dataset_path']) / "sparse/0/images.bin"
             extrinsics = read_extrinsics_binary(str(path), transform)
+        print(args.pbr)
 
         if args.pbr:
             print(f"  PBR export from {ckpt_dir}")
             rmesh_data = process_pbr_to_rmesh(
-                str(ply_file), str(ckpt_dir), extrinsics[0], args.degree
+                str(ply_file), str(ckpt_dir), extrinsics[0], 0
             )
         else:
             rmesh_data = process_ply_to_rmesh(str(ply_file), extrinsics[0], args.degree)

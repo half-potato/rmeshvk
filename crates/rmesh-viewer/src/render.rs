@@ -304,6 +304,14 @@ impl App {
                         add_primitive = Some(PrimitiveKind::Cylinder);
                     }
                 });
+                ui.horizontal(|ui| {
+                    if ui.button("Point Light").clicked() {
+                        add_primitive = Some(PrimitiveKind::PointLight);
+                    }
+                    if ui.button("Spot Light").clicked() {
+                        add_primitive = Some(PrimitiveKind::SpotLight);
+                    }
+                });
                 ui.separator();
                 for (i, prim) in primitives_ref.iter().enumerate() {
                     let selected = new_selected == Some(i);
@@ -557,6 +565,16 @@ impl App {
                 None
             };
 
+            let mrt_views = if self.deferred_enabled && gpu.has_pbr_data {
+                Some(rmesh_compositor::MrtViews {
+                    aux0_view: &gpu.targets.aux0_view,
+                    normals_view: &gpu.targets.normals_view,
+                    albedo_view: &gpu.targets.depth_view,
+                })
+            } else {
+                None
+            };
+
             record_primitive_pass(
                 &mut encoder,
                 &gpu.queue,
@@ -566,6 +584,7 @@ impl App {
                 &gpu.primitive_targets.depth_view,
                 if self.show_primitives { &self.primitives } else { &[] },
                 &vp,
+                mrt_views,
             );
 
             // Restore original transform after rendering
@@ -758,18 +777,38 @@ impl App {
                 let mut gpu_lights = [rmesh_render::GpuLight::default(); rmesh_render::MAX_LIGHTS];
                 let mut num_lights = 0u32;
                 for prim in &self.primitives {
-                    if prim.kind == PrimitiveKind::PointLight && (num_lights as usize) < rmesh_render::MAX_LIGHTS {
-                        gpu_lights[num_lights as usize] = rmesh_render::GpuLight {
-                            position: prim.transform.position.to_array(),
-                            light_type: 0, // point
-                            color: [1.0, 1.0, 1.0],
-                            intensity: 1.0,
-                            direction: [0.0, 0.0, -1.0],
-                            inner_angle: 0.0,
-                            outer_angle: 0.0,
-                            _pad: [0.0; 3],
-                        };
-                        num_lights += 1;
+                    if (num_lights as usize) >= rmesh_render::MAX_LIGHTS {
+                        break;
+                    }
+                    match prim.kind {
+                        PrimitiveKind::PointLight => {
+                            gpu_lights[num_lights as usize] = rmesh_render::GpuLight {
+                                position: prim.transform.position.to_array(),
+                                light_type: 0, // point
+                                color: [1.0, 1.0, 1.0],
+                                intensity: 1.0,
+                                direction: [0.0, 0.0, -1.0],
+                                inner_angle: 0.0,
+                                outer_angle: 0.0,
+                                _pad: [0.0; 3],
+                            };
+                            num_lights += 1;
+                        }
+                        PrimitiveKind::SpotLight => {
+                            let forward = prim.transform.rotation * glam::Vec3::NEG_Z;
+                            gpu_lights[num_lights as usize] = rmesh_render::GpuLight {
+                                position: prim.transform.position.to_array(),
+                                light_type: 1, // spot
+                                color: [1.0, 1.0, 1.0],
+                                intensity: 1.0,
+                                direction: forward.to_array(),
+                                inner_angle: 20.0_f32.to_radians(),
+                                outer_angle: 35.0_f32.to_radians(),
+                                _pad: [0.0; 3],
+                            };
+                            num_lights += 1;
+                        }
+                        _ => {}
                     }
                 }
 

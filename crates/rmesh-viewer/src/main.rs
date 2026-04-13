@@ -491,7 +491,12 @@ impl App {
         let has_pbr = self.pbr_data.is_some();
         let (deferred_pipeline, deferred_bg, deferred_output, deferred_output_view, deferred_blit_bg) = if has_pbr {
             log::info!("Creating deferred PBR shading pipeline...");
-            let dp = rmesh_render::DeferredShadePipeline::new(&device, color_format);
+            let mut dp = rmesh_render::DeferredShadePipeline::new(&device, color_format);
+            if let Some(ref pbr) = self.pbr_data {
+                if !pbr.tone_curve.is_empty() {
+                    dp.update_tone_curve(&device, &queue, &pbr.tone_curve);
+                }
+            }
             let bg = rmesh_render::create_deferred_bind_group(&device, &dp, &targets, &primitive_targets.depth_view);
             // Separate output texture (can't read+write color_view in same pass)
             let out_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -835,7 +840,10 @@ impl App {
 
                 // Recreate deferred pipeline
                 let color_format = wgpu::TextureFormat::Rgba16Float;
-                let dp = rmesh_render::DeferredShadePipeline::new(&gpu.device, color_format);
+                let mut dp = rmesh_render::DeferredShadePipeline::new(&gpu.device, color_format);
+                if !pbr.tone_curve.is_empty() {
+                    dp.update_tone_curve(&gpu.device, &gpu.queue, &pbr.tone_curve);
+                }
                 gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(&gpu.device, &dp, &gpu.targets, &gpu.primitive_targets.depth_view));
                 let w = gpu.surface_config.width;
                 let h = gpu.surface_config.height;

@@ -129,6 +129,9 @@ pub struct PbrData {
     pub retro_weights: Vec<f32>,
     /// RetroHead bias [1] f32.
     pub retro_bias: Vec<f32>,
+    /// Monotonic spline tone curve [y_knots..., slope, intercept, intercept_bias] f32.
+    /// n_knots = len - 3. X knots are implicit linspace(0, 1, n_knots).
+    pub tone_curve: Vec<f32>,
 }
 
 /// Load a .rmesh file (gzip-compressed binary).
@@ -413,6 +416,7 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
     let mut brdf_layers = Vec::new();
     let mut retro_weights = Vec::new();
     let mut retro_bias = Vec::new();
+    let mut tone_curve = Vec::new();
 
     for _ in 0..num_sections {
         if *offset + 16 > data.len() {
@@ -476,6 +480,9 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
                     retro_weights = vals;
                 }
             }
+            "tone_curve" => {
+                tone_curve = f16_payload_to_f32(payload, dtype);
+            }
             other => {
                 log::info!("  skipping unknown section '{}'", other);
             }
@@ -495,6 +502,7 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
         brdf_layers,
         retro_weights,
         retro_bias,
+        tone_curve,
     })
 }
 

@@ -6,5 +6,7 @@ edition = "2021"
 [dependencies]
 rmesh-util = { path = "../rmesh-util" }
 rmesh-render = { path = "../rmesh-render" }
+rmesh-sort = { path = "../rmesh-sort" }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
+glam = { workspace = true }

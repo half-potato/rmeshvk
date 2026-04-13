@@ -166,21 +166,24 @@ fn find_crossing_edges(p: array<vec2<f32>, 4>) -> vec2<u32> {
     return pairs[0];
 }
 
-// Write a vertex as 3 packed vec4s at the given slot.
-// Layout: [i*3+0] = (ndc_xy, z_front, z_back)
-//         [i*3+1] = (off_front, off_back, 0, 0)
-//         [i*3+2] = (gradient.xyz, 0) — raw field gradient at entry point
+// Write a vertex as 4 packed vec4s at the given slot.
+// Layout: [i*4+0] = (ndc_xy, z_front, z_back)
+//         [i*4+1] = (off_front, off_back, 0, 0)
+//         [i*4+2] = (gradient.xyz, 0) — raw field gradient (n_front)
+//         [i*4+3] = (gradient.xyz, 0) — n_back (same as n_front here)
 fn write_vertex(slot: u32, ndc_xy: vec2<f32>, z_front: f32, z_back: f32,
                 off_front: f32, off_back: f32, gradient: vec3f) {
-    out_vertices[slot * 3u + 0u] = vec4<f32>(ndc_xy, z_front, z_back);
-    out_vertices[slot * 3u + 1u] = vec4<f32>(off_front, off_back, 0.0, 0.0);
-    out_vertices[slot * 3u + 2u] = vec4<f32>(gradient, 0.0);
+    out_vertices[slot * 4u + 0u] = vec4<f32>(ndc_xy, z_front, z_back);
+    out_vertices[slot * 4u + 1u] = vec4<f32>(off_front, off_back, 0.0, 0.0);
+    out_vertices[slot * 4u + 2u] = vec4<f32>(gradient, 0.0);
+    out_vertices[slot * 4u + 3u] = vec4<f32>(gradient, 0.0);
 }
 
 fn write_degenerate_vertex(slot: u32) {
-    out_vertices[slot * 3u + 0u] = vec4<f32>(0.0);
-    out_vertices[slot * 3u + 1u] = vec4<f32>(0.0);
-    out_vertices[slot * 3u + 2u] = vec4<f32>(0.0);
+    out_vertices[slot * 4u + 0u] = vec4<f32>(0.0);
+    out_vertices[slot * 4u + 1u] = vec4<f32>(0.0);
+    out_vertices[slot * 4u + 2u] = vec4<f32>(0.0);
+    out_vertices[slot * 4u + 3u] = vec4<f32>(0.0);
 }
 
 @compute @workgroup_size(64)

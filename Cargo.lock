@@ -3566,7 +3566,9 @@ name = "rmesh-dsm"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "glam",
  "rmesh-render",
+ "rmesh-sort",
  "rmesh-util",
  "wgpu",
 ]

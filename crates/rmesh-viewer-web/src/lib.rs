@@ -310,6 +310,7 @@ impl WebViewer {
             &self.primitive_targets.depth_view,
             if self.show_primitives { &self.primitives } else { &[] },
             &vp,
+            None,
         );
 
         // Sorted forward pass: compute → radix sort → HW render

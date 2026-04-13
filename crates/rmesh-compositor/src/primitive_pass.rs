@@ -5,6 +5,7 @@ use crate::geometry::{PrimitiveGeometry, PrimitiveVertex};
 use rmesh_interact::Primitive;
 
 const PRIMITIVE_WGSL: &str = include_str!("wgsl/primitive.wgsl");
+const PRIMITIVE_MRT_WGSL: &str = include_str!("wgsl/primitive_mrt.wgsl");
 
 /// Uniform data for one primitive draw call, padded to 256 bytes for dynamic offsets.
 /// Layout: vp(64) + model(64) + color(16) + pad(112) = 256 bytes.
@@ -66,9 +67,17 @@ impl PrimitiveTargets {
     }
 }
 
+/// Additional MRT target views for primitive rendering when deferred shading is active.
+pub struct MrtViews<'a> {
+    pub aux0_view: &'a wgpu::TextureView,
+    pub normals_view: &'a wgpu::TextureView,
+    pub albedo_view: &'a wgpu::TextureView,
+}
+
 /// Pipeline and resources for rendering primitives.
 pub struct PrimitivePipeline {
     pub pipeline: wgpu::RenderPipeline,
+    pub pipeline_mrt: wgpu::RenderPipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub uniform_buffer: wgpu::Buffer,
     pub bind_group: wgpu::BindGroup,
@@ -79,6 +88,10 @@ impl PrimitivePipeline {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("primitive.wgsl"),
             source: wgpu::ShaderSource::Wgsl(PRIMITIVE_WGSL.into()),
+        });
+        let shader_mrt = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("primitive_mrt.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(PRIMITIVE_MRT_WGSL.into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -103,55 +116,95 @@ impl PrimitivePipeline {
             immediate_size: 0,
         });
 
+        let color_format = wgpu::TextureFormat::Rgba16Float;
+
+        let vertex_state = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<PrimitiveVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x3,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x3,
+                    offset: 12,
+                    shader_location: 1,
+                },
+            ],
+        };
+
+        let depth_stencil = wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        };
+
+        let primitive_state = wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        };
+
+        // Single-target pipeline (non-MRT)
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("prim_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<PrimitiveVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        // position
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        // normal
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: 12,
-                            shader_location: 1,
-                        },
-                    ],
-                }],
+                buffers: &[vertex_state.clone()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None, // opaque
+                    format: color_format,
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
             }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
+            primitive: primitive_state,
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // MRT pipeline (4 color targets matching interval pipeline)
+        let opaque_target = Some(wgpu::ColorTargetState {
+            format: color_format,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        });
+        let pipeline_mrt = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("prim_pipeline_mrt"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader_mrt,
+                entry_point: Some("vs_main"),
+                buffers: &[vertex_state],
+                compilation_options: Default::default(),
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader_mrt,
+                entry_point: Some("fs_main"),
+                targets: &[
+                    opaque_target.clone(), // location(0): color/plaster
+                    opaque_target.clone(), // location(1): aux0
+                    opaque_target.clone(), // location(2): normals
+                    opaque_target,         // location(3): albedo
+                ],
+                compilation_options: Default::default(),
             }),
+            primitive: primitive_state,
+            depth_stencil: Some(depth_stencil),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -179,13 +232,14 @@ impl PrimitivePipeline {
             }],
         });
 
-        Self { pipeline, bind_group_layout, uniform_buffer, bind_group }
+        Self { pipeline, pipeline_mrt, bind_group_layout, uniform_buffer, bind_group }
     }
 }
 
 /// Record a primitive render pass.
 ///
-/// Writes uniform data for each primitive, then records draw calls.
+/// When `mrt_views` is `Some`, renders to 4 MRT targets (color + aux0 + normals + albedo)
+/// for deferred shading. Otherwise renders to a single color target.
 pub fn record_primitive_pass(
     encoder: &mut wgpu::CommandEncoder,
     queue: &wgpu::Queue,
@@ -195,20 +249,56 @@ pub fn record_primitive_pass(
     depth_view: &wgpu::TextureView,
     primitives: &[Primitive],
     vp: &glam::Mat4,
+    mrt_views: Option<MrtViews>,
 ) {
+    let clear_ops = wgpu::Operations {
+        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        store: wgpu::StoreOp::Store,
+    };
+
+    let color_attachment = Some(wgpu::RenderPassColorAttachment {
+        view: color_view,
+        resolve_target: None,
+        ops: clear_ops,
+        depth_slice: None,
+    });
+
+    // Build color attachments based on MRT mode
+    let mrt_attachments;
+    let single_attachments;
+    let color_attachments: &[Option<wgpu::RenderPassColorAttachment>] = if let Some(ref mrt) = mrt_views {
+        mrt_attachments = [
+            color_attachment,
+            Some(wgpu::RenderPassColorAttachment {
+                view: mrt.aux0_view,
+                resolve_target: None,
+                ops: clear_ops,
+                depth_slice: None,
+            }),
+            Some(wgpu::RenderPassColorAttachment {
+                view: mrt.normals_view,
+                resolve_target: None,
+                ops: clear_ops,
+                depth_slice: None,
+            }),
+            Some(wgpu::RenderPassColorAttachment {
+                view: mrt.albedo_view,
+                resolve_target: None,
+                ops: clear_ops,
+                depth_slice: None,
+            }),
+        ];
+        &mrt_attachments
+    } else {
+        single_attachments = [color_attachment];
+        &single_attachments
+    };
+
     if primitives.is_empty() {
         // Still clear the targets
         let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("prim_clear"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: color_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
+            color_attachments,
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_view,
                 depth_ops: Some(wgpu::Operations {
@@ -248,15 +338,7 @@ pub fn record_primitive_pass(
     // Record render pass
     let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("primitives"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: color_view,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                store: wgpu::StoreOp::Store,
-            },
-            depth_slice: None,
-        })],
+        color_attachments,
         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
             view: depth_view,
             depth_ops: Some(wgpu::Operations {
@@ -268,7 +350,12 @@ pub fn record_primitive_pass(
         ..Default::default()
     });
 
-    rpass.set_pipeline(&pipeline.pipeline);
+    let active_pipeline = if mrt_views.is_some() {
+        &pipeline.pipeline_mrt
+    } else {
+        &pipeline.pipeline
+    };
+    rpass.set_pipeline(active_pipeline);
     rpass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
 
     for (i, prim) in primitives.iter().take(count).enumerate() {

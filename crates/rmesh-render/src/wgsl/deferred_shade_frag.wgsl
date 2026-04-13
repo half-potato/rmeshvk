@@ -42,6 +42,7 @@ struct Light {
 @group(0) @binding(4) var albedo_tex: texture_2d<f32>;    // albedo.rgb, alpha
 @group(0) @binding(5) var<storage, read> lights: array<Light>;
 @group(0) @binding(6) var hw_depth_tex: texture_depth_2d; // hardware depth buffer
+@group(0) @binding(7) var<storage, read> tone_curve: array<f32>; // [y_knots..., slope, intercept, intercept_bias]
 
 // Debug mode constants
 const DBG_FINAL:       u32 = 0u;
@@ -58,6 +59,26 @@ const DBG_RETRO:       u32 = 10u;
 const DBG_LAMBDA:      u32 = 11u;
 const DBG_PLASTER:     u32 = 12u;
 const DBG_ALPHA:       u32 = 13u;
+
+/// Evaluate the monotonic piecewise-linear tone curve loaded from the .rmesh file.
+/// Layout: [y_knots..., slope, intercept, intercept_bias], n_knots = len - 3.
+fn eval_tone_curve(x_in: f32) -> f32 {
+    let total_len = arrayLength(&tone_curve);
+    let n_knots = total_len - 3u;
+    let x = clamp(x_in, 0.0, 1.0);
+
+    // Piecewise linear interpolation over uniform x knots in [0, 1]
+    let t = x * f32(n_knots - 1u);
+    let bin = min(u32(t), n_knots - 2u);
+    let alpha = t - f32(bin);
+    let y = tone_curve[bin] + alpha * (tone_curve[bin + 1u] - tone_curve[bin]);
+
+    let slope = tone_curve[total_len - 3u];
+    let intercept = tone_curve[total_len - 2u];
+    let intercept_bias = tone_curve[total_len - 1u];
+
+    return max(y + slope * x + intercept + intercept_bias, 1e-3);
+}
 
 struct VsOut {
     @builtin(position) pos: vec4f,
@@ -113,9 +134,10 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let ndc_depth = hw_depth;
     let depth = near * far / (far - ndc_depth * (far - near));
 
-    // Recover true albedo by dividing out plaster (env lighting)
+    // Recover true albedo by applying calibrated tone curve to plaster luminance
     let plaster_lum = max(0.2126 * plaster.r + 0.7152 * plaster.g + 0.0722 * plaster.b, 1e-3);
-    let albedo = raw_albedo / plaster_lum;
+    let calibrated_lighting = eval_tone_curve(plaster_lum);
+    let albedo = raw_albedo / calibrated_lighting;
 
     // Reconstruct world position from hw depth + inverse VP
     let ndc_x = (frag_coord.x + 0.5) / f32(uniforms.width) * 2.0 - 1.0;

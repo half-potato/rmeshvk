@@ -49,10 +49,11 @@ fn main(@builtin(vertex_index) vid: u32) -> IntervalVertexOutput {
     let tet = vid / 5u;
     let slot = vid;
 
-    // Read 3 vec4s per vertex
-    let pos_depth = verts[slot * 3u + 0u];   // (ndc_x, ndc_y, z_front, z_back)
-    let offsets = verts[slot * 3u + 1u];      // (off_front, off_back, 0, 0)
-    let grad_data = verts[slot * 3u + 2u];   // (gradient.xyz, 0)
+    // Read 4 vec4s per vertex (matching interval_generate write_vertex stride)
+    let pos_depth = verts[slot * 4u + 0u];   // (pixel_x, pixel_y, z_front, z_back)
+    let offsets = verts[slot * 4u + 1u];      // (off_front, off_back, 0, 0)
+    let grad_data = verts[slot * 4u + 2u];   // (n_front.xyz, 0)
+    // slot * 4u + 3u = (n_back.xyz, 0) — used by fragment shader via interpolation
 
     // Read per-tet flat data (2 vec4s per tet: [color+density, tet_id+pad])
     let td = tet_data[tet * 2u];              // (base_r, base_g, base_b, density)
