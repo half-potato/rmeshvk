@@ -48,16 +48,16 @@ fn main(@builtin(vertex_index) vid: u32) -> IntervalVertexOutput {
     let tet = vid / 5u;
     let slot = vid;
 
-    // Read 2 vec4s per vertex
-    let pos_depth = verts[slot * 2u + 0u];   // (ndc_x, ndc_y, z_front, z_back)
-    let offsets = verts[slot * 2u + 1u];      // (off_front, off_back, 0, 0)
+    // Read 4 vec4s per vertex (matching interval_compute write_vertex stride)
+    let pos_depth = verts[slot * 4u + 0u];   // (ndc_x, ndc_y, z_front, z_back)
+    let offsets = verts[slot * 4u + 1u];      // (off_front, off_back, 0, 0)
 
     // Read per-tet flat data (2 vec4s per tet: [color+density, tet_id+pad])
     let td = tet_data[tet * 2u];              // (base_r, base_g, base_b, density)
     let td1 = tet_data[tet * 2u + 1u];        // (bitcast tet_id, 0, 0, 0)
 
     var out: IntervalVertexOutput;
-    out.position = vec4<f32>(pos_depth.xy, 0.0, 1.0);
+    out.position = vec4<f32>(pos_depth.xy, pos_depth.z, 1.0);
     out.depths = pos_depth.zw;
     out.color_offsets = offsets.xy;
     out.density = td.w;

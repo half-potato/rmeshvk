@@ -62,5 +62,6 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> @locatio
     let od = clamp(in.density * dist, 0.0, 88.0);
     let alpha = 1.0 - exp(-od);
 
-    return vec4<f32>(0.0, 0.0, 0.0, alpha);
+    // RGB = alpha for debug visualization; alpha for compositing
+    return vec4<f32>(alpha, alpha, alpha, alpha);
 }

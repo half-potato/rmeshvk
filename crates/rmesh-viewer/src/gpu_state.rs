@@ -168,6 +168,19 @@ pub struct GpuState {
     /// Blit bind group pointing to deferred output (swapped when deferred is active)
     pub deferred_blit_bg: Option<wgpu::BindGroup>,
     pub has_pbr_data: bool,
+    // DSM debug view (Fourier deep shadow map from camera perspective)
+    pub dsm_pipeline: rmesh_dsm::DsmPipeline,
+    pub dsm_prim_pipeline: rmesh_dsm::DsmPrimitivePipeline,
+    pub dsm_resolve_pipeline: rmesh_dsm::DsmResolvePipeline,
+    pub dsm_fourier_textures: [wgpu::Texture; rmesh_dsm::FOURIER_MRT_COUNT],
+    pub dsm_fourier_views: [wgpu::TextureView; rmesh_dsm::FOURIER_MRT_COUNT],
+    pub dsm_depth_texture: wgpu::Texture,
+    pub dsm_depth_view: wgpu::TextureView,
+    pub dsm_resolve_output: wgpu::Texture,
+    pub dsm_resolve_output_view: wgpu::TextureView,
+    pub dsm_render_bg: wgpu::BindGroup,
+    pub dsm_resolve_bg: wgpu::BindGroup,
+    pub dsm_blit_bg: wgpu::BindGroup,
     // Ray trace
     pub rt_pipeline: rmesh_render::RayTracePipeline,
     pub rt_buffers: rmesh_render::RayTraceBuffers,

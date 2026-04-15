@@ -10,6 +10,7 @@ rmesh-sort = { path = "../rmesh-sort" }
 rmesh-sim = { path = "../rmesh-sim" }
 rmesh-interact = { path = "../rmesh-interact" }
 rmesh-compositor = { path = "../rmesh-compositor" }
+rmesh-dsm = { path = "../rmesh-dsm" }
 rmesh-util = { path = "../rmesh-util" }
 wgpu = { workspace = true }
 winit = { workspace = true }

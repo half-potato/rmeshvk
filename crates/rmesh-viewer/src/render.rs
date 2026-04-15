@@ -202,6 +202,7 @@ impl App {
         let mut deferred_enabled = self.deferred_enabled;
         let mut ambient = self.ambient;
         let mut deferred_debug_mode = self.deferred_debug_mode;
+        let mut dsm_query_depth = self.dsm_query_depth;
         // Get mesh bbox for dynamic slider ranges
         let (fluid_bbox_min, fluid_bbox_max) = if let Some(ref sim) = gpu.fluid_sim {
             (sim.mesh_bbox_min, sim.mesh_bbox_max)
@@ -248,12 +249,18 @@ impl App {
                                 "Final", "Raw Albedo", "True Albedo", "Normals",
                                 "Roughness", "Env Feature", "Depth", "Specular",
                                 "Diffuse", "Shadow", "Retro", "Lambda",
-                                "Plaster", "Alpha", "Primitives",
+                                "Plaster", "Alpha", "Primitives", "DSM",
                             ];
                             ui.separator();
                             ui.label("Debug Layer");
                             for (i, label) in debug_labels.iter().enumerate() {
                                 ui.radio_value(&mut deferred_debug_mode, i as u32, *label);
+                            }
+                            if deferred_debug_mode == 15 {
+                                ui.separator();
+                                ui.add(egui::Slider::new(&mut dsm_query_depth, self.camera.near_z..=self.camera.far_z)
+                                    .logarithmic(true)
+                                    .text("DSM Depth"));
                             }
                         }
                     });
@@ -399,6 +406,7 @@ impl App {
         self.deferred_enabled = deferred_enabled;
         self.ambient = ambient;
         self.deferred_debug_mode = deferred_debug_mode;
+        self.dsm_query_depth = dsm_query_depth;
 
         // Handle primitive add/delete/selection
         if let Some(kind) = add_primitive {
@@ -859,11 +867,67 @@ impl App {
             }
         }
 
-        // 4. Blit to swapchain — from raytrace output, deferred output, or color_view
+        // 3b. DSM debug view (Fourier deep shadow map from camera perspective)
+        let use_dsm_debug = self.deferred_enabled && self.deferred_debug_mode == 15;
+        if use_dsm_debug {
+            let fourier_views: [&wgpu::TextureView; rmesh_dsm::FOURIER_MRT_COUNT] =
+                std::array::from_fn(|i| &gpu.dsm_fourier_views[i]);
+
+            // Primitive pre-pass into Fourier MRT targets
+            rmesh_dsm::record_dsm_primitive_pass(
+                &mut encoder,
+                &gpu.queue,
+                &gpu.dsm_prim_pipeline,
+                &gpu.primitive_geometry,
+                &fourier_views,
+                &gpu.dsm_depth_view,
+                if self.show_primitives { &self.primitives } else { &[] },
+                &vp,
+                self.camera.near_z,
+                self.camera.far_z,
+                w,
+                h,
+            );
+
+            // Tet DSM render (Fourier accumulation, reuses interval data from forward pass)
+            rmesh_dsm::record_dsm_render(
+                &mut encoder,
+                &gpu.dsm_pipeline,
+                &gpu.dsm_render_bg,
+                &gpu.buffers.interval_fan_index_buf,
+                &gpu.buffers.interval_args_buf,
+                &fourier_views,
+                &gpu.dsm_depth_view,
+                w,
+                h,
+            );
+
+            // Upload query depth and resolve Fourier → T(z)
+            gpu.queue.write_buffer(
+                &gpu.dsm_resolve_pipeline.uniforms_buf,
+                0,
+                bytemuck::bytes_of(&rmesh_dsm::DsmResolveUniforms {
+                    z_query: self.dsm_query_depth,
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    _pad: 0.0,
+                }),
+            );
+            rmesh_dsm::record_dsm_resolve(
+                &mut encoder,
+                &gpu.dsm_resolve_pipeline,
+                &gpu.dsm_resolve_bg,
+                &gpu.dsm_resolve_output_view,
+            );
+        }
+
+        // 4. Blit to swapchain — from raytrace output, DSM debug, deferred output, or color_view
         if self.render_mode == RenderMode::RayTrace {
             rmesh_render::record_blit_nf(
                 &mut encoder, &gpu.rt_blit_pipeline, &gpu.rt_blit_bg, &view,
             );
+        } else if use_dsm_debug {
+            record_blit(&mut encoder, &gpu.blit_pipeline, &gpu.dsm_blit_bg, &view);
         } else {
             let blit_bg = if use_deferred {
                 gpu.deferred_blit_bg.as_ref().unwrap_or(&gpu.blit_bg)

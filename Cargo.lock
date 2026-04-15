@@ -3567,6 +3567,8 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "glam",
+ "rmesh-compositor",
+ "rmesh-interact",
  "rmesh-render",
  "rmesh-sort",
  "rmesh-util",
@@ -3712,6 +3714,7 @@ dependencies = [
  "rfd",
  "rmesh-compositor",
  "rmesh-data",
+ "rmesh-dsm",
  "rmesh-interact",
  "rmesh-render",
  "rmesh-sim",

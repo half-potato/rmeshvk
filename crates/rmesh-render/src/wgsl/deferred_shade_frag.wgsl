@@ -60,6 +60,7 @@ const DBG_LAMBDA:      u32 = 11u;
 const DBG_PLASTER:     u32 = 12u;
 const DBG_ALPHA:       u32 = 13u;
 const DBG_PRIMITIVES:  u32 = 14u;
+const DBG_DSM:         u32 = 15u;
 
 /// Evaluate the monotonic piecewise-linear tone curve loaded from the .rmesh file.
 /// Layout: [y_knots..., slope, intercept, intercept_bias], n_knots = len - 3.
