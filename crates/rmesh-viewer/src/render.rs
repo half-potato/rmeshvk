@@ -821,7 +821,72 @@ impl App {
                     }
                 }
 
-                // If no lights, add a default at camera position
+                // DSM shadows only for actual scene lights (before adding default camera light)
+                let scene_light_count = num_lights;
+                let scene_lights = &gpu_lights[..scene_light_count as usize];
+                let lights_changed = scene_light_count != self.cached_dsm_num_lights
+                    || scene_lights != &self.cached_dsm_lights[..];
+
+                if lights_changed {
+                    if scene_light_count == 0 {
+                        // No scene lights → disable DSM
+                        gpu.dsm_atlas = None;
+                        gpu.deferred_dsm_bg = None;
+                    } else {
+                        // Reallocate DsmAtlas if light count or types changed
+                        let need_realloc = gpu.dsm_atlas.as_ref().map_or(true, |atlas| {
+                            atlas.num_lights != scene_light_count
+                        });
+                        if need_realloc {
+                            let light_types: Vec<u32> = scene_lights.iter().map(|l| l.light_type).collect();
+                            gpu.dsm_atlas = Some(rmesh_dsm::DsmAtlas::new(
+                                &gpu.device, 512, &light_types,
+                            ));
+                        }
+
+                        // Generate DSMs for scene lights only
+                        if let Some(ref atlas) = gpu.dsm_atlas {
+                            rmesh_dsm::generate_dsm_for_lights(
+                                atlas,
+                                &mut encoder,
+                                &gpu.device,
+                                &gpu.queue,
+                                &gpu.dsm_pipeline,
+                                &gpu.dsm_prim_pipeline,
+                                &gpu.primitive_geometry,
+                                if self.show_primitives { &self.primitives } else { &[] },
+                                &gpu.pipelines,
+                                &gpu.compute_interval_pipelines,
+                                &gpu.sort_pipelines,
+                                &gpu.sort_state,
+                                &gpu.buffers,
+                                &gpu.material_buffers,
+                                &gpu.sh_coeffs_buf,
+                                scene_lights,
+                                scene_light_count,
+                                gpu.tet_count,
+                                self.camera.near_z,
+                                self.camera.far_z,
+                            );
+                            atlas.populate_metadata(
+                                &gpu.queue, scene_lights,
+                                self.camera.near_z, self.camera.far_z,
+                            );
+
+                            // Create DSM bind group from atlas
+                            gpu.deferred_dsm_bg = Some(rmesh_render::create_deferred_dsm_bind_group(
+                                &gpu.device, deferred,
+                                &atlas.fourier_array_views, &atlas.meta_buf,
+                            ));
+                        }
+                    }
+
+                    // Update cached state
+                    self.cached_dsm_lights = scene_lights.to_vec();
+                    self.cached_dsm_num_lights = scene_light_count;
+                }
+
+                // If no scene lights, add default at camera position (for lighting only, no DSM)
                 if num_lights == 0 {
                     gpu_lights[0] = rmesh_render::GpuLight {
                         position: pos,
@@ -842,7 +907,8 @@ impl App {
                     bytemuck::cast_slice(&gpu_lights),
                 );
 
-                // Upload deferred uniforms
+                // Upload deferred uniforms — DSM only for scene lights
+                let dsm_enabled = if gpu.dsm_atlas.is_some() { 1u32 } else { 0u32 };
                 let deferred_uniforms = rmesh_render::DeferredUniforms {
                     inv_vp: vp.inverse().to_cols_array_2d(),
                     cam_pos: pos,
@@ -853,7 +919,8 @@ impl App {
                     debug_mode: self.deferred_debug_mode,
                     near_plane: self.camera.near_z,
                     far_plane: self.camera.far_z,
-                    _pad: [0.0; 2],
+                    dsm_enabled,
+                    _pad: 0.0,
                 };
                 gpu.queue.write_buffer(
                     &deferred.uniforms_buf, 0,
@@ -861,8 +928,11 @@ impl App {
                 );
 
                 // Record deferred shade pass — writes to separate output texture
+                let dsm_bg = gpu.deferred_dsm_bg.as_ref()
+                    .or(gpu.deferred_dsm_dummy_bg.as_ref())
+                    .unwrap();
                 rmesh_render::record_deferred_shade(
-                    &mut encoder, deferred, bg, out_view,
+                    &mut encoder, deferred, bg, dsm_bg, out_view,
                 );
             }
         }

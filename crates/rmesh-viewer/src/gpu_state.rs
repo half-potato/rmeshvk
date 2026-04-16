@@ -181,6 +181,10 @@ pub struct GpuState {
     pub dsm_render_bg: wgpu::BindGroup,
     pub dsm_resolve_bg: wgpu::BindGroup,
     pub dsm_blit_bg: wgpu::BindGroup,
+    // Per-light DSM cache (Fourier deep shadow maps)
+    pub dsm_atlas: Option<rmesh_dsm::DsmAtlas>,
+    pub deferred_dsm_bg: Option<wgpu::BindGroup>,
+    pub deferred_dsm_dummy_bg: Option<wgpu::BindGroup>,
     // Ray trace
     pub rt_pipeline: rmesh_render::RayTracePipeline,
     pub rt_buffers: rmesh_render::RayTraceBuffers,

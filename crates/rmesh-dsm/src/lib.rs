@@ -666,78 +666,132 @@ const CUBEMAP_DIRS: [(Vec3, Vec3); 6] = [
     (Vec3::NEG_Z, Vec3::NEG_Y),   // -Z, up = -Y
 ];
 
-/// Per-light DSM entry. Point lights have 6 face textures (cubemap),
-/// spot/directional lights have 1.
-pub struct DsmEntry {
-    /// Fourier coefficient textures: [mrt_index][face_index].
-    pub fourier_textures: [Vec<wgpu::Texture>; FOURIER_MRT_COUNT],
-    pub fourier_views: [Vec<wgpu::TextureView>; FOURIER_MRT_COUNT],
-    pub depth_textures: Vec<wgpu::Texture>,
-    pub depth_views: Vec<wgpu::TextureView>,
+/// Per-light shadow metadata for the deferred shader (matches WGSL `ShadowLight`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ShadowLightMeta {
+    /// VP matrices for each cubemap face (6 faces for point lights, 1 for spot/dir).
+    pub vp_matrices: [[[f32; 4]; 4]; 6],
+    pub face_offset: u32,
+    pub face_count: u32,
+    pub near: f32,
+    pub far: f32,
+    pub light_type: u32,
+    pub _pad: [u32; 3],
 }
 
-/// Cached deep shadow map textures for all active lights.
-pub struct DsmLightMaps {
-    pub entries: Vec<DsmEntry>,
+/// Cached DSM atlas: texture arrays for all light faces + per-light metadata.
+///
+/// Fourier coefficients are stored in 3 `texture_2d_array` textures (one per MRT).
+/// Each layer corresponds to one face of one light (point lights have 6 faces,
+/// spot/directional have 1). DSM generation renders directly into per-layer views.
+pub struct DsmAtlas {
+    /// 3 texture arrays (one per Fourier MRT), with `total_layers` layers each.
+    pub fourier_arrays: [wgpu::Texture; FOURIER_MRT_COUNT],
+    /// D2Array views for shader binding.
+    pub fourier_array_views: [wgpu::TextureView; FOURIER_MRT_COUNT],
+    /// Per-layer D2 views for render attachment during DSM generation.
+    pub fourier_layer_views: [Vec<wgpu::TextureView>; FOURIER_MRT_COUNT],
+    /// Depth array texture for DSM render pass.
+    pub depth_array: wgpu::Texture,
+    /// Per-layer depth views for render attachment.
+    pub depth_layer_views: Vec<wgpu::TextureView>,
+    /// Per-light shadow metadata storage buffer.
+    pub meta_buf: wgpu::Buffer,
+    /// Per-light face offsets (cumulative).
+    pub face_offsets: Vec<u32>,
+    /// Face count per light.
+    pub face_counts: Vec<u32>,
+    pub num_lights: u32,
+    pub total_layers: u32,
     pub resolution: u32,
-    /// Scratch uniform buffer for light viewpoint (avoids clobbering camera uniforms).
+    /// Scratch uniform buffer for light viewpoint.
     pub scratch_uniforms: wgpu::Buffer,
 }
 
-impl DsmLightMaps {
-    /// Allocate DSM textures for `num_lights` lights.
+impl DsmAtlas {
+    /// Allocate atlas textures for the given light types.
     ///
-    /// `light_types[i]` determines face count: 0 (point) → 6 faces, else → 1 face.
+    /// `light_types[i]`: 0 = point (6 faces), else = 1 face.
     pub fn new(device: &wgpu::Device, resolution: u32, light_types: &[u32]) -> Self {
-        let mut entries = Vec::with_capacity(light_types.len());
-        for (i, &lt) in light_types.iter().enumerate() {
-            let face_count = if lt == 0 { 6 } else { 1 };
-            let mut fourier_textures: [Vec<wgpu::Texture>; FOURIER_MRT_COUNT] = std::array::from_fn(|_| Vec::with_capacity(face_count));
-            let mut fourier_views: [Vec<wgpu::TextureView>; FOURIER_MRT_COUNT] = std::array::from_fn(|_| Vec::with_capacity(face_count));
-            let mut depth_textures = Vec::with_capacity(face_count);
-            let mut depth_views = Vec::with_capacity(face_count);
-            for f in 0..face_count {
-                for m in 0..FOURIER_MRT_COUNT {
-                    let tex = device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some(&format!("dsm_light{i}_face{f}_mrt{m}")),
-                        size: wgpu::Extent3d {
-                            width: resolution,
-                            height: resolution,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: DSM_FORMAT,
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                            | wgpu::TextureUsages::TEXTURE_BINDING,
-                        view_formats: &[],
-                    });
-                    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-                    fourier_textures[m].push(tex);
-                    fourier_views[m].push(view);
-                }
-
-                let dtex = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some(&format!("dsm_depth_light{i}_face{f}")),
-                    size: wgpu::Extent3d {
-                        width: resolution,
-                        height: resolution,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Depth32Float,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
-                });
-                let dview = dtex.create_view(&wgpu::TextureViewDescriptor::default());
-                depth_textures.push(dtex);
-                depth_views.push(dview);
-            }
-            entries.push(DsmEntry { fourier_textures, fourier_views, depth_textures, depth_views });
+        let mut face_offsets = Vec::with_capacity(light_types.len());
+        let mut face_counts = Vec::with_capacity(light_types.len());
+        let mut total_layers = 0u32;
+        for &lt in light_types {
+            face_offsets.push(total_layers);
+            let fc = if lt == 0 { 6u32 } else { 1u32 };
+            face_counts.push(fc);
+            total_layers += fc;
         }
+        // Ensure at least 1 layer (for dummy atlas when no lights)
+        let array_layers = total_layers.max(1);
+
+        let fourier_arrays: [wgpu::Texture; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&format!("dsm_atlas_mrt{m}")),
+                size: wgpu::Extent3d {
+                    width: resolution,
+                    height: resolution,
+                    depth_or_array_layers: array_layers,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DSM_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        });
+
+        let fourier_array_views: [wgpu::TextureView; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
+            fourier_arrays[m].create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            })
+        });
+
+        let fourier_layer_views: [Vec<wgpu::TextureView>; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
+            (0..total_layers).map(|layer| {
+                fourier_arrays[m].create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            }).collect()
+        });
+
+        let depth_array = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dsm_atlas_depth"),
+            size: wgpu::Extent3d {
+                width: resolution,
+                height: resolution,
+                depth_or_array_layers: array_layers,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+
+        let depth_layer_views: Vec<wgpu::TextureView> = (0..total_layers).map(|layer| {
+            depth_array.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: layer,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        }).collect();
+
+        let meta_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dsm_shadow_meta"),
+            size: (16 * std::mem::size_of::<ShadowLightMeta>()) as u64, // MAX_LIGHTS
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let scratch_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dsm_scratch_uniforms"),
@@ -747,10 +801,54 @@ impl DsmLightMaps {
         });
 
         Self {
-            entries,
+            fourier_arrays,
+            fourier_array_views,
+            fourier_layer_views,
+            depth_array,
+            depth_layer_views,
+            meta_buf,
+            face_offsets,
+            face_counts,
+            num_lights: light_types.len() as u32,
+            total_layers,
             resolution,
             scratch_uniforms,
         }
+    }
+
+    /// Create a dummy atlas (1x1, 1 layer) for when no DSM is available.
+    pub fn new_dummy(device: &wgpu::Device) -> Self {
+        Self::new(device, 1, &[])
+    }
+
+    /// Fill metadata buffer with VP matrices and face offsets for all lights.
+    pub fn populate_metadata(
+        &self,
+        queue: &wgpu::Queue,
+        lights: &[GpuLight],
+        near: f32,
+        far: f32,
+    ) {
+        let mut metas = vec![ShadowLightMeta::zeroed(); 16]; // MAX_LIGHTS
+        for (li, light) in lights.iter().enumerate() {
+            if li >= 16 { break; }
+            let fc = self.face_counts[li] as usize;
+            let mut vps = [[[0.0f32; 4]; 4]; 6];
+            for fi in 0..fc {
+                let (vp, _c2w) = build_light_vp(light, fi, near, far);
+                vps[fi] = vp.to_cols_array_2d();
+            }
+            metas[li] = ShadowLightMeta {
+                vp_matrices: vps,
+                face_offset: self.face_offsets[li],
+                face_count: fc as u32,
+                near,
+                far,
+                light_type: light.light_type,
+                _pad: [0; 3],
+            };
+        }
+        queue.write_buffer(&self.meta_buf, 0, bytemuck::cast_slice(&metas));
     }
 }
 
@@ -759,7 +857,7 @@ impl DsmLightMaps {
 /// For point lights (type 0), `face_index` selects the cubemap face (0..6).
 /// For spot lights (type 1), uses the light's direction and outer cone angle.
 /// For directional lights (type 2), uses an orthographic projection along direction.
-fn build_light_vp(
+pub fn build_light_vp(
     light: &GpuLight,
     face_index: usize,
     near: f32,
@@ -823,7 +921,7 @@ fn build_light_vp(
 ///   3. Indirect convert
 ///   4. Per face: interval gen + DSM render
 pub fn generate_dsm_for_lights(
-    maps: &DsmLightMaps,
+    atlas: &DsmAtlas,
     encoder: &mut wgpu::CommandEncoder,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -844,7 +942,7 @@ pub fn generate_dsm_for_lights(
     near: f32,
     far: f32,
 ) {
-    let res = maps.resolution;
+    let res = atlas.resolution;
     let n_pow2 = tet_count.next_power_of_two();
 
     // Intrinsics for 90° square FOV at DSM resolution (used for cubemap + spot ray_scale)
@@ -852,15 +950,13 @@ pub fn generate_dsm_for_lights(
 
     for li in 0..num_lights.min(lights.len() as u32) {
         let light = &lights[li as usize];
-        let entry = &maps.entries[li as usize];
-        let face_count = entry.depth_views.len();
+        let face_count = atlas.face_counts[li as usize] as usize;
+        let face_offset = atlas.face_offsets[li as usize] as usize;
         let pos = Vec3::from(light.position);
 
         // --- Sort pass (once per light position) ---
-        // Use the first face VP for the forward compute (sort only uses cam_pos)
         let (first_vp, first_c2w) = build_light_vp(light, 0, near, far);
 
-        // Compute intrinsics matching the projection
         let fx = first_vp.col(0).x * half;
         let fy = first_vp.col(1).y * half;
         let intrinsics = [fx.abs(), fy.abs(), half, half];
@@ -873,15 +969,15 @@ pub fn generate_dsm_for_lights(
             res as f32,
             res as f32,
             tet_count,
-            0,  // step
-            4,  // tile_size (unused for DSM)
+            0,
+            4,
             0.0,
-            0,  // sh_degree (unused for DSM)
+            0,
             near,
             far,
         );
         queue.write_buffer(
-            &maps.scratch_uniforms,
+            &atlas.scratch_uniforms,
             0,
             bytemuck::bytes_of(&uniforms),
         );
@@ -904,7 +1000,7 @@ pub fn generate_dsm_for_lights(
             buffers,
             material,
             sh_coeffs_buf,
-            &maps.scratch_uniforms,
+            &atlas.scratch_uniforms,
         );
 
         // Forward compute (projection + sort keys)
@@ -971,7 +1067,7 @@ pub fn generate_dsm_for_lights(
                 far,
             );
             queue.write_buffer(
-                &maps.scratch_uniforms,
+                &atlas.scratch_uniforms,
                 0,
                 bytemuck::bytes_of(&face_uniforms),
             );
@@ -988,7 +1084,7 @@ pub fn generate_dsm_for_lights(
                 buffers,
                 material,
                 sort_values,
-                &maps.scratch_uniforms,
+                &atlas.scratch_uniforms,
             );
             {
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1000,9 +1096,10 @@ pub fn generate_dsm_for_lights(
                 cpass.dispatch_workgroups_indirect(&buffers.interval_args_buf, 0);
             }
 
-            // Build per-face Fourier view array
+            // Atlas layer index for this face
+            let layer = face_offset + fi;
             let face_fourier_views: [&wgpu::TextureView; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
-                &entry.fourier_views[m][fi]
+                &atlas.fourier_layer_views[m][layer]
             });
 
             // Primitive pre-pass: clear color+depth, draw opaque primitives
@@ -1012,7 +1109,7 @@ pub fn generate_dsm_for_lights(
                 dsm_prim_pipeline,
                 prim_geometry,
                 &face_fourier_views,
-                &entry.depth_views[fi],
+                &atlas.depth_layer_views[layer],
                 primitives,
                 &face_vp,
                 near,
@@ -1025,7 +1122,7 @@ pub fn generate_dsm_for_lights(
             let render_bg = create_dsm_render_bind_group(
                 device,
                 dsm_pipeline,
-                &maps.scratch_uniforms,
+                &atlas.scratch_uniforms,
                 &buffers.interval_vertex_buf,
                 &buffers.interval_tet_data_buf,
             );
@@ -1036,7 +1133,7 @@ pub fn generate_dsm_for_lights(
                 &buffers.interval_fan_index_buf,
                 &buffers.interval_args_buf,
                 &face_fourier_views,
-                &entry.depth_views[fi],
+                &atlas.depth_layer_views[layer],
                 res,
                 res,
             );

@@ -103,6 +103,9 @@ struct App {
     deferred_debug_mode: u32,
     ambient: f32,
     dsm_query_depth: f32,
+    /// Cached light state for DSM dirty detection.
+    cached_dsm_lights: Vec<rmesh_render::GpuLight>,
+    cached_dsm_num_lights: u32,
     pbr_data: Option<rmesh_data::PbrData>,
     // Ray trace CPU-side state
     rt_neighbors_cpu: Vec<i32>,
@@ -149,6 +152,8 @@ impl App {
             deferred_debug_mode: 0,
             ambient: 0.05,
             dsm_query_depth: 1.0,
+            cached_dsm_lights: Vec::new(),
+            cached_dsm_num_lights: 0,
             pbr_data: pbr,
             rt_neighbors_cpu: Vec::new(),
             rt_start_tet_hint: -1,
@@ -491,15 +496,15 @@ impl App {
 
         // Deferred PBR shading pipeline (only when PBR data is loaded)
         let has_pbr = self.pbr_data.is_some();
-        let (deferred_pipeline, deferred_bg, deferred_output, deferred_output_view, deferred_blit_bg) = if has_pbr {
+        let (deferred_pipeline, deferred_bg, deferred_output, deferred_output_view, deferred_blit_bg, deferred_dsm_dummy_bg) = if has_pbr {
             log::info!("Creating deferred PBR shading pipeline...");
-            let mut dp = rmesh_render::DeferredShadePipeline::new(&device, color_format);
-            if let Some(ref pbr) = self.pbr_data {
-                if !pbr.tone_curve.is_empty() {
-                    dp.update_tone_curve(&device, &queue, &pbr.tone_curve);
-                }
-            }
+            let dp = rmesh_render::DeferredShadePipeline::new(&device, color_format);
             let bg = rmesh_render::create_deferred_bind_group(&device, &dp, &targets, &primitive_targets.depth_view);
+            // Dummy DSM bind group (1x1 atlas, no lights)
+            let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&device);
+            let dummy_dsm_bg = rmesh_render::create_deferred_dsm_bind_group(
+                &device, &dp, &dummy_atlas.fourier_array_views, &dummy_atlas.meta_buf,
+            );
             // Separate output texture (can't read+write color_view in same pass)
             let out_tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("deferred_output"),
@@ -513,9 +518,9 @@ impl App {
             });
             let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
             let d_blit_bg = create_blit_bind_group(&device, &blit_pipeline, &out_view);
-            (Some(dp), Some(bg), Some(out_tex), Some(out_view), Some(d_blit_bg))
+            (Some(dp), Some(bg), Some(out_tex), Some(out_view), Some(d_blit_bg), Some(dummy_dsm_bg))
         } else {
-            (None, None, None, None, None)
+            (None, None, None, None, None, None)
         };
 
         // Ray trace pipeline
@@ -696,6 +701,9 @@ impl App {
             dsm_render_bg,
             dsm_resolve_bg,
             dsm_blit_bg,
+            dsm_atlas: None,
+            deferred_dsm_bg: None,
+            deferred_dsm_dummy_bg: deferred_dsm_dummy_bg,
             rt_pipeline,
             rt_buffers,
             rt_bg,
@@ -913,11 +921,17 @@ impl App {
 
                 // Recreate deferred pipeline
                 let color_format = wgpu::TextureFormat::Rgba16Float;
-                let mut dp = rmesh_render::DeferredShadePipeline::new(&gpu.device, color_format);
-                if !pbr.tone_curve.is_empty() {
-                    dp.update_tone_curve(&gpu.device, &gpu.queue, &pbr.tone_curve);
-                }
+                let dp = rmesh_render::DeferredShadePipeline::new(&gpu.device, color_format);
                 gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(&gpu.device, &dp, &gpu.targets, &gpu.primitive_targets.depth_view));
+                // Reset DSM state (will be regenerated on next frame with lights)
+                let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&gpu.device);
+                gpu.deferred_dsm_dummy_bg = Some(rmesh_render::create_deferred_dsm_bind_group(
+                    &gpu.device, &dp, &dummy_atlas.fourier_array_views, &dummy_atlas.meta_buf,
+                ));
+                gpu.deferred_dsm_bg = None;
+                gpu.dsm_atlas = None;
+                self.cached_dsm_lights.clear();
+                self.cached_dsm_num_lights = 0;
                 let w = gpu.surface_config.width;
                 let h = gpu.surface_config.height;
                 let out_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {

@@ -58,7 +58,7 @@ const DEFERRED_SHADE_FRAG_WGSL: &str = include_str!("wgsl/deferred_shade_frag.wg
 
 /// Per-light data for deferred shading (matches WGSL `Light` struct).
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuLight {
     pub position: [f32; 3],
     pub light_type: u32, // 0=point, 1=spot, 2=directional
@@ -83,7 +83,8 @@ pub struct DeferredUniforms {
     pub debug_mode: u32,
     pub near_plane: f32,
     pub far_plane: f32,
-    pub _pad: [f32; 2],
+    pub dsm_enabled: u32,
+    pub _pad: f32,
 }
 
 /// Maximum number of lights supported.
@@ -1599,7 +1600,6 @@ impl RenderTargets {
         let aux0_view = aux0_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let normals_view = normals_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
         Self {
             color_texture,
             aux0_texture,
@@ -4439,9 +4439,9 @@ pub fn record_blit_nf(
 pub struct DeferredShadePipeline {
     pub pipeline: wgpu::RenderPipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
+    pub dsm_bind_group_layout: wgpu::BindGroupLayout,
     pub uniforms_buf: wgpu::Buffer,
     pub light_buf: wgpu::Buffer,
-    pub tone_curve_buf: wgpu::Buffer,
 }
 
 impl DeferredShadePipeline {
@@ -4528,9 +4528,47 @@ impl DeferredShadePipeline {
                     },
                     count: None,
                 },
-                // 7: tone curve spline parameters
+            ],
+        });
+
+        // Group 1: DSM shadow atlas (3 Fourier texture arrays + metadata buffer)
+        let dsm_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deferred_dsm_bgl"),
+            entries: &[
+                // 0-2: Fourier MRT texture arrays
                 wgpu::BindGroupLayoutEntry {
-                    binding: 7,
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 3: per-light shadow metadata
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -4544,7 +4582,7 @@ impl DeferredShadePipeline {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("deferred_shade_pl"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&bind_group_layout, &dsm_bind_group_layout],
             immediate_size: 0,
         });
 
@@ -4591,29 +4629,7 @@ impl DeferredShadePipeline {
             mapped_at_creation: false,
         });
 
-        // Default identity tone curve: 2 y-knots [0, 1], slope=0, intercept=0, intercept_bias=0
-        let default_tone: [f32; 5] = [0.0, 1.0, 0.0, 0.0, 0.0];
-        let tone_curve_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("deferred_tone_curve"),
-            contents: bytemuck::cast_slice(&default_tone),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
-        Self { pipeline, bind_group_layout, uniforms_buf, light_buf, tone_curve_buf }
-    }
-
-    /// Upload tone curve spline data. Recreates the buffer if the size changed.
-    pub fn update_tone_curve(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[f32]) {
-        let byte_len = (data.len() * std::mem::size_of::<f32>()) as u64;
-        if self.tone_curve_buf.size() != byte_len {
-            self.tone_curve_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("deferred_tone_curve"),
-                contents: bytemuck::cast_slice(data),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            });
-        } else {
-            queue.write_buffer(&self.tone_curve_buf, 0, bytemuck::cast_slice(data));
-        }
+        Self { pipeline, bind_group_layout, dsm_bind_group_layout, uniforms_buf, light_buf }
     }
 }
 
@@ -4656,9 +4672,36 @@ pub fn create_deferred_bind_group(
                 binding: 6,
                 resource: wgpu::BindingResource::TextureView(hw_depth_view),
             },
+        ],
+    })
+}
+
+/// Create the DSM shadow bind group (group 1) for deferred shading.
+pub fn create_deferred_dsm_bind_group(
+    device: &wgpu::Device,
+    deferred: &DeferredShadePipeline,
+    fourier_array_views: &[wgpu::TextureView; 3],
+    meta_buf: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("deferred_dsm_bg"),
+        layout: &deferred.dsm_bind_group_layout,
+        entries: &[
             wgpu::BindGroupEntry {
-                binding: 7,
-                resource: deferred.tone_curve_buf.as_entire_binding(),
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&fourier_array_views[0]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&fourier_array_views[1]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&fourier_array_views[2]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: meta_buf.as_entire_binding(),
             },
         ],
     })
@@ -4669,6 +4712,7 @@ pub fn record_deferred_shade(
     encoder: &mut wgpu::CommandEncoder,
     deferred: &DeferredShadePipeline,
     bind_group: &wgpu::BindGroup,
+    dsm_bind_group: &wgpu::BindGroup,
     target_view: &wgpu::TextureView,
 ) {
     let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -4687,6 +4731,7 @@ pub fn record_deferred_shade(
     });
     rpass.set_pipeline(&deferred.pipeline);
     rpass.set_bind_group(0, bind_group, &[]);
+    rpass.set_bind_group(1, dsm_bind_group, &[]);
     rpass.draw(0..3, 0..1); // fullscreen triangle
 }
 

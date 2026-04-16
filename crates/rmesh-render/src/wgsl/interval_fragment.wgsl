@@ -52,7 +52,7 @@ struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) aux0: vec4<f32>,
     @location(2) normals: vec4<f32>,
-    @location(3) albedo: vec4<f32>,
+    @location(3) expected_depth: vec4<f32>,
 };
 
 // phi(x) = (1 - exp(-x)) / x
@@ -107,11 +107,8 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
 
     // Volume rendering integral
     let od = clamp(in.density * dist, 0.0, 88.0);
-    out.color = compute_integral(c_back, c_front, od);
-
-    let alpha = out.color.a;
-
-    // --- MRT: G-buffer outputs ---
+    let alpha_t = exp(-od);
+    let alpha = 1.0 - alpha_t;
 
     // Per-tet aux channels lookup
     let aux_base = in.tet_id * AUX_DIM;
@@ -124,12 +121,22 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     let alb_g = aux_data[aux_base + 6u];
     let alb_b = aux_data[aux_base + 7u];
 
-    // Premultiply by alpha — .a = alpha for correct hardware OneMinusSrcAlpha blend.
-    // Field gradient stored raw (unnormalized) — normalization happens in deferred shader
-    // after alpha compositing across all tets.
+    // Slot 0: albedo (flat per tet, premultiplied alpha)
+    let albedo = vec3f(alb_r, alb_g, alb_b);
+    out.color = vec4f(albedo * alpha, alpha);
+
+    // Slot 1: aux (roughness, env features)
     out.aux0 = vec4f(roughness * alpha, env_f0 * alpha, env_f1 * alpha, alpha);
+
+    // Slot 2: normals (raw gradient, normalized in deferred)
     out.normals = vec4f(in.field_gradient * alpha, alpha);
-    out.albedo = vec4f(alb_r * alpha, alb_g * alpha, alb_b * alpha, alpha);
+
+    // Slot 3: expected termination depth + env_f2/f3
+    let phi_val = phi(od);
+    let w0 = phi_val - alpha_t;   // weight for back (z_b)
+    let w1 = 1.0 - phi_val;       // weight for front (z_f)
+    let depth_premul = w0 * z_b + w1 * z_f;
+    out.expected_depth = vec4f(depth_premul, env_f2 * alpha, env_f3 * alpha, alpha);
 
     return out;
 }
