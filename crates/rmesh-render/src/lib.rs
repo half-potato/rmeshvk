@@ -187,7 +187,7 @@ impl SceneBuffers {
         let sort_values = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sort_values"),
             size: n_pow2 * 4,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 

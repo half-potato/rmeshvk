@@ -188,6 +188,7 @@ impl App {
         let mesh_shader_supported = self.mesh_shader_supported;
         let mut fluid_enabled = self.fluid_enabled;
         let mut show_primitives = self.show_primitives;
+        let mut show_scene = self.show_scene;
         let mut sort_16bit = self.sort_16bit;
         let mut fluid_reset = false;
         let fluid_params = &mut self.fluid_params;
@@ -196,6 +197,7 @@ impl App {
         let mut new_selected = interact_selected;
         let mut add_primitive: Option<PrimitiveKind> = None;
         let mut delete_selected = false;
+        let mut add_shadow_test_scene = false;
         let primitives_ref = &self.primitives;
         let has_pbr = gpu.has_pbr_data;
         let rt_locate_ms = self.rt_locate_ms;
@@ -238,6 +240,7 @@ impl App {
                         ui.radio_value(&mut render_mode, RenderMode::RayTrace, "Ray Trace");
                         ui.checkbox(&mut fluid_enabled, "Fluid Sim");
                         ui.checkbox(&mut show_primitives, "Show Primitives");
+                        ui.checkbox(&mut show_scene, "Show Scene");
                         if render_mode == RenderMode::IntervalShader {
                             ui.checkbox(&mut sort_16bit, "16-bit Sort");
                         }
@@ -319,6 +322,9 @@ impl App {
                         add_primitive = Some(PrimitiveKind::SpotLight);
                     }
                 });
+                if ui.button("Add Shadow Test Scene").clicked() {
+                    add_shadow_test_scene = true;
+                }
                 ui.separator();
                 for (i, prim) in primitives_ref.iter().enumerate() {
                     let selected = new_selected == Some(i);
@@ -386,6 +392,7 @@ impl App {
                     ui.add(egui::Slider::new(&mut fluid_params.pressure_iterations, 1..=200).text("Pressure Iters"));
                 });
             }
+
         });
         if open_file {
             if let Some(path) = rfd::FileDialog::new()
@@ -402,11 +409,54 @@ impl App {
         self.render_mode = render_mode;
         self.fluid_enabled = fluid_enabled;
         self.show_primitives = show_primitives;
+        if show_scene != self.show_scene {
+            // Invalidate DSM cache when scene visibility changes
+            self.cached_dsm_lights.clear();
+            self.cached_dsm_num_lights = 0;
+        }
+        self.show_scene = show_scene;
         self.sort_16bit = sort_16bit;
         self.deferred_enabled = deferred_enabled;
         self.ambient = ambient;
         self.deferred_debug_mode = deferred_debug_mode;
         self.dsm_query_depth = dsm_query_depth;
+
+        // Handle shadow test scene
+        if add_shadow_test_scene {
+            use rmesh_interact::{Transform, PrimitiveKind};
+            self.primitives.clear();
+            self.interaction.set_selected(None);
+
+            // Point light at origin
+            let mut light = Primitive::new(PrimitiveKind::PointLight, "TestLight");
+            light.transform.position = glam::Vec3::new(0.0, 0.0, 0.0);
+            self.primitives.push(light);
+
+            // Small occluder cube in +X direction
+            let mut occluder = Primitive::new(PrimitiveKind::Cube, "Occluder_+X");
+            occluder.transform.position = glam::Vec3::new(2.0, 0.0, 0.0);
+            occluder.transform.scale = glam::Vec3::splat(0.5);
+            self.primitives.push(occluder);
+
+            // 6 large surface cubes in each axis direction
+            let dirs: [(glam::Vec3, &str); 6] = [
+                (glam::Vec3::X, "+X"),
+                (glam::Vec3::NEG_X, "-X"),
+                (glam::Vec3::Y, "+Y"),
+                (glam::Vec3::NEG_Y, "-Y"),
+                (glam::Vec3::Z, "+Z"),
+                (glam::Vec3::NEG_Z, "-Z"),
+            ];
+            for (dir, label) in dirs {
+                let mut wall = Primitive::new(PrimitiveKind::Cube, format!("Wall_{label}"));
+                wall.transform.position = dir * 5.0;
+                wall.transform.scale = glam::Vec3::splat(2.0);
+                self.primitives.push(wall);
+            }
+
+            self.show_primitives = true;
+            self.next_primitive_id = 10;
+        }
 
         // Handle primitive add/delete/selection
         if let Some(kind) = add_primitive {
@@ -604,7 +654,25 @@ impl App {
         // 2. Sorted forward pass: compute → radix sort → render
         //    Color uses LoadOp::Load (preserves primitive colors), depth test culls behind primitives
         let mrt_enabled = self.deferred_enabled && gpu.has_pbr_data;
-        let skip_volume = self.deferred_enabled && self.deferred_debug_mode == 14;
+        let skip_volume = !self.show_scene || (self.deferred_enabled && self.deferred_debug_mode == 14);
+        if skip_volume && mrt_enabled {
+            // Clear MRT targets when volume is skipped to avoid ghosting
+            let clear_ops = wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            };
+            let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("mrt_clear"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment { view: &gpu.targets.color_view, resolve_target: None, ops: clear_ops, depth_slice: None }),
+                    Some(wgpu::RenderPassColorAttachment { view: &gpu.targets.aux0_view, resolve_target: None, ops: clear_ops, depth_slice: None }),
+                    Some(wgpu::RenderPassColorAttachment { view: &gpu.targets.normals_view, resolve_target: None, ops: clear_ops, depth_slice: None }),
+                    Some(wgpu::RenderPassColorAttachment { view: &gpu.targets.depth_view, resolve_target: None, ops: clear_ops, depth_slice: None }),
+                ],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+        }
         if !skip_volume { match self.render_mode {
             RenderMode::IntervalShader => {
                 let (sort_st, gen_a, gen_b) = if self.sort_16bit {
@@ -833,6 +901,16 @@ impl App {
                         gpu.dsm_atlas = None;
                         gpu.deferred_dsm_bg = None;
                     } else {
+                        // Filter out light primitives from DSM occluders
+                        let dsm_primitives: Vec<_> = if self.show_primitives {
+                            self.primitives.iter().filter(|p| {
+                                !matches!(p.kind, PrimitiveKind::PointLight | PrimitiveKind::SpotLight)
+                            }).cloned().collect()
+                        } else {
+                            Vec::new()
+                        };
+
+                        log::debug!("DSM: {} primitives for shadow generation", dsm_primitives.len());
                         // Reallocate DsmAtlas if light count or types changed
                         let need_realloc = gpu.dsm_atlas.as_ref().map_or(true, |atlas| {
                             atlas.num_lights != scene_light_count
@@ -854,7 +932,7 @@ impl App {
                                 &gpu.dsm_pipeline,
                                 &gpu.dsm_prim_pipeline,
                                 &gpu.primitive_geometry,
-                                if self.show_primitives { &self.primitives } else { &[] },
+                                &dsm_primitives,
                                 &gpu.pipelines,
                                 &gpu.compute_interval_pipelines,
                                 &gpu.sort_pipelines,
@@ -865,12 +943,13 @@ impl App {
                                 scene_lights,
                                 scene_light_count,
                                 gpu.tet_count,
-                                self.camera.near_z,
-                                self.camera.far_z,
+                                0.1,
+                                20.0,
+                                self.show_scene,
                             );
                             atlas.populate_metadata(
                                 &gpu.queue, scene_lights,
-                                self.camera.near_z, self.camera.far_z,
+                                0.1, 20.0,
                             );
 
                             // Create DSM bind group from atlas
@@ -881,24 +960,13 @@ impl App {
                         }
                     }
 
+                    // Wait for DSM GPU work to complete before continuing
+                    // (prevents shared buffer conflicts with the forward pass)
+                    gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).ok();
+
                     // Update cached state
                     self.cached_dsm_lights = scene_lights.to_vec();
                     self.cached_dsm_num_lights = scene_light_count;
-                }
-
-                // If no scene lights, add default at camera position (for lighting only, no DSM)
-                if num_lights == 0 {
-                    gpu_lights[0] = rmesh_render::GpuLight {
-                        position: pos,
-                        light_type: 0,
-                        color: [1.0, 1.0, 1.0],
-                        intensity: 1.0,
-                        direction: [0.0, 0.0, -1.0],
-                        inner_angle: 0.0,
-                        outer_angle: 0.0,
-                        _pad: [0.0; 3],
-                    };
-                    num_lights = 1;
                 }
 
                 // Upload lights
@@ -937,13 +1005,13 @@ impl App {
             }
         }
 
-        // 3b. DSM debug view (Fourier deep shadow map from camera perspective)
+        // 3b. DSM debug view
         let use_dsm_debug = self.deferred_enabled && self.deferred_debug_mode == 15;
         if use_dsm_debug {
+            // Camera-perspective DSM debug (original mode 15)
             let fourier_views: [&wgpu::TextureView; rmesh_dsm::FOURIER_MRT_COUNT] =
                 std::array::from_fn(|i| &gpu.dsm_fourier_views[i]);
 
-            // Primitive pre-pass into Fourier MRT targets
             rmesh_dsm::record_dsm_primitive_pass(
                 &mut encoder,
                 &gpu.queue,
@@ -959,7 +1027,6 @@ impl App {
                 h,
             );
 
-            // Tet DSM render (Fourier accumulation, reuses interval data from forward pass)
             rmesh_dsm::record_dsm_render(
                 &mut encoder,
                 &gpu.dsm_pipeline,
@@ -972,7 +1039,6 @@ impl App {
                 h,
             );
 
-            // Upload query depth and resolve Fourier → T(z)
             gpu.queue.write_buffer(
                 &gpu.dsm_resolve_pipeline.uniforms_buf,
                 0,

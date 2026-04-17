@@ -626,6 +626,104 @@ pub fn create_dsm_resolve_bind_group(
     })
 }
 
+/// Record resolve passes for all 6 cubemap faces in a cross layout.
+///
+/// Layout (4×3 grid, each cell = face_size × face_size):
+/// ```
+///        [+Y]
+///  [-X]  [+Z]  [+X]  [-Z]
+///        [-Y]
+/// ```
+pub fn record_dsm_resolve_cubemap_cross(
+    encoder: &mut wgpu::CommandEncoder,
+    device: &wgpu::Device,
+    resolve: &DsmResolvePipeline,
+    queue: &wgpu::Queue,
+    atlas: &DsmAtlas,
+    light_index: usize,
+    z_query: f32,
+    near: f32,
+    far: f32,
+    output_view: &wgpu::TextureView,
+    output_width: u32,
+    output_height: u32,
+) {
+    // Simple 3x2 grid: top row = faces 0,1,2; bottom row = faces 3,4,5
+    // Face 0 (+X), Face 1 (-X), Face 2 (+Y), Face 3 (-Y), Face 4 (+Z), Face 5 (-Z)
+    let face_w = output_width / 3;
+    let face_h = output_height / 2;
+    let face_offset = atlas.face_offsets.get(light_index).copied().unwrap_or(0) as usize;
+    let face_count = atlas.face_counts.get(light_index).copied().unwrap_or(0) as usize;
+
+    let positions: [(u32, u32); 6] = [
+        (0, 0), (1, 0), (2, 0),  // +X, -X, +Y
+        (0, 1), (1, 1), (2, 1),  // -Y, +Z, -Z
+    ];
+
+    queue.write_buffer(
+        &resolve.uniforms_buf,
+        0,
+        bytemuck::bytes_of(&DsmResolveUniforms {
+            z_query,
+            near,
+            far,
+            _pad: 0.0,
+        }),
+    );
+
+    // Clear output
+    {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("dsm_cross_clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: output_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.2, g: 0.2, b: 0.2, a: 1.0 }),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+    }
+
+    // Render each face into its cross position
+    for fi in 0..face_count.min(6) {
+        let layer = face_offset + fi;
+        if layer >= atlas.fourier_layer_views[0].len() { break; }
+
+        let layer_views: [&wgpu::TextureView; FOURIER_MRT_COUNT] =
+            std::array::from_fn(|m| &atlas.fourier_layer_views[m][layer]);
+
+        let resolve_bg = create_dsm_resolve_bind_group(device, resolve, &layer_views);
+
+        let (col, row) = positions[fi];
+        let x = col * face_w;
+        let y = row * face_h;
+
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("dsm_cross_face"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: output_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        rpass.set_viewport(x as f32, y as f32, face_w as f32, face_h as f32, 0.0, 1.0);
+        rpass.set_pipeline(&resolve.pipeline);
+        rpass.set_bind_group(0, &resolve_bg, &[]);
+        rpass.draw(0..3, 0..1);
+    }
+}
+
 /// Record the resolve pass: reads Fourier textures, writes T(z_query) to output.
 pub fn record_dsm_resolve(
     encoder: &mut wgpu::CommandEncoder,
@@ -690,12 +788,13 @@ pub struct DsmAtlas {
     pub fourier_arrays: [wgpu::Texture; FOURIER_MRT_COUNT],
     /// D2Array views for shader binding.
     pub fourier_array_views: [wgpu::TextureView; FOURIER_MRT_COUNT],
-    /// Per-layer D2 views for render attachment during DSM generation.
+    /// Per-layer D2 views for reading individual faces (resolve inspector).
     pub fourier_layer_views: [Vec<wgpu::TextureView>; FOURIER_MRT_COUNT],
-    /// Depth array texture for DSM render pass.
-    pub depth_array: wgpu::Texture,
-    /// Per-layer depth views for render attachment.
-    pub depth_layer_views: Vec<wgpu::TextureView>,
+    /// Staging textures for rendering one face at a time (then copied into array layers).
+    pub staging_fourier: [wgpu::Texture; FOURIER_MRT_COUNT],
+    pub staging_fourier_views: [wgpu::TextureView; FOURIER_MRT_COUNT],
+    pub staging_depth: wgpu::Texture,
+    pub staging_depth_view: wgpu::TextureView,
     /// Per-light shadow metadata storage buffer.
     pub meta_buf: wgpu::Buffer,
     /// Per-light face offsets (cumulative).
@@ -738,8 +837,8 @@ impl DsmAtlas {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: DSM_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             })
         });
@@ -762,12 +861,34 @@ impl DsmAtlas {
             }).collect()
         });
 
-        let depth_array = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("dsm_atlas_depth"),
+        // Staging textures: single 2D textures for rendering one face at a time
+        let staging_fourier: [wgpu::Texture; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&format!("dsm_staging_mrt{m}")),
+                size: wgpu::Extent3d {
+                    width: resolution,
+                    height: resolution,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DSM_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        });
+        let staging_fourier_views: [wgpu::TextureView; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
+            staging_fourier[m].create_view(&wgpu::TextureViewDescriptor::default())
+        });
+        let staging_depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dsm_staging_depth"),
             size: wgpu::Extent3d {
                 width: resolution,
                 height: resolution,
-                depth_or_array_layers: array_layers,
+                depth_or_array_layers: 1,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -776,15 +897,7 @@ impl DsmAtlas {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
-
-        let depth_layer_views: Vec<wgpu::TextureView> = (0..total_layers).map(|layer| {
-            depth_array.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                base_array_layer: layer,
-                array_layer_count: Some(1),
-                ..Default::default()
-            })
-        }).collect();
+        let staging_depth_view = staging_depth.create_view(&wgpu::TextureViewDescriptor::default());
 
         let meta_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dsm_shadow_meta"),
@@ -804,8 +917,10 @@ impl DsmAtlas {
             fourier_arrays,
             fourier_array_views,
             fourier_layer_views,
-            depth_array,
-            depth_layer_views,
+            staging_fourier,
+            staging_fourier_views,
+            staging_depth,
+            staging_depth_view,
             meta_buf,
             face_offsets,
             face_counts,
@@ -941,6 +1056,7 @@ pub fn generate_dsm_for_lights(
     tet_count: u32,
     near: f32,
     far: f32,
+    render_tets: bool,
 ) {
     let res = atlas.resolution;
     let n_pow2 = tet_count.next_power_of_two();
@@ -957,9 +1073,7 @@ pub fn generate_dsm_for_lights(
         // --- Sort pass (once per light position) ---
         let (first_vp, first_c2w) = build_light_vp(light, 0, near, far);
 
-        let fx = first_vp.col(0).x * half;
-        let fy = first_vp.col(1).y * half;
-        let intrinsics = [fx.abs(), fy.abs(), half, half];
+        let intrinsics = [half, half, half, half];
 
         let uniforms = rmesh_render::make_uniforms(
             first_vp,
@@ -982,74 +1096,42 @@ pub fn generate_dsm_for_lights(
             bytemuck::bytes_of(&uniforms),
         );
 
-        // Reset indirect args + interval_args_buf
-        let reset_cmd = DrawIndirectCommand {
-            vertex_count: 12,
-            instance_count: 0,
-            first_vertex: 0,
-            first_instance: 0,
-        };
-        queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
-        queue.write_buffer(&buffers.interval_args_buf, 0, bytemuck::cast_slice(&[0u32; 8]));
-        queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
+        // For DSM (OIT additive blending), no sort needed — just identity mapping.
+        if render_tets {
+            // sort_values = [0, 1, 2, ..., tet_count-1]
+            let identity: Vec<u32> = (0..tet_count).collect();
+            queue.write_buffer(&buffers.sort_values, 0, bytemuck::cast_slice(&identity));
 
-        // Create compute bind group with scratch uniforms
-        let compute_bg = create_dsm_hw_compute_bg(
-            device,
-            fwd_pipelines,
-            buffers,
-            material,
-            sh_coeffs_buf,
-            &atlas.scratch_uniforms,
-        );
+            // Set up indirect_args (for forward compute compatibility)
+            let args = DrawIndirectCommand {
+                vertex_count: 12,
+                instance_count: tet_count,
+                first_vertex: 0,
+                first_instance: 0,
+            };
+            queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&args));
 
-        // Forward compute (projection + sort keys)
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("dsm_project_compute"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
-            cpass.set_bind_group(0, &compute_bg, &[]);
-            let workgroup_size = 64u32;
-            let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
-            let (dx, dy) = dispatch_2d(total_workgroups);
-            cpass.dispatch_workgroups(dx, dy, 1);
+            // Set up interval_args_buf with 2D dispatch for large tet counts
+            let wg_size = 64u32;
+            let total_wg = (tet_count + wg_size - 1) / wg_size;
+            let dispatch_x = total_wg.min(65535);
+            let dispatch_y = (total_wg + 65534) / 65535;
+            let interval_args: [u32; 8] = [
+                dispatch_x, dispatch_y, 1,         // compute dispatch args (2D)
+                tet_count * 12, 1, 0, 0, 0,        // draw-indexed-indirect args
+            ];
+            queue.write_buffer(&buffers.interval_args_buf, 0, bytemuck::cast_slice(&interval_args));
         }
 
-        // Radix sort
-        let result_in_b = rmesh_sort::record_radix_sort(
-            encoder,
-            device,
-            sort_pipelines,
-            sort_state,
-            &buffers.sort_keys,
-            &buffers.sort_values,
-        );
-
-        // Indirect convert
-        let convert_bg = create_dsm_indirect_convert_bg(
-            device,
-            ci_pipelines,
-            buffers,
-        );
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("dsm_indirect_convert"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&ci_pipelines.indirect_convert_pipeline);
-            cpass.set_bind_group(0, &convert_bg, &[]);
-            cpass.dispatch_workgroups(1, 1, 1);
-        }
-
-        // --- Per-face: interval gen + DSM render ---
+        // --- Per-face: primitive pre-pass + optional tet DSM render ---
+        // Submit + recreate encoder between faces because queue.write_buffer
+        // for scratch_uniforms must take effect before the next face's GPU work.
         for fi in 0..face_count {
             let (face_vp, face_c2w) = build_light_vp(light, fi, near, far);
 
-            let fx = face_vp.col(0).x * half;
-            let fy = face_vp.col(1).y * half;
-            let face_intrinsics = [fx.abs(), fy.abs(), half, half];
+            // For 90° FOV cubemap faces, fx = fy = half (tan(45°) = 1).
+            // Don't extract from VP matrix — it's only correct for Z-forward cameras.
+            let face_intrinsics = [half, half, half, half];
 
             let face_uniforms = rmesh_render::make_uniforms(
                 face_vp,
@@ -1066,40 +1148,47 @@ pub fn generate_dsm_for_lights(
                 near,
                 far,
             );
+            // Submit previous work so the new write_buffer takes effect
+            let old_encoder = std::mem::replace(encoder, device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: Some("dsm_face") },
+            ));
+            queue.submit(std::iter::once(old_encoder.finish()));
             queue.write_buffer(
                 &atlas.scratch_uniforms,
                 0,
                 bytemuck::bytes_of(&face_uniforms),
             );
 
-            // Interval gen compute
-            let sort_values = if result_in_b {
-                sort_state.values_b()
-            } else {
-                &buffers.sort_values
-            };
-            let gen_bg = create_dsm_interval_gen_bg(
-                device,
-                ci_pipelines,
-                buffers,
-                material,
-                sort_values,
-                &atlas.scratch_uniforms,
-            );
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("dsm_interval_gen"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&ci_pipelines.gen_pipeline);
-                cpass.set_bind_group(0, &gen_bg, &[]);
-                cpass.dispatch_workgroups_indirect(&buffers.interval_args_buf, 0);
+            // Re-initialize buffers for this face (interval gen modifies them)
+            if render_tets {
+                // Reset indirect_args (instance_count = all tets)
+                let args = DrawIndirectCommand {
+                    vertex_count: 12,
+                    instance_count: tet_count,
+                    first_vertex: 0,
+                    first_instance: 0,
+                };
+                queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&args));
+
+                // Reset interval_args_buf with 2D dispatch for large tet counts
+                let wg_size = 64u32;
+                let total_wg = (tet_count + wg_size - 1) / wg_size;
+                let dispatch_x = total_wg.min(65535);
+                let dispatch_y = (total_wg + 65534) / 65535;
+                let interval_args: [u32; 8] = [
+                    dispatch_x, dispatch_y, 1,
+                    tet_count * 12, 1, 0, 0, 0,
+                ];
+                queue.write_buffer(&buffers.interval_args_buf, 0, bytemuck::cast_slice(&interval_args));
+
+                // Reset sort_values to identity
+                let identity: Vec<u32> = (0..tet_count).collect();
+                queue.write_buffer(&buffers.sort_values, 0, bytemuck::cast_slice(&identity));
             }
 
-            // Atlas layer index for this face
-            let layer = face_offset + fi;
-            let face_fourier_views: [&wgpu::TextureView; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
-                &atlas.fourier_layer_views[m][layer]
+            // Render to staging textures
+            let staging_views: [&wgpu::TextureView; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
+                &atlas.staging_fourier_views[m]
             });
 
             // Primitive pre-pass: clear color+depth, draw opaque primitives
@@ -1108,8 +1197,8 @@ pub fn generate_dsm_for_lights(
                 queue,
                 dsm_prim_pipeline,
                 prim_geometry,
-                &face_fourier_views,
-                &atlas.depth_layer_views[layer],
+                &staging_views,
+                &atlas.staging_depth_view,
                 primitives,
                 &face_vp,
                 near,
@@ -1119,24 +1208,65 @@ pub fn generate_dsm_for_lights(
             );
 
             // DSM tet render pass (loads color+depth from primitive pass)
-            let render_bg = create_dsm_render_bind_group(
-                device,
-                dsm_pipeline,
-                &atlas.scratch_uniforms,
-                &buffers.interval_vertex_buf,
-                &buffers.interval_tet_data_buf,
-            );
-            record_dsm_render(
-                encoder,
-                dsm_pipeline,
-                &render_bg,
-                &buffers.interval_fan_index_buf,
-                &buffers.interval_args_buf,
-                &face_fourier_views,
-                &atlas.depth_layer_views[layer],
-                res,
-                res,
-            );
+            if render_tets {
+                let gen_bg = create_dsm_interval_gen_bg(
+                    device,
+                    ci_pipelines,
+                    buffers,
+                    material,
+                    &buffers.sort_values,
+                    &atlas.scratch_uniforms,
+                );
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("dsm_interval_gen"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&ci_pipelines.gen_pipeline);
+                    cpass.set_bind_group(0, &gen_bg, &[]);
+                    cpass.dispatch_workgroups_indirect(&buffers.interval_args_buf, 0);
+                }
+
+                let render_bg = create_dsm_render_bind_group(
+                    device,
+                    dsm_pipeline,
+                    &atlas.scratch_uniforms,
+                    &buffers.interval_vertex_buf,
+                    &buffers.interval_tet_data_buf,
+                );
+                record_dsm_render(
+                    encoder,
+                    dsm_pipeline,
+                    &render_bg,
+                    &buffers.interval_fan_index_buf,
+                    &buffers.interval_args_buf,
+                    &staging_views,
+                    &atlas.staging_depth_view,
+                    res,
+                    res,
+                );
+            }
+
+            // Copy staging textures into atlas array layers
+            let layer = face_offset + fi;
+            let copy_size = wgpu::Extent3d { width: res, height: res, depth_or_array_layers: 1 };
+            for m in 0..FOURIER_MRT_COUNT {
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &atlas.staging_fourier[m],
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &atlas.fourier_arrays[m],
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    copy_size,
+                );
+            }
         }
     }
 }

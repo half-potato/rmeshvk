@@ -115,7 +115,7 @@ fn select_cubemap_face(dir: vec3f) -> u32 {
 }
 
 /// Evaluate Fourier transmittance T(world_pos) for a given light.
-fn evaluate_transmittance(world_pos: vec3f, li: u32) -> f32 {
+fn evaluate_transmittance(world_pos: vec3f, li: u32, NdotL: f32) -> f32 {
     let sm = shadow_meta[li];
 
     // Select cubemap face for point lights, face 0 for spot/directional
@@ -139,7 +139,7 @@ fn evaluate_transmittance(world_pos: vec3f, li: u32) -> f32 {
 
     // Outside frustum → no shadow
     if ndc_xy.x < -1.0 || ndc_xy.x > 1.0 || ndc_xy.y < -1.0 || ndc_xy.y > 1.0 {
-        return 1.0;
+        return 0.0;
     }
 
     // NDC xy to texel coordinates (wgpu: Y points down in texture space)
@@ -162,7 +162,12 @@ fn evaluate_transmittance(world_pos: vec3f, li: u32) -> f32 {
     let b4 = c2.x;
 
     // clip.w is linear view-space depth; normalize to [0,1] matching DSM generation
-    let z = clamp((clip.w - sm.near) / (sm.far - sm.near), 0.0, 1.0);
+    let z_raw = (clip.w - sm.near) / (sm.far - sm.near);
+
+    // Slope-scale bias to avoid self-shadowing (applied in normalized linear depth space)
+    let slope = sqrt(1.0 - NdotL * NdotL) / max(NdotL, 0.001);
+    let bias = 10*(0.002 + 0.005 * min(slope, 10.0));
+    let z = clamp(z_raw - bias, 0.0, 1.0);
 
     // Reconstruct absorbance A(z) from Fourier series
     var A = (a0 / 2.0) * z;
@@ -221,8 +226,9 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let env_f1 = aux0_raw.b * inv_alpha;
 
     // Un-premultiply and normalize raw field gradient to get surface normal.
+    // Transform from colmap (Y-down, Z-forward) to wgpu (Y-up, Z-backward) coordinate system.
     let raw_gradient = normals_raw.rgb * inv_alpha;
-    let normal = normalize(raw_gradient);
+    let normal = -normalize(vec3f(raw_gradient.x, raw_gradient.y, raw_gradient.z));
 
     // Expected termination depth + env_f2/f3 from slot 3
     let z_expected = depth_raw.r * inv_alpha;
@@ -282,8 +288,8 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
 
         // Shadow transmittance from cached DSM
         var T = 1.0;
-        if uniforms.dsm_enabled != 0u && NdotL > 0.0 {
-            T = evaluate_transmittance(world_pos, li);
+        if uniforms.dsm_enabled != 0u {// && NdotL > 0.0 {
+            T = evaluate_transmittance(world_pos, li, NdotL);
         }
 
         // total_contribution += albedo * NdotL * T * atten * l_color;
@@ -308,7 +314,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
         var T_total = 0.0;
         if uniforms.dsm_enabled != 0u {
             for (var li = 0u; li < uniforms.num_lights; li++) {
-                T_total += evaluate_transmittance(world_pos, li);
+                T_total += evaluate_transmittance(world_pos, li, 1.0);
             }
             final_color = vec3f(T_total / f32(uniforms.num_lights));
         } else {
@@ -316,12 +322,40 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
         }
     }
     else if (dm == DBG_RETRO) {
-        // Debug: cubemap face selection for first light
+        // Debug: R=a0 (raw opacity), G=normalized depth z, B=transmittance T
         if uniforms.dsm_enabled != 0u && uniforms.num_lights > 0u {
             let sm = shadow_meta[0u];
             let to_surface = world_pos - lights[0u].position;
+            var face = 0u;
+            if sm.light_type == 0u { face = select_cubemap_face(to_surface); }
+            let vp = get_shadow_vp(sm, face);
+            let clip = vp * vec4f(world_pos, 1.0);
+            if clip.w > 0.0 {
+                let ndc_xy = clip.xy / clip.w;
+                let uv = vec2f(ndc_xy.x * 0.5 + 0.5, 0.5 - ndc_xy.y * 0.5);
+                let tex_size = vec2f(f32(textureDimensions(dsm_rt0).x), f32(textureDimensions(dsm_rt0).y));
+                let texel = vec2u(
+                    clamp(u32(uv.x * tex_size.x), 0u, u32(tex_size.x) - 1u),
+                    clamp(u32(uv.y * tex_size.y), 0u, u32(tex_size.y) - 1u),
+                );
+                let layer = i32(sm.face_offset + face);
+                let c0 = textureLoad(dsm_rt0, texel, layer, 0);
+                let a0 = c0.x;
+                let z = clamp((clip.w - sm.near) / (sm.far - sm.near), 0.0, 1.0);
+                let T = evaluate_transmittance(world_pos, 0u, 1.0);
+                final_color = vec3f(clamp(a0 * 0.2, 0.0, 1.0), z, T);
+            } else {
+                final_color = vec3f(1.0, 0.0, 1.0);
+            }
+        } else {
+            final_color = vec3f(0.5);
+        }
+    }
+    else if (dm == 16u) {
+        // Debug: cubemap face selection for first light
+        if uniforms.dsm_enabled != 0u && uniforms.num_lights > 0u {
+            let to_surface = world_pos - lights[0u].position;
             let face = select_cubemap_face(to_surface);
-            // Color per face: +X=red, -X=cyan, +Y=green, -Y=magenta, +Z=blue, -Z=yellow
             switch face {
                 case 0u: { final_color = vec3f(1.0, 0.0, 0.0); }
                 case 1u: { final_color = vec3f(0.0, 1.0, 1.0); }

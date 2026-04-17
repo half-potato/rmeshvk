@@ -37,7 +37,7 @@ impl Camera {
             orbit_yaw: yaw,
             orbit_pitch: pitch,
             fov_y: 50.0_f32.to_radians(),
-            near_z: 0.01,
+            near_z: 0.1,
             far_z: 1000.0,
         }
     }

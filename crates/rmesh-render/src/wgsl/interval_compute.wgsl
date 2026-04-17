@@ -188,7 +188,8 @@ fn write_degenerate_vertex(slot: u32) {
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let tid = global_id.x;
+    // Support 2D dispatch for large tet counts (>65535 workgroups)
+    let tid = global_id.y * 65535u * 64u + global_id.x;
     let visible_count = indirect_args.instance_count;
 
     // Base offset for this tet's fixed slots
