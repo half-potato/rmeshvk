@@ -505,7 +505,7 @@ impl App {
             // Dummy DSM bind group (1x1 atlas, no lights)
             let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&device);
             let dummy_dsm_bg = rmesh_render::create_deferred_dsm_bind_group(
-                &device, &dp, &dummy_atlas.fourier_array_views, &dummy_atlas.meta_buf,
+                &device, &dp, &dummy_atlas.cubemap_views[0], &dummy_atlas.meta_buf,
             );
             // Separate output texture (can't read+write color_view in same pass)
             let out_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -928,7 +928,7 @@ impl App {
                 // Reset DSM state (will be regenerated on next frame with lights)
                 let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&gpu.device);
                 gpu.deferred_dsm_dummy_bg = Some(rmesh_render::create_deferred_dsm_bind_group(
-                    &gpu.device, &dp, &dummy_atlas.fourier_array_views, &dummy_atlas.meta_buf,
+                    &gpu.device, &dp, &dummy_atlas.cubemap_views[0], &dummy_atlas.meta_buf,
                 ));
                 gpu.deferred_dsm_bg = None;
                 gpu.dsm_atlas = None;

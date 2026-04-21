@@ -4540,8 +4540,8 @@ impl DeferredShadePipeline {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::Cube,
                         multisampled: false,
                     },
                     count: None,
@@ -4550,8 +4550,8 @@ impl DeferredShadePipeline {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::Cube,
                         multisampled: false,
                     },
                     count: None,
@@ -4560,8 +4560,8 @@ impl DeferredShadePipeline {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::Cube,
                         multisampled: false,
                     },
                     count: None,
@@ -4575,6 +4575,13 @@ impl DeferredShadePipeline {
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
+                    count: None,
+                },
+                // 4: bilinear sampler for moment textures
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -4680,28 +4687,38 @@ pub fn create_deferred_bind_group(
 pub fn create_deferred_dsm_bind_group(
     device: &wgpu::Device,
     deferred: &DeferredShadePipeline,
-    fourier_array_views: &[wgpu::TextureView; 3],
+    cubemap_views: &[wgpu::TextureView; 3],
     meta_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("dsm_bilinear_sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("deferred_dsm_bg"),
         layout: &deferred.dsm_bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&fourier_array_views[0]),
+                resource: wgpu::BindingResource::TextureView(&cubemap_views[0]),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(&fourier_array_views[1]),
+                resource: wgpu::BindingResource::TextureView(&cubemap_views[1]),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: wgpu::BindingResource::TextureView(&fourier_array_views[2]),
+                resource: wgpu::BindingResource::TextureView(&cubemap_views[2]),
             },
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: meta_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(&sampler),
             },
         ],
     })

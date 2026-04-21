@@ -48,25 +48,13 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> FourierOutput {
     let z_linear = near * far / (far - frag_coord.z * (far - near));
     let z = clamp((z_linear - near) / (far - near), 0.0, 1.0);
 
-    // Fourier coefficients for alpha=1 (fully opaque)
+    // Power moments for alpha=1 (fully opaque): m_k = z^k
+    let z2 = z * z;
+    let z3 = z2 * z;
+    let z4 = z3 * z;
     var out: FourierOutput;
-    out.rt0 = vec4<f32>(
-        2.0,
-        2.0 * cos(TWO_PI * 1.0 * z),
-        2.0 * sin(TWO_PI * 1.0 * z),
-        2.0 * cos(TWO_PI * 2.0 * z),
-    );
-    out.rt1 = vec4<f32>(
-        2.0 * sin(TWO_PI * 2.0 * z),
-        2.0 * cos(TWO_PI * 3.0 * z),
-        2.0 * sin(TWO_PI * 3.0 * z),
-        2.0 * cos(TWO_PI * 4.0 * z),
-    );
-    out.rt2 = vec4<f32>(
-        2.0 * sin(TWO_PI * 4.0 * z),
-        0.0,
-        0.0,
-        0.0,
-    );
+    out.rt0 = vec4<f32>(1.0, z, z2, z3);  // m0, m1, m2, m3
+    out.rt1 = vec4<f32>(z4, 0.0, 0.0, 0.0);  // m4
+    out.rt2 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     return out;
 }

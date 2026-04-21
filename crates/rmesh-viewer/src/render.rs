@@ -918,9 +918,31 @@ impl App {
                         if need_realloc {
                             let light_types: Vec<u32> = scene_lights.iter().map(|l| l.light_type).collect();
                             gpu.dsm_atlas = Some(rmesh_dsm::DsmAtlas::new(
-                                &gpu.device, 512, &light_types,
+                                &gpu.device, 1024, &light_types,
                             ));
                         }
+
+                        // Compute scene-adaptive near/far for DSM
+                        // Use scene AABB to determine max extent from any light
+                        let dsm_near = 0.05f32;
+                        let dsm_far = {
+                            let verts = &self.scene_data.vertices;
+                            if verts.len() >= 3 {
+                                let mut max_dist = 1.0f32;
+                                // Sample vertices to estimate extent (every 300th vertex for speed)
+                                let stride = (verts.len() / 3).max(1).min(1000);
+                                for li in 0..scene_light_count as usize {
+                                    let lp = glam::Vec3::from(scene_lights[li].position);
+                                    for vi in (0..verts.len() / 3).step_by(stride) {
+                                        let v = glam::Vec3::new(verts[vi*3], verts[vi*3+1], verts[vi*3+2]);
+                                        max_dist = max_dist.max((v - lp).length());
+                                    }
+                                }
+                                (max_dist * 1.1).max(1.0) // 10% margin
+                            } else {
+                                20.0
+                            }
+                        };
 
                         // Generate DSMs for scene lights only
                         if let Some(ref atlas) = gpu.dsm_atlas {
@@ -943,19 +965,19 @@ impl App {
                                 scene_lights,
                                 scene_light_count,
                                 gpu.tet_count,
-                                0.1,
-                                20.0,
+                                dsm_near,
+                                dsm_far,
                                 self.show_scene,
                             );
                             atlas.populate_metadata(
                                 &gpu.queue, scene_lights,
-                                0.1, 20.0,
+                                dsm_near, dsm_far,
                             );
 
                             // Create DSM bind group from atlas
                             gpu.deferred_dsm_bg = Some(rmesh_render::create_deferred_dsm_bind_group(
                                 &gpu.device, deferred,
-                                &atlas.fourier_array_views, &atlas.meta_buf,
+                                &atlas.cubemap_views[0], &atlas.meta_buf,
                             ));
                         }
                     }

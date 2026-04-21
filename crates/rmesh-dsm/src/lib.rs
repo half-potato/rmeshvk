@@ -342,7 +342,7 @@ impl DsmPrimitivePipeline {
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None, // Y-flip in VP reverses winding
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -652,8 +652,7 @@ pub fn record_dsm_resolve_cubemap_cross(
     // Face 0 (+X), Face 1 (-X), Face 2 (+Y), Face 3 (-Y), Face 4 (+Z), Face 5 (-Z)
     let face_w = output_width / 3;
     let face_h = output_height / 2;
-    let face_offset = atlas.face_offsets.get(light_index).copied().unwrap_or(0) as usize;
-    let face_count = atlas.face_counts.get(light_index).copied().unwrap_or(0) as usize;
+    let face_count = if light_index < atlas.cubemaps.len() { 6usize } else { 0 };
 
     let positions: [(u32, u32); 6] = [
         (0, 0), (1, 0), (2, 0),  // +X, -X, +Y
@@ -691,11 +690,17 @@ pub fn record_dsm_resolve_cubemap_cross(
 
     // Render each face into its cross position
     for fi in 0..face_count.min(6) {
-        let layer = face_offset + fi;
-        if layer >= atlas.fourier_layer_views[0].len() { break; }
-
+        // Create per-face D2 views from the cubemap texture
+        let face_views: [wgpu::TextureView; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
+            atlas.cubemaps[light_index][m].create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: fi as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        });
         let layer_views: [&wgpu::TextureView; FOURIER_MRT_COUNT] =
-            std::array::from_fn(|m| &atlas.fourier_layer_views[m][layer]);
+            std::array::from_fn(|m| &face_views[m]);
 
         let resolve_bg = create_dsm_resolve_bind_group(device, resolve, &layer_views);
 
@@ -784,25 +789,19 @@ pub struct ShadowLightMeta {
 /// Each layer corresponds to one face of one light (point lights have 6 faces,
 /// spot/directional have 1). DSM generation renders directly into per-layer views.
 pub struct DsmAtlas {
-    /// 3 texture arrays (one per Fourier MRT), with `total_layers` layers each.
-    pub fourier_arrays: [wgpu::Texture; FOURIER_MRT_COUNT],
-    /// D2Array views for shader binding.
-    pub fourier_array_views: [wgpu::TextureView; FOURIER_MRT_COUNT],
-    /// Per-layer D2 views for reading individual faces (resolve inspector).
-    pub fourier_layer_views: [Vec<wgpu::TextureView>; FOURIER_MRT_COUNT],
-    /// Staging textures for rendering one face at a time (then copied into array layers).
+    /// 3 cubemap textures (one per moment MRT), 6 faces each per light.
+    /// For multiple lights, each light gets its own set of cubemaps.
+    pub cubemaps: Vec<[wgpu::Texture; FOURIER_MRT_COUNT]>,
+    /// Cube views for shader binding (one per light per MRT).
+    pub cubemap_views: Vec<[wgpu::TextureView; FOURIER_MRT_COUNT]>,
+    /// Staging textures for rendering one face at a time (then copied into cubemap faces).
     pub staging_fourier: [wgpu::Texture; FOURIER_MRT_COUNT],
     pub staging_fourier_views: [wgpu::TextureView; FOURIER_MRT_COUNT],
     pub staging_depth: wgpu::Texture,
     pub staging_depth_view: wgpu::TextureView,
     /// Per-light shadow metadata storage buffer.
     pub meta_buf: wgpu::Buffer,
-    /// Per-light face offsets (cumulative).
-    pub face_offsets: Vec<u32>,
-    /// Face count per light.
-    pub face_counts: Vec<u32>,
     pub num_lights: u32,
-    pub total_layers: u32,
     pub resolution: u32,
     /// Scratch uniform buffer for light viewpoint.
     pub scratch_uniforms: wgpu::Buffer,
@@ -813,53 +812,38 @@ impl DsmAtlas {
     ///
     /// `light_types[i]`: 0 = point (6 faces), else = 1 face.
     pub fn new(device: &wgpu::Device, resolution: u32, light_types: &[u32]) -> Self {
-        let mut face_offsets = Vec::with_capacity(light_types.len());
-        let mut face_counts = Vec::with_capacity(light_types.len());
-        let mut total_layers = 0u32;
-        for &lt in light_types {
-            face_offsets.push(total_layers);
-            let fc = if lt == 0 { 6u32 } else { 1u32 };
-            face_counts.push(fc);
-            total_layers += fc;
-        }
-        // Ensure at least 1 layer (for dummy atlas when no lights)
-        let array_layers = total_layers.max(1);
+        let num_lights = light_types.len() as u32;
 
-        let fourier_arrays: [wgpu::Texture; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(&format!("dsm_atlas_mrt{m}")),
-                size: wgpu::Extent3d {
-                    width: resolution,
-                    height: resolution,
-                    depth_or_array_layers: array_layers,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: DSM_FORMAT,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            })
-        });
-
-        let fourier_array_views: [wgpu::TextureView; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
-            fourier_arrays[m].create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2Array),
-                ..Default::default()
-            })
-        });
-
-        let fourier_layer_views: [Vec<wgpu::TextureView>; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
-            (0..total_layers).map(|layer| {
-                fourier_arrays[m].create_view(&wgpu::TextureViewDescriptor {
-                    dimension: Some(wgpu::TextureViewDimension::D2),
-                    base_array_layer: layer,
-                    array_layer_count: Some(1),
+        // One cubemap (6 faces) per light per MRT
+        let mut cubemaps = Vec::with_capacity(light_types.len());
+        let mut cubemap_views = Vec::with_capacity(light_types.len());
+        for i in 0..light_types.len() {
+            let textures: [wgpu::Texture; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(&format!("dsm_cube_light{i}_mrt{m}")),
+                    size: wgpu::Extent3d {
+                        width: resolution,
+                        height: resolution,
+                        depth_or_array_layers: 6,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: DSM_FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                })
+            });
+            let views: [wgpu::TextureView; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
+                textures[m].create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::Cube),
                     ..Default::default()
                 })
-            }).collect()
-        });
+            });
+            cubemaps.push(textures);
+            cubemap_views.push(views);
+        }
 
         // Staging textures: single 2D textures for rendering one face at a time
         let staging_fourier: [wgpu::Texture; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
@@ -914,26 +898,22 @@ impl DsmAtlas {
         });
 
         Self {
-            fourier_arrays,
-            fourier_array_views,
-            fourier_layer_views,
+            cubemaps,
+            cubemap_views,
             staging_fourier,
             staging_fourier_views,
             staging_depth,
             staging_depth_view,
             meta_buf,
-            face_offsets,
-            face_counts,
-            num_lights: light_types.len() as u32,
-            total_layers,
+            num_lights,
             resolution,
             scratch_uniforms,
         }
     }
 
-    /// Create a dummy atlas (1x1, 1 layer) for when no DSM is available.
+    /// Create a dummy atlas (1x1 cubemap) for when no DSM is available.
     pub fn new_dummy(device: &wgpu::Device) -> Self {
-        Self::new(device, 1, &[])
+        Self::new(device, 1, &[0]) // one dummy point light
     }
 
     /// Fill metadata buffer with VP matrices and face offsets for all lights.
@@ -947,7 +927,7 @@ impl DsmAtlas {
         let mut metas = vec![ShadowLightMeta::zeroed(); 16]; // MAX_LIGHTS
         for (li, light) in lights.iter().enumerate() {
             if li >= 16 { break; }
-            let fc = self.face_counts[li] as usize;
+            let fc = 6usize; // always 6 faces for cubemap
             let mut vps = [[[0.0f32; 4]; 4]; 6];
             for fi in 0..fc {
                 let (vp, _c2w) = build_light_vp(light, fi, near, far);
@@ -955,7 +935,7 @@ impl DsmAtlas {
             }
             metas[li] = ShadowLightMeta {
                 vp_matrices: vps,
-                face_offset: self.face_offsets[li],
+                face_offset: 0, // not used with cubemaps
                 face_count: fc as u32,
                 near,
                 far,
@@ -1017,6 +997,17 @@ pub fn build_light_vp(
         }
     };
 
+    // Flip Y in the VP to match cubemap convention.
+    // look_to_rh with up=-Y gives correct horizontal (sc=-Z) but inverted vertical.
+    // The cubemap sampler expects Y-up per face, but our rendering is Y-down.
+    // Flipping clip.y fixes this. clip.w (depth) is unaffected.
+    let y_flip = Mat4::from_cols(
+        glam::Vec4::X,
+        -glam::Vec4::Y,
+        glam::Vec4::Z,
+        glam::Vec4::W,
+    );
+
     // Camera-to-world rotation = inverse of the 3×3 part of view
     let view3 = Mat3::from_cols(
         view.col(0).truncate(),
@@ -1025,7 +1016,7 @@ pub fn build_light_vp(
     );
     let c2w = view3.transpose();
 
-    (proj * view, c2w)
+    (y_flip * proj * view, c2w)
 }
 
 /// Generate deep shadow maps for all active lights.
@@ -1066,8 +1057,7 @@ pub fn generate_dsm_for_lights(
 
     for li in 0..num_lights.min(lights.len() as u32) {
         let light = &lights[li as usize];
-        let face_count = atlas.face_counts[li as usize] as usize;
-        let face_offset = atlas.face_offsets[li as usize] as usize;
+        let face_count = 6usize; // always 6 faces for cubemap
         let pos = Vec3::from(light.position);
 
         // --- Sort pass (once per light position) ---
@@ -1247,8 +1237,7 @@ pub fn generate_dsm_for_lights(
                 );
             }
 
-            // Copy staging textures into atlas array layers
-            let layer = face_offset + fi;
+            // Copy staging textures into cubemap face
             let copy_size = wgpu::Extent3d { width: res, height: res, depth_or_array_layers: 1 };
             for m in 0..FOURIER_MRT_COUNT {
                 encoder.copy_texture_to_texture(
@@ -1259,9 +1248,9 @@ pub fn generate_dsm_for_lights(
                         aspect: wgpu::TextureAspect::All,
                     },
                     wgpu::TexelCopyTextureInfo {
-                        texture: &atlas.fourier_arrays[m],
+                        texture: &atlas.cubemaps[li as usize][m],
                         mip_level: 0,
-                        origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 },
+                        origin: wgpu::Origin3d { x: 0, y: 0, z: fi as u32 },
                         aspect: wgpu::TextureAspect::All,
                     },
                     copy_size,

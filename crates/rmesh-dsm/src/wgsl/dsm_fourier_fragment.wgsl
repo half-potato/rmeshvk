@@ -50,6 +50,15 @@ struct FourierOutput {
 const PI: f32 = 3.14159265358979323846;
 const TWO_PI: f32 = 6.28318530717958647692;
 
+// phi(x) = (1 - exp(-x)) / x
+// Taylor with 4 terms for |x| < 0.02 avoids catastrophic cancellation.
+fn phi(x: f32) -> f32 {
+    if (abs(x) < 0.02) {
+        return 1.0 + x * (-0.5 + x * (1.0 / 6.0 + x * (-1.0 / 24.0)));
+    }
+    return (1.0 - exp(-x)) / x;
+}
+
 @fragment
 fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> FourierOutput {
     let near = uniforms.near_plane;
@@ -72,29 +81,36 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> FourierO
     let od = clamp(in.density * dist, 0.0, 88.0);
     let alpha = 1.0 - exp(-od);
 
-    // Linear depth normalized to [0,1] for Fourier basis evaluation
-    let z = clamp((z_f - near) / range, 0.0, 1.0);
-    let two_alpha = 2.0 * alpha;
+    // Normalized depths [0,1]
+    let za = clamp((z_f - near) / range, 0.0, 1.0);
+    let zb = clamp((z_b - near) / range, 0.0, 1.0);
 
-    // Fourier coefficients: a_k = 2*alpha*cos(2*PI*k*z), b_k = 2*alpha*sin(2*PI*k*z)
+    // Volume rendering weights (same as forward_fragment.wgsl / interval_fragment.wgsl):
+    //   w0 = phi(od) - exp(-od)   → weight for back depth (zb)
+    //   w1 = 1 - phi(od)          → weight for front depth (za)
+    // These are the exact Beer-Lambert quadrature weights.
+    // w0 + w1 = alpha = 1 - exp(-od)
+    let alpha_t = exp(-od);
+    let phi_val = phi(od);
+    let w0 = phi_val - alpha_t;  // back weight
+    let w1 = 1.0 - phi_val;     // front weight
+
+    // Power moments using the same quadrature:
+    //   m_k = w0 * zb^k + w1 * za^k
+    // This is already premultiplied by alpha (since w0 + w1 = alpha).
+    let za2 = za * za; let zb2 = zb * zb;
+    let za3 = za2 * za; let zb3 = zb2 * zb;
+    let za4 = za3 * za; let zb4 = zb3 * zb;
+
+    let mk0 = w0 + w1;                    // = alpha
+    let mk1 = w0 * zb + w1 * za;          // = expected depth (premul)
+    let mk2 = w0 * zb2 + w1 * za2;
+    let mk3 = w0 * zb3 + w1 * za3;
+    let mk4 = w0 * zb4 + w1 * za4;
+
     var out: FourierOutput;
-    out.rt0 = vec4<f32>(
-        two_alpha,                          // a0
-        two_alpha * cos(TWO_PI * 1.0 * z),  // a1
-        two_alpha * sin(TWO_PI * 1.0 * z),  // b1
-        two_alpha * cos(TWO_PI * 2.0 * z),  // a2
-    );
-    out.rt1 = vec4<f32>(
-        two_alpha * sin(TWO_PI * 2.0 * z),  // b2
-        two_alpha * cos(TWO_PI * 3.0 * z),  // a3
-        two_alpha * sin(TWO_PI * 3.0 * z),  // b3
-        two_alpha * cos(TWO_PI * 4.0 * z),  // a4
-    );
-    out.rt2 = vec4<f32>(
-        two_alpha * sin(TWO_PI * 4.0 * z),  // b4
-        0.0,
-        0.0,
-        0.0,
-    );
+    out.rt0 = vec4<f32>(mk0, mk1, mk2, mk3);
+    out.rt1 = vec4<f32>(mk4, 0.0, 0.0, 0.0);
+    out.rt2 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     return out;
 }
