@@ -48,10 +48,10 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> FourierOutput {
     let z_linear = near * far / (far - frag_coord.z * (far - near));
     let z = clamp((z_linear - near) / (far - near), 0.0, 1.0);
 
-    // Opaque surface: depth with alpha=1
+    // Opaque surface: depth and depth² with alpha=1
     var out: FourierOutput;
     out.rt0 = vec4<f32>(z, z, z, 1.0);
-    out.rt1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    out.rt1 = vec4<f32>(z * z, z * z, z * z, 1.0);
     out.rt2 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     return out;
 }

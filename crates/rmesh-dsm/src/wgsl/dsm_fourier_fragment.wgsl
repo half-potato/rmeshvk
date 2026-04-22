@@ -92,11 +92,15 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> FourierO
     let w1 = 1.0 - phi_val;     // front weight
     let depth_premul = w0 * zb + w1 * za;
 
+    // Second moment: E[z²] premultiplied by alpha (same weights as first moment)
+    let depth_sq_premul = w0 * zb * zb + w1 * za * za;
+
     // RT0: expected depth (premul-alpha composited via hardware blend)
-    // RT1/RT2: unused
+    // RT1: expected depth² (premul-alpha composited via hardware blend)
+    // RT2: unused
     var out: FourierOutput;
     out.rt0 = vec4<f32>(depth_premul, depth_premul, depth_premul, alpha);
-    out.rt1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    out.rt1 = vec4<f32>(depth_sq_premul, depth_sq_premul, depth_sq_premul, alpha);
     out.rt2 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     return out;
 }

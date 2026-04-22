@@ -116,7 +116,13 @@ fn select_cubemap_face(dir: vec3f) -> u32 {
     }
 }
 
-/// Evaluate transmittance T(world_pos) for a given light using expected-depth shadow map.
+/// Evaluate transmittance T(world_pos) using variance shadow map (Chebyshev bound).
+///
+/// RT0 stores premul E[z], RT1 stores premul E[z²]. From these we recover
+/// variance σ² = E[z²] - E[z]², then apply Chebyshev's inequality to get
+/// an upper bound on P(occluder depth ≥ z). No bias parameter needed —
+/// variance naturally distinguishes thin shells (sharp shadow) from thick
+/// fog (soft shadow), and self-shadowing is handled by z ≈ E[z] → p ≈ 1.
 fn evaluate_transmittance(world_pos: vec3f, li: u32, NdotL: f32) -> f32 {
     let sm = shadow_meta[li];
 
@@ -131,26 +137,36 @@ fn evaluate_transmittance(world_pos: vec3f, li: u32, NdotL: f32) -> f32 {
     let clip = vp * vec4f(world_pos, 1.0);
     if clip.w <= 0.0 { return 1.0; }
 
-    // Sample expected termination depth from cubemap
+    // Sample first and second depth moments from cubemap
     let c0 = textureSample(dsm_rt0, dsm_sampler, dir);
+    let c1 = textureSample(dsm_rt1, dsm_sampler, dir);
     let shadow_alpha = c0.a;
 
     // No shadow data at this direction
     if shadow_alpha < 0.01 { return 1.0; }
 
-    // Un-premultiply to get expected termination depth in [0,1] (view-space Z)
-    let shadow_depth = c0.r / shadow_alpha;
+    // Un-premultiply to get E[z] and E[z²]
+    let inv_alpha = 1.0 / shadow_alpha;
+    let mean = c0.r * inv_alpha;        // E[z]
+    let mean_sq = c1.r * inv_alpha;     // E[z²]
 
     // Query depth: view-space Z normalized to [0,1] (matches DSM storage)
     let z = (clip.w - sm.near) / (sm.far - sm.near);
 
-    // Slope-scale bias
-    let slope_val = sqrt(1.0 - NdotL * NdotL) / max(NdotL, 0.001);
-    let bias = 0.002 + 0.005 * min(slope_val, 10.0);
+    // Surface is in front of the shadow — fully lit
+    if z <= mean { return 1.0; }
 
-    // Binary shadow
-    if z > shadow_depth + bias { return 0.0; }
-    return 1.0;
+    // Variance with a small minimum to avoid division by zero and reduce
+    // light bleeding from overlapping occluders at similar depths.
+    let variance = max(mean_sq - mean * mean, 3e-5);
+
+    // Chebyshev upper bound: P(occluder ≥ z) ≤ σ²/(σ² + (z - μ)²)
+    let d = z - mean;
+    let p_max = variance / (variance + d * d);
+
+    // Floor at total transmittance — shadow can't exceed the volume's total opacity
+    let T_total = 1.0 - shadow_alpha;
+    return max(p_max, T_total);
 }
 
 // ---------------------------------------------------------------------------
@@ -259,12 +275,12 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
         // Shadow transmittance from cached DSM
         var T = 1.0;
         if uniforms.dsm_enabled != 0u {// && NdotL > 0.0 {
-            T = evaluate_transmittance(world_pos, li, NdotL);
+            T = evaluate_transmittance(world_pos, li, 1.0);
         }
 
         // total_contribution += albedo * NdotL * T * atten * l_color;
-        // total_contribution += albedo * T * atten * l_color;
-        total_contribution += albedo * T * l_color;
+        total_contribution += albedo * T * atten * l_color;
+        // total_contribution += albedo * T * l_color;
     }
 
     var final_color = uniforms.ambient * albedo + total_contribution;

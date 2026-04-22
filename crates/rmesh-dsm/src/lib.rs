@@ -135,6 +135,12 @@ impl DsmPipeline {
             },
         };
 
+        let premul_target_1 = Some(wgpu::ColorTargetState {
+            format: color_format,
+            blend: Some(premul_blend),
+            write_mask: wgpu::ColorWrites::ALL,
+        });
+
         let additive_target = Some(wgpu::ColorTargetState {
             format: color_format,
             blend: Some(additive_blend),
@@ -171,9 +177,9 @@ impl DsmPipeline {
                 module: &fragment_shader,
                 entry_point: Some("main"),
                 targets: &[
-                    premul_target,           // RT0: expected depth (premul-alpha)
-                    additive_target.clone(), // RT1: unused
-                    additive_target,         // RT2: unused
+                    premul_target,   // RT0: expected depth (premul-alpha)
+                    premul_target_1, // RT1: expected depth² (premul-alpha)
+                    additive_target, // RT2: unused
                 ],
                 compilation_options: Default::default(),
             }),
