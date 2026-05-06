@@ -87,7 +87,13 @@ impl App {
                     (ts[4].wrapping_sub(ts[1])) as f64 * p
                 };
                 let render = (ts[5].wrapping_sub(ts[4])) as f64 * p;
-                let sh = (ts[7].wrapping_sub(ts[6])) as f64 * p;
+                // SH eval queries (slots 6..8) are only written when sh_degree > 0;
+                // see comment near resolve_query_set.
+                let sh = if gpu.sh_degree > 0 && ts.len() >= 8 {
+                    (ts[7].wrapping_sub(ts[6])) as f64 * p
+                } else {
+                    0.0
+                };
                 let total = sh + project + sort + prepass + render;
 
                 gpu.gpu_times_ms = GpuTimings {
@@ -140,7 +146,7 @@ impl App {
                 return;
             }
             Err(e) => {
-                log::error!("Surface error: {:?}", e);
+                log::error!("Surface error: {:?} (waited {:.1}ms)", e, t_before_acquire.elapsed().as_secs_f64() * 1000.0);
                 return;
             }
         };
@@ -1118,16 +1124,21 @@ impl App {
         let cur_rb = gpu.ts_frame % 2;
         let ts_buf_free = !gpu.ts_readback_mapped[cur_rb].load(std::sync::atomic::Ordering::Acquire);
         if ts_buf_free {
+            // Only resolve slots that are actually written this frame. Slots 6..8 are
+            // SH-eval timestamps and are NOT written when sh_degree == 0 (no SH compute
+            // pass runs). Resolving never-written queries is undefined behavior on Vulkan
+            // and wedges the NVIDIA Linux driver.
+            let written_count: u32 = if gpu.sh_degree > 0 { TS_QUERY_COUNT } else { 6 };
             encoder.resolve_query_set(
                 &gpu.ts_query_set,
-                0..TS_QUERY_COUNT,
+                0..written_count,
                 &gpu.ts_resolve_buf,
                 0,
             );
             encoder.copy_buffer_to_buffer(
                 &gpu.ts_resolve_buf, 0,
                 &gpu.ts_readback[cur_rb], 0,
-                (TS_QUERY_COUNT as u64) * 8,
+                (written_count as u64) * 8,
             );
         }
 

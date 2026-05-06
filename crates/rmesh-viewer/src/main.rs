@@ -185,14 +185,16 @@ impl App {
                 .await
                 .expect("No suitable GPU adapter found");
 
-            log::info!("GPU: {:?}", adapter.get_info().name);
+            let info = adapter.get_info();
+            log::info!("GPU: {:?} (backend: {:?}, driver: {:?})", info.name, info.backend, info.driver_info);
 
             let adapter_features = adapter.features();
-            let backend = adapter.get_info().backend;
+            let backend = info.backend;
             let subgroup_supported = adapter_features.contains(wgpu::Features::SUBGROUP);
-            let mesh_shader_supported = subgroup_supported
-                && adapter_features.contains(wgpu::Features::EXPERIMENTAL_MESH_SHADER)
-                && backend != wgpu::Backend::Metal; // naga MSL backend doesn't implement mesh shaders
+            let mesh_shader_supported = false;
+            //subgroup_supported
+                // && adapter_features.contains(wgpu::Features::EXPERIMENTAL_MESH_SHADER)
+                // && backend != wgpu::Backend::Metal; // naga MSL backend doesn't implement mesh shaders
             log::info!("Subgroup support: {}", subgroup_supported);
             log::info!("Mesh shader support: {}", mesh_shader_supported);
 
@@ -264,7 +266,7 @@ impl App {
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: wgpu::PresentMode::AutoNoVsync,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 3,
@@ -525,19 +527,11 @@ impl App {
             (None, None, None, None, None, None)
         };
 
-        // Ray trace pipeline
-        log::info!("Building ray trace data...");
+        // Ray trace pipeline — DIAGNOSTIC: stubbed to keep init fast; real path is RenderMode::RayTrace only
+        log::info!("Building ray trace data... (STUBBED FOR DIAGNOSTIC)");
         let t0 = std::time::Instant::now();
-        let rt_neighbors = rmesh_render::compute_tet_neighbors(
-            &self.scene_data.indices,
-            self.scene_data.tet_count as usize,
-        );
-        let rt_bvh = rmesh_render::build_boundary_bvh(
-            &self.scene_data.vertices,
-            &self.scene_data.indices,
-            &rt_neighbors,
-            self.scene_data.tet_count as usize,
-        );
+        let rt_neighbors: Vec<i32> = vec![-1];
+        let rt_bvh = rmesh_render::BVHData { nodes: Vec::new(), boundary_faces: Vec::new() };
         let rt_pipeline = rmesh_render::RayTracePipeline::new(
             &device,
             size.width.max(1),
@@ -545,12 +539,7 @@ impl App {
             0,
         );
         let rt_buffers = rmesh_render::RayTraceBuffers::new(&device, &rt_neighbors, &rt_bvh);
-        let start_tet = rmesh_render::find_containing_tet(
-            &self.scene_data.vertices,
-            &self.scene_data.indices,
-            self.scene_data.tet_count as usize,
-            self.camera.position,
-        ).map(|t| t as i32).unwrap_or(-1);
+        let start_tet: i32 = -1; // DIAGNOSTIC: skip find_containing_tet
         queue.write_buffer(&rt_buffers.start_tet, 0, bytemuck::cast_slice(&[start_tet]));
         self.rt_neighbors_cpu = rt_neighbors;
         self.rt_start_tet_hint = start_tet;

@@ -17,14 +17,10 @@ pub use rmesh_util::shared::{BVHNode, DrawIndirectCommand, Uniforms};
 
 // Re-export tile types (moved to rmesh-tile crate).
 pub use rmesh_tile::{
-    TileBuffers, TilePipelines,
-    ScanPipelines, ScanBuffers,
-    create_tile_fill_bind_group,
-    create_tile_ranges_bind_group, create_tile_ranges_bind_group_with_keys,
-    create_prepare_dispatch_bind_group, create_rts_bind_group,
-    create_tile_gen_scan_bind_group,
-    record_scan_tile_pipeline,
-    dispatch_2d,
+    create_prepare_dispatch_bind_group, create_rts_bind_group, create_tile_fill_bind_group,
+    create_tile_gen_scan_bind_group, create_tile_ranges_bind_group,
+    create_tile_ranges_bind_group_with_keys, dispatch_2d, record_scan_tile_pipeline, ScanBuffers,
+    ScanPipelines, TileBuffers, TilePipelines,
 };
 
 // WGSL shader sources, embedded from crate-local files.
@@ -84,6 +80,10 @@ pub struct DeferredUniforms {
     pub near_plane: f32,
     pub far_plane: f32,
     pub dsm_enabled: u32,
+    pub exposure: f32,
+    pub sky_color: [f32; 3],
+    pub ao_strength: f32,
+    pub ground_color: [f32; 3],
     pub _pad: f32,
 }
 
@@ -211,7 +211,9 @@ impl SceneBuffers {
         let tiles_touched = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tiles_touched"),
             size: ((m + 3) / 4) * 16,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -262,10 +264,18 @@ impl SceneBuffers {
             .flat_map(|i| {
                 let b = i * 5;
                 [
-                    b, b + 1, b + 4,
-                    b + 1, b + 2, b + 4,
-                    b + 2, b + 3, b + 4,
-                    b + 3, b, b + 4,
+                    b,
+                    b + 1,
+                    b + 4,
+                    b + 1,
+                    b + 2,
+                    b + 4,
+                    b + 2,
+                    b + 3,
+                    b + 4,
+                    b + 3,
+                    b,
+                    b + 4,
                 ]
             })
             .collect();
@@ -388,7 +398,11 @@ pub struct ForwardPipelines {
 }
 
 /// Helper: create N storage buffer layout entries for the given visibility.
-fn storage_entries(count: u32, visibility: wgpu::ShaderStages, read_only: &[bool]) -> Vec<wgpu::BindGroupLayoutEntry> {
+fn storage_entries(
+    count: u32,
+    visibility: wgpu::ShaderStages,
+    read_only: &[bool],
+) -> Vec<wgpu::BindGroupLayoutEntry> {
     (0..count)
         .map(|i| wgpu::BindGroupLayoutEntry {
             binding: i,
@@ -410,10 +424,7 @@ impl ForwardPipelines {
     ///
     /// `color_format`: texture format for all color attachments (Rgba16Float).
     /// Total bytes per sample must not exceed 32 bytes (4 * 8 = 32 for Rgba16Float).
-    pub fn new(
-        device: &wgpu::Device,
-        color_format: wgpu::TextureFormat,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
         // ----- Compute pipeline (14 bindings) -----
         // Bindings 0-5: read-only storage (uniforms, vertices, indices, densities, color_grads, circumdata)
         // Bindings 6-11: read-write storage (colors, sort_keys, sort_values, indirect_args, tiles_touched, compact_tet_ids)
@@ -421,16 +432,12 @@ impl ForwardPipelines {
         // Binding 13: read-only storage (sh_coeffs, f16-packed)
         let compute_read_only = [
             true, true, true, true, true, true, // 0-5 read-only
-            false, false, false, false,          // 6-9 read-write
-            false, false,                        // 10-11 read-write (tiles_touched, compact_tet_ids)
-            true,                                // 12 read-only (base_colors)
-            true,                                // 13 read-only (sh_coeffs)
+            false, false, false, false, // 6-9 read-write
+            false, false, // 10-11 read-write (tiles_touched, compact_tet_ids)
+            true,  // 12 read-only (base_colors)
+            true,  // 13 read-only (sh_coeffs)
         ];
-        let compute_entries = storage_entries(
-            14,
-            wgpu::ShaderStages::COMPUTE,
-            &compute_read_only,
-        );
+        let compute_entries = storage_entries(14, wgpu::ShaderStages::COMPUTE, &compute_read_only);
         let compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("compute_bind_group_layout"),
@@ -446,15 +453,14 @@ impl ForwardPipelines {
             label: Some("project_compute.wgsl"),
             source: wgpu::ShaderSource::Wgsl(PROJECT_COMPUTE_WGSL.into()),
         });
-        let compute_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("project_compute_pipeline"),
-                layout: Some(&compute_pipeline_layout),
-                module: &compute_shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("project_compute_pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &compute_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         // ----- 16-bit linear sort key variant (same layout, different shader) -----
         let compute_shader_16bit = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -477,16 +483,13 @@ impl ForwardPipelines {
         //           colors(rw), base_colors(r), color_grads(r), sh_coeffs(r)
         let hw_compute_read_only = [
             true, true, true, true, // 0-3 read-only
-            false, false, false,    // 4-6 read-write
-            false, true,            // 7-8: colors(rw), base_colors(r)
-            true,                   // 9: color_grads(r)
-            true,                   // 10: sh_coeffs(r)
+            false, false, false, // 4-6 read-write
+            false, true, // 7-8: colors(rw), base_colors(r)
+            true, // 9: color_grads(r)
+            true, // 10: sh_coeffs(r)
         ];
-        let hw_compute_entries = storage_entries(
-            11,
-            wgpu::ShaderStages::COMPUTE,
-            &hw_compute_read_only,
-        );
+        let hw_compute_entries =
+            storage_entries(11, wgpu::ShaderStages::COMPUTE, &hw_compute_read_only);
         let hw_compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("hw_compute_bind_group_layout"),
@@ -555,87 +558,81 @@ impl ForwardPipelines {
             },
         };
 
-        let render_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("forward_render_pipeline"),
-                layout: Some(&render_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &vertex_shader,
-                    entry_point: Some("main"),
-                    buffers: &[], // No vertex buffers -- all data from storage
-                    compilation_options: Default::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back), // Only front-facing → 1 fragment per pixel
-                    unclipped_depth: false,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    conservative: false,
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::LessEqual,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &fragment_shader,
-                    entry_point: Some("main"),
-                    targets: &[
-                        // Color attachment 0: premultiplied alpha blend
-                        Some(wgpu::ColorTargetState {
-                            format: color_format,
-                            blend: Some(premul_blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                        // Color attachment 1 (aux): premultiplied alpha blend
-                        Some(wgpu::ColorTargetState {
-                            format: color_format,
-                            blend: Some(premul_blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                        // Color attachment 2 (normals): premultiplied alpha blend
-                        // Uses color_format (Rgba16Float) because Rgba32Float is not blendable
-                        Some(wgpu::ColorTargetState {
-                            format: color_format,
-                            blend: Some(premul_blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                        // Color attachment 3 (depth): premultiplied alpha blend
-                        Some(wgpu::ColorTargetState {
-                            format: color_format,
-                            blend: Some(premul_blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                    ],
-                    compilation_options: Default::default(),
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("forward_render_pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vertex_shader,
+                entry_point: Some("main"),
+                buffers: &[], // No vertex buffers -- all data from storage
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back), // Only front-facing → 1 fragment per pixel
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &fragment_shader,
+                entry_point: Some("main"),
+                targets: &[
+                    // Color attachment 0: premultiplied alpha blend
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // Color attachment 1 (aux): premultiplied alpha blend
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // Color attachment 2 (normals): premultiplied alpha blend
+                    // Uses color_format (Rgba16Float) because Rgba32Float is not blendable
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // Color attachment 3 (depth): premultiplied alpha blend
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
 
         // ----- Prepass compute pipeline (9 bindings) -----
         // Bindings: uniforms(r), vertices(r), indices(r), sorted_indices(r),
         //           indirect_args(r), precomputed(rw), colors(r), densities(r), color_grads(r)
         let prepass_read_only = [
-            true, true, true, true, true, // 0-4 read-only
-            false,                         // 5 read-write (precomputed)
-            true, true, true,              // 6-8 read-only (colors, densities, color_grads)
+            true, true, true, true, true,  // 0-4 read-only
+            false, // 5 read-write (precomputed)
+            true, true, true, // 6-8 read-only (colors, densities, color_grads)
         ];
-        let prepass_entries = storage_entries(
-            9,
-            wgpu::ShaderStages::COMPUTE,
-            &prepass_read_only,
-        );
-        let prepass_bg_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("prepass_bg_layout"),
-                entries: &prepass_entries,
-            });
+        let prepass_entries = storage_entries(9, wgpu::ShaderStages::COMPUTE, &prepass_read_only);
+        let prepass_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("prepass_bg_layout"),
+            entries: &prepass_entries,
+        });
         let prepass_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("prepass_pipeline_layout"),
@@ -683,63 +680,62 @@ impl ForwardPipelines {
             label: Some("forward_vertex_quad.wgsl"),
             source: wgpu::ShaderSource::Wgsl(FORWARD_VERTEX_QUAD_WGSL.into()),
         });
-        let quad_render_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("forward_quad_render_pipeline"),
-                layout: Some(&quad_render_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &quad_vertex_shader,
-                    entry_point: Some("main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleStrip,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None, // No face culling — quad is screen-aligned
-                    unclipped_depth: false,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    conservative: false,
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::LessEqual,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &fragment_shader,
-                    entry_point: Some("main"),
-                    targets: &[
-                        Some(wgpu::ColorTargetState {
-                            format: color_format,
-                            blend: Some(premul_blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                        Some(wgpu::ColorTargetState {
-                            format: color_format,
-                            blend: Some(premul_blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                        Some(wgpu::ColorTargetState {
-                            format: color_format,
-                            blend: Some(premul_blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                        Some(wgpu::ColorTargetState {
-                            format: color_format,
-                            blend: Some(premul_blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                    ],
-                    compilation_options: Default::default(),
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
+        let quad_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("forward_quad_render_pipeline"),
+            layout: Some(&quad_render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &quad_vertex_shader,
+                entry_point: Some("main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None, // No face culling — quad is screen-aligned
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &fragment_shader,
+                entry_point: Some("main"),
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
 
         // ----- Color-only pipeline variants (no MRT — single color target) -----
         let color_only_targets: &[Option<wgpu::ColorTargetState>] = &[
@@ -866,22 +862,17 @@ impl MeshForwardPipelines {
         // Bindings 0-6: same as vertex shader render bind group
         // Binding 7: indirect_args (read visible_count)
         let mesh_read_only = [true; 8];
-        let mesh_entries = storage_entries(
-            8,
-            wgpu::ShaderStages::MESH,
-            &mesh_read_only,
-        );
+        let mesh_entries = storage_entries(8, wgpu::ShaderStages::MESH, &mesh_read_only);
         let mesh_render_bg_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("mesh_render_bg_layout"),
                 entries: &mesh_entries,
             });
-        let mesh_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("mesh_pipeline_layout"),
-                bind_group_layouts: &[&mesh_render_bg_layout],
-                immediate_size: 0,
-            });
+        let mesh_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mesh_pipeline_layout"),
+            bind_group_layouts: &[&mesh_render_bg_layout],
+            immediate_size: 0,
+        });
         let mesh_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("forward_mesh.wgsl"),
             source: wgpu::ShaderSource::Wgsl(FORWARD_MESH_WGSL.into()),
@@ -905,63 +896,62 @@ impl MeshForwardPipelines {
             },
         };
 
-        let mesh_render_pipeline =
-            device.create_mesh_pipeline(&wgpu::MeshPipelineDescriptor {
-                label: Some("mesh_forward_render_pipeline"),
-                layout: Some(&mesh_pipeline_layout),
-                task: None,
-                mesh: wgpu::MeshState {
-                    module: &mesh_shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
-                    unclipped_depth: false,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    conservative: false,
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::LessEqual,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &fragment_shader,
-                    entry_point: Some("main"),
-                    targets: &[
-                        Some(wgpu::ColorTargetState {
-                            format: color_format,
-                            blend: Some(premul_blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                        Some(wgpu::ColorTargetState {
-                            format: color_format,
-                            blend: Some(premul_blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                        Some(wgpu::ColorTargetState {
-                            format: color_format,
-                            blend: Some(premul_blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                        Some(wgpu::ColorTargetState {
-                            format: color_format,
-                            blend: Some(premul_blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                    ],
-                    compilation_options: Default::default(),
-                }),
-                multiview: None,
-                cache: None,
-            });
+        let mesh_render_pipeline = device.create_mesh_pipeline(&wgpu::MeshPipelineDescriptor {
+            label: Some("mesh_forward_render_pipeline"),
+            layout: Some(&mesh_pipeline_layout),
+            task: None,
+            mesh: wgpu::MeshState {
+                module: &mesh_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &fragment_shader,
+                entry_point: Some("main"),
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+            cache: None,
+        });
 
         // ----- Indirect convert compute pipeline (2 bindings) -----
         let indirect_convert_bg_layout =
@@ -996,11 +986,10 @@ impl MeshForwardPipelines {
                 bind_group_layouts: &[&indirect_convert_bg_layout],
                 immediate_size: 0,
             });
-        let indirect_convert_shader =
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("indirect_convert.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(INDIRECT_CONVERT_WGSL.into()),
-            });
+        let indirect_convert_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("indirect_convert.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(INDIRECT_CONVERT_WGSL.into()),
+        });
         let indirect_convert_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("indirect_convert_pipeline"),
@@ -1101,12 +1090,11 @@ impl IntervalPipelines {
                 label: Some("interval_mesh_render_bg_layout"),
                 entries: &mesh_entries,
             });
-        let mesh_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("interval_mesh_pipeline_layout"),
-                bind_group_layouts: &[&mesh_render_bg_layout],
-                immediate_size: 0,
-            });
+        let mesh_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("interval_mesh_pipeline_layout"),
+            bind_group_layouts: &[&mesh_render_bg_layout],
+            immediate_size: 0,
+        });
         let mesh_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("interval_mesh.wgsl"),
             source: wgpu::ShaderSource::Wgsl(INTERVAL_MESH_WGSL.into()),
@@ -1130,49 +1118,48 @@ impl IntervalPipelines {
             },
         };
 
-        let mesh_render_pipeline =
-            device.create_mesh_pipeline(&wgpu::MeshPipelineDescriptor {
-                label: Some("interval_mesh_render_pipeline"),
-                layout: Some(&mesh_pipeline_layout),
-                task: None,
-                mesh: wgpu::MeshState {
-                    module: &mesh_shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None, // No face culling — interval triangles are screen-aligned
-                    unclipped_depth: false,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    conservative: false,
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::LessEqual,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &fragment_shader,
-                    entry_point: Some("main"),
-                    targets: &[
-                        // Single color attachment: premultiplied alpha blend
-                        Some(wgpu::ColorTargetState {
-                            format: color_format,
-                            blend: Some(premul_blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                    ],
-                    compilation_options: Default::default(),
-                }),
-                multiview: None,
-                cache: None,
-            });
+        let mesh_render_pipeline = device.create_mesh_pipeline(&wgpu::MeshPipelineDescriptor {
+            label: Some("interval_mesh_render_pipeline"),
+            layout: Some(&mesh_pipeline_layout),
+            task: None,
+            mesh: wgpu::MeshState {
+                module: &mesh_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None, // No face culling — interval triangles are screen-aligned
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &fragment_shader,
+                entry_point: Some("main"),
+                targets: &[
+                    // Single color attachment: premultiplied alpha blend
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+            cache: None,
+        });
 
         // ----- Indirect convert compute pipeline (2 bindings) -----
         // Reuses indirect_convert.wgsl with TETS_PER_GROUP overridden to 16
@@ -1208,11 +1195,10 @@ impl IntervalPipelines {
                 bind_group_layouts: &[&indirect_convert_bg_layout],
                 immediate_size: 0,
             });
-        let indirect_convert_shader =
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("interval_indirect_convert.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(INDIRECT_CONVERT_WGSL.into()),
-            });
+        let indirect_convert_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("interval_indirect_convert.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(INDIRECT_CONVERT_WGSL.into()),
+        });
         // Override TETS_PER_GROUP to 16 for interval path
         let indirect_convert_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1262,7 +1248,7 @@ impl ComputeIntervalPipelines {
         let gen_read_only = [
             true, true, true, true, true, true, true, true, // 0-7 read-only
             false, false, // 8-9 read-write (out_vertices, out_tet_data)
-            true,         // 10 read-only (vertex_normals)
+            true,  // 10 read-only (vertex_normals)
         ];
         let gen_entries = storage_entries(11, wgpu::ShaderStages::COMPUTE, &gen_read_only);
         let gen_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1300,11 +1286,12 @@ impl ComputeIntervalPipelines {
             label: Some("compute_interval_render_bg_layout"),
             entries: &render_entries,
         });
-        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("compute_interval_render_pipeline_layout"),
-            bind_group_layouts: &[&render_bg_layout],
-            immediate_size: 0,
-        });
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("compute_interval_render_pipeline_layout"),
+                bind_group_layouts: &[&render_bg_layout],
+                immediate_size: 0,
+            });
 
         let vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("interval_vertex.wgsl"),
@@ -1422,11 +1409,10 @@ impl ComputeIntervalPipelines {
                 bind_group_layouts: &[&indirect_convert_bg_layout],
                 immediate_size: 0,
             });
-        let indirect_convert_shader =
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("interval_indirect_convert.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(INTERVAL_INDIRECT_CONVERT_WGSL.into()),
-            });
+        let indirect_convert_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("interval_indirect_convert.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_INDIRECT_CONVERT_WGSL.into()),
+        });
         let indirect_convert_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("compute_interval_indirect_convert_pipeline"),
@@ -1448,41 +1434,42 @@ impl ComputeIntervalPipelines {
             None,
         ];
 
-        let render_pipeline_color_only = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("compute_interval_render_pipeline_color_only"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &vertex_shader,
-                entry_point: Some("main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &fragment_shader,
-                entry_point: Some("main"),
-                targets: color_only_targets,
-                compilation_options: Default::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let render_pipeline_color_only =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("compute_interval_render_pipeline_color_only"),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &vertex_shader,
+                    entry_point: Some("main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &fragment_shader,
+                    entry_point: Some("main"),
+                    targets: color_only_targets,
+                    compilation_options: Default::default(),
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
 
         Self {
             gen_pipeline,
@@ -1648,45 +1635,44 @@ impl TexToBufferPipeline {
             source: wgpu::ShaderSource::Wgsl(TEX_TO_BUFFER_WGSL.into()),
         });
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("tex_to_buffer_bind_group_layout"),
-                entries: &[
-                    // @binding(0) texture
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tex_to_buffer_bind_group_layout"),
+            entries: &[
+                // @binding(0) texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    // @binding(1) output buffer (read_write)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                // @binding(1) output buffer (read_write)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    // @binding(2) params (read)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                // @binding(2) params (read)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tex_to_buffer_pipeline_layout"),
@@ -1753,21 +1739,14 @@ impl TexToBufferPipeline {
 /// Record the tex-to-buffer conversion dispatch.
 ///
 /// Should be called after the render pass finishes, within the same command encoder.
-pub fn record_tex_to_buffer(
-    encoder: &mut wgpu::CommandEncoder,
-    ttb: &TexToBufferPipeline,
-) {
+pub fn record_tex_to_buffer(encoder: &mut wgpu::CommandEncoder, ttb: &TexToBufferPipeline) {
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: Some("tex_to_buffer"),
         timestamp_writes: None,
     });
     pass.set_pipeline(&ttb.pipeline);
     pass.set_bind_group(0, &ttb.bind_group, &[]);
-    pass.dispatch_workgroups(
-        (ttb.width + 15) / 16,
-        (ttb.height + 15) / 16,
-        1,
-    );
+    pass.dispatch_workgroups((ttb.width + 15) / 16, (ttb.height + 15) / 16, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1965,7 +1944,7 @@ pub fn create_mesh_render_bind_group(
             buf_entry(3, &material.colors),
             buf_entry(4, &buffers.densities),
             buf_entry(5, &material.color_grads),
-            buf_entry(6, &buffers.sort_values),  // sorted indices
+            buf_entry(6, &buffers.sort_values), // sorted indices
             buf_entry(7, &buffers.indirect_args),
         ],
     })
@@ -2035,7 +2014,7 @@ pub fn create_interval_render_bind_group(
             buf_entry(3, &material.colors),
             buf_entry(4, &buffers.densities),
             buf_entry(5, &material.color_grads),
-            buf_entry(6, &buffers.sort_values),  // sorted indices
+            buf_entry(6, &buffers.sort_values), // sorted indices
             buf_entry(7, &buffers.indirect_args),
         ],
     })
@@ -2162,9 +2141,9 @@ pub fn create_compute_interval_render_bind_group(
             buf_entry(0, &buffers.uniforms),
             buf_entry(1, &buffers.interval_vertex_buf),
             buf_entry(2, &buffers.interval_tet_data_buf),
-            buf_entry(3, &dummy),               // aux_data
+            buf_entry(3, &dummy),                  // aux_data
             buf_entry(4, &buffers.vertex_normals), // vertex_normals
-            buf_entry(5, &dummy),               // tet_indices (use dummy, tet_id will be 0)
+            buf_entry(5, &dummy),                  // tet_indices (use dummy, tet_id will be 0)
         ],
     })
 }
@@ -2526,8 +2505,12 @@ pub fn record_sorted_forward_pass(
 
     // ----- 3. Radix sort (back-to-front via ascending ~depth_bits) -----
     let result_in_b = rmesh_sort::record_radix_sort(
-        encoder, device, sort_pipelines, sort_state,
-        &buffers.sort_keys, &buffers.sort_values,
+        encoder,
+        device,
+        sort_pipelines,
+        sort_state,
+        &buffers.sort_keys,
+        &buffers.sort_values,
     );
 
     // ----- 3.5. Compute prepass (quad path only) -----
@@ -2732,8 +2715,12 @@ pub fn record_sorted_mesh_forward_pass(
 
     // ----- 3. Radix sort -----
     let result_in_b = rmesh_sort::record_radix_sort(
-        encoder, device, sort_pipelines, sort_state,
-        &buffers.sort_keys, &buffers.sort_values,
+        encoder,
+        device,
+        sort_pipelines,
+        sort_state,
+        &buffers.sort_keys,
+        &buffers.sort_values,
     );
 
     // ----- 3.5. Indirect convert: instance_count → mesh dispatch args -----
@@ -2752,7 +2739,11 @@ pub fn record_sorted_mesh_forward_pass(
     }
 
     // ----- 4. Mesh shader render pass -----
-    let mesh_bg = if result_in_b { mesh_render_bg_b } else { mesh_render_bg_a };
+    let mesh_bg = if result_in_b {
+        mesh_render_bg_b
+    } else {
+        mesh_render_bg_a
+    };
 
     let color_attachment = Some(wgpu::RenderPassColorAttachment {
         view: &targets.color_view,
@@ -2913,8 +2904,12 @@ pub fn record_sorted_interval_forward_pass(
 
     // ----- 3. Radix sort -----
     let result_in_b = rmesh_sort::record_radix_sort(
-        encoder, device, sort_pipelines, sort_state,
-        &buffers.sort_keys, &buffers.sort_values,
+        encoder,
+        device,
+        sort_pipelines,
+        sort_state,
+        &buffers.sort_keys,
+        &buffers.sort_values,
     );
 
     // ----- 3.5. Indirect convert: instance_count → mesh dispatch args (TETS_PER_GROUP=16) -----
@@ -2933,7 +2928,11 @@ pub fn record_sorted_interval_forward_pass(
     }
 
     // ----- 4. Interval shading render pass (single color output) -----
-    let render_bg = if result_in_b { interval_render_bg_b } else { interval_render_bg_a };
+    let render_bg = if result_in_b {
+        interval_render_bg_b
+    } else {
+        interval_render_bg_a
+    };
     {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("interval_forward_render"),
@@ -3062,8 +3061,12 @@ pub fn record_sorted_compute_interval_forward_pass(
 
     // ----- 3. Radix sort -----
     let result_in_b = rmesh_sort::record_radix_sort(
-        encoder, device, sort_pipelines, sort_state,
-        &buffers.sort_keys, &buffers.sort_values,
+        encoder,
+        device,
+        sort_pipelines,
+        sort_state,
+        &buffers.sort_keys,
+        &buffers.sort_values,
     );
 
     // ----- 4. Indirect convert → combined dispatch + draw args -----
@@ -3177,7 +3180,10 @@ pub fn record_sorted_compute_interval_forward_pass(
             rpass.set_pipeline(&ci_pipelines.render_pipeline_color_only);
         }
         rpass.set_bind_group(0, ci_render_bg, &[]);
-        rpass.set_index_buffer(buffers.interval_fan_index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        rpass.set_index_buffer(
+            buffers.interval_fan_index_buf.slice(..),
+            wgpu::IndexFormat::Uint32,
+        );
         // draw-indexed-indirect args start at byte offset 12 (skip 3 dispatch u32s)
         rpass.draw_indexed_indirect(&buffers.interval_args_buf, 12);
     }
@@ -3349,9 +3355,21 @@ pub fn build_boundary_bvh(
             let vi1 = indices[tet_id * 4 + TET_FACE_INDICES[fi_base + 1] as usize] as usize;
             let vi2 = indices[tet_id * 4 + TET_FACE_INDICES[fi_base + 2] as usize] as usize;
 
-            let v0 = [vertices[vi0 * 3], vertices[vi0 * 3 + 1], vertices[vi0 * 3 + 2]];
-            let v1 = [vertices[vi1 * 3], vertices[vi1 * 3 + 1], vertices[vi1 * 3 + 2]];
-            let v2 = [vertices[vi2 * 3], vertices[vi2 * 3 + 1], vertices[vi2 * 3 + 2]];
+            let v0 = [
+                vertices[vi0 * 3],
+                vertices[vi0 * 3 + 1],
+                vertices[vi0 * 3 + 2],
+            ];
+            let v1 = [
+                vertices[vi1 * 3],
+                vertices[vi1 * 3 + 1],
+                vertices[vi1 * 3 + 2],
+            ];
+            let v2 = [
+                vertices[vi2 * 3],
+                vertices[vi2 * 3 + 1],
+                vertices[vi2 * 3 + 2],
+            ];
 
             centroids.push([
                 (v0[0] + v1[0] + v2[0]) / 3.0,
@@ -3359,8 +3377,16 @@ pub fn build_boundary_bvh(
                 (v0[2] + v1[2] + v2[2]) / 3.0,
             ]);
             aabbs.push((
-                [v0[0].min(v1[0]).min(v2[0]), v0[1].min(v1[1]).min(v2[1]), v0[2].min(v1[2]).min(v2[2])],
-                [v0[0].max(v1[0]).max(v2[0]), v0[1].max(v1[1]).max(v2[1]), v0[2].max(v1[2]).max(v2[2])],
+                [
+                    v0[0].min(v1[0]).min(v2[0]),
+                    v0[1].min(v1[1]).min(v2[1]),
+                    v0[2].min(v1[2]).min(v2[2]),
+                ],
+                [
+                    v0[0].max(v1[0]).max(v2[0]),
+                    v0[1].max(v1[1]).max(v2[1]),
+                    v0[2].max(v1[2]).max(v2[2]),
+                ],
             ));
         }
     }
@@ -3369,7 +3395,10 @@ pub fn build_boundary_bvh(
     if n_faces == 0 {
         return BVHData {
             nodes: vec![BVHNode {
-                aabb_min: [0.0; 3], left_or_face: -1, aabb_max: [0.0; 3], right_or_count: 0,
+                aabb_min: [0.0; 3],
+                left_or_face: -1,
+                aabb_max: [0.0; 3],
+                right_or_count: 0,
             }],
             boundary_faces,
         };
@@ -3415,8 +3444,17 @@ pub fn build_boundary_bvh(
 
     let mut nodes: Vec<BVHNode> = Vec::with_capacity(2 * n_faces);
     // Reserve root
-    nodes.push(BVHNode { aabb_min: [0.0; 3], left_or_face: 0, aabb_max: [0.0; 3], right_or_count: 0 });
-    let mut stack = vec![BuildTask { start: 0, end: n_faces, node_idx: 0 }];
+    nodes.push(BVHNode {
+        aabb_min: [0.0; 3],
+        left_or_face: 0,
+        aabb_max: [0.0; 3],
+        right_or_count: 0,
+    });
+    let mut stack = vec![BuildTask {
+        start: 0,
+        end: n_faces,
+        node_idx: 0,
+    }];
 
     while let Some(task) = stack.pop() {
         let count = task.end - task.start;
@@ -3439,9 +3477,19 @@ pub fn build_boundary_bvh(
         } else {
             let mid = task.start + count / 2;
             let left_idx = nodes.len();
-            nodes.push(BVHNode { aabb_min: [0.0; 3], left_or_face: 0, aabb_max: [0.0; 3], right_or_count: 0 });
+            nodes.push(BVHNode {
+                aabb_min: [0.0; 3],
+                left_or_face: 0,
+                aabb_max: [0.0; 3],
+                right_or_count: 0,
+            });
             let right_idx = nodes.len();
-            nodes.push(BVHNode { aabb_min: [0.0; 3], left_or_face: 0, aabb_max: [0.0; 3], right_or_count: 0 });
+            nodes.push(BVHNode {
+                aabb_min: [0.0; 3],
+                left_or_face: 0,
+                aabb_max: [0.0; 3],
+                right_or_count: 0,
+            });
 
             nodes[task.node_idx] = BVHNode {
                 aabb_min: amin,
@@ -3450,12 +3498,23 @@ pub fn build_boundary_bvh(
                 right_or_count: right_idx as i32,
             };
 
-            stack.push(BuildTask { start: task.start, end: mid, node_idx: left_idx });
-            stack.push(BuildTask { start: mid, end: task.end, node_idx: right_idx });
+            stack.push(BuildTask {
+                start: task.start,
+                end: mid,
+                node_idx: left_idx,
+            });
+            stack.push(BuildTask {
+                start: mid,
+                end: task.end,
+                node_idx: right_idx,
+            });
         }
     }
 
-    BVHData { nodes, boundary_faces }
+    BVHData {
+        nodes,
+        boundary_faces,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3478,10 +3537,26 @@ pub fn find_containing_tet(
             indices[tet_id * 4 + 3] as usize,
         ];
         let v = [
-            Vec3::new(vertices[vi[0] * 3], vertices[vi[0] * 3 + 1], vertices[vi[0] * 3 + 2]),
-            Vec3::new(vertices[vi[1] * 3], vertices[vi[1] * 3 + 1], vertices[vi[1] * 3 + 2]),
-            Vec3::new(vertices[vi[2] * 3], vertices[vi[2] * 3 + 1], vertices[vi[2] * 3 + 2]),
-            Vec3::new(vertices[vi[3] * 3], vertices[vi[3] * 3 + 1], vertices[vi[3] * 3 + 2]),
+            Vec3::new(
+                vertices[vi[0] * 3],
+                vertices[vi[0] * 3 + 1],
+                vertices[vi[0] * 3 + 2],
+            ),
+            Vec3::new(
+                vertices[vi[1] * 3],
+                vertices[vi[1] * 3 + 1],
+                vertices[vi[1] * 3 + 2],
+            ),
+            Vec3::new(
+                vertices[vi[2] * 3],
+                vertices[vi[2] * 3 + 1],
+                vertices[vi[2] * 3 + 2],
+            ),
+            Vec3::new(
+                vertices[vi[3] * 3],
+                vertices[vi[3] * 3 + 1],
+                vertices[vi[3] * 3 + 2],
+            ),
         ];
 
         let d = v[1] - v[0];
@@ -3537,19 +3612,20 @@ impl RayTracePipeline {
             .replace("/*AUX_DIM*/0u", &format!("{}u", aux_dim))
             .replace("/*AUX_ACC_SIZE*/1u", &format!("{}u", aux_dim.max(1)));
 
-        let shader = rmesh_util::compose::create_shader_module(
-            device, "raytrace_compute.wgsl", &source,
-        ).expect("Failed to compose raytrace_compute.wgsl");
+        let shader =
+            rmesh_util::compose::create_shader_module(device, "raytrace_compute.wgsl", &source)
+                .expect("Failed to compose raytrace_compute.wgsl");
 
         // Group 0: 13 bindings (0-6 read, 7 rw, 8-12 read)
-        let read_only = [true, true, true, true, true, true, true, false, true, true, true, true, true];
+        let read_only = [
+            true, true, true, true, true, true, true, false, true, true, true, true, true,
+        ];
         let entries = storage_entries(13, wgpu::ShaderStages::COMPUTE, &read_only);
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("raytrace_bgl"),
-                entries: &entries,
-            });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raytrace_bgl"),
+            entries: &entries,
+        });
 
         // Group 1: aux_image (rw), aux_data (read)
         let aux_entries = storage_entries(2, wgpu::ShaderStages::COMPUTE, &[false, true]);
@@ -3603,16 +3679,20 @@ impl RayTracePipeline {
         let aux_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("raytrace_aux_bg_default"),
             layout: &aux_bind_group_layout,
-            entries: &[
-                buf_entry(0, &aux_image),
-                buf_entry(1, &aux_data_dummy),
-            ],
+            entries: &[buf_entry(0, &aux_image), buf_entry(1, &aux_data_dummy)],
         });
 
         Self {
-            pipeline, bind_group_layout, aux_bind_group_layout,
-            rendered_image, aux_image, aux_bind_group,
-            width, height, aux_dim, aux_stride,
+            pipeline,
+            bind_group_layout,
+            aux_bind_group_layout,
+            rendered_image,
+            aux_image,
+            aux_bind_group,
+            width,
+            height,
+            aux_dim,
+            aux_stride,
         }
     }
 
@@ -3646,7 +3726,12 @@ impl RayTraceBuffers {
         });
 
         let bvh_data = if bvh.nodes.is_empty() {
-            vec![BVHNode { aabb_min: [0.0; 3], left_or_face: -1, aabb_max: [0.0; 3], right_or_count: 0 }]
+            vec![BVHNode {
+                aabb_min: [0.0; 3],
+                left_or_face: -1,
+                aabb_max: [0.0; 3],
+                right_or_count: 0,
+            }]
         } else {
             bvh.nodes.clone()
         };
@@ -3656,7 +3741,11 @@ impl RayTraceBuffers {
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-        let bf_data = if bvh.boundary_faces.is_empty() { vec![0u32] } else { bvh.boundary_faces.clone() };
+        let bf_data = if bvh.boundary_faces.is_empty() {
+            vec![0u32]
+        } else {
+            bvh.boundary_faces.clone()
+        };
         let boundary_faces = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("boundary_faces"),
             contents: bytemuck::cast_slice(&bf_data),
@@ -3681,7 +3770,14 @@ impl RayTraceBuffers {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        Self { tet_neighbors, bvh_nodes, boundary_faces, start_tet, ray_origins, ray_dirs }
+        Self {
+            tet_neighbors,
+            bvh_nodes,
+            boundary_faces,
+            start_tet,
+            ray_origins,
+            ray_dirs,
+        }
     }
 }
 
@@ -3768,9 +3864,9 @@ impl RasterizeComputePipeline {
             .replace("/*AUX_DIM*/0u", &format!("{}u", aux_dim))
             .replace("/*SM_AUX_SIZE*/1u", &format!("{}u", (256 * aux_dim).max(1)));
 
-        let shader = rmesh_util::compose::create_shader_module(
-            device, "rasterize_compute.wgsl", &source,
-        ).expect("Failed to compose rasterize_compute.wgsl");
+        let shader =
+            rmesh_util::compose::create_shader_module(device, "rasterize_compute.wgsl", &source)
+                .expect("Failed to compose rasterize_compute.wgsl");
 
         // Group 0: 10 bindings
         let read_only = [true, true, true, true, true, true, true, true, true, false];
@@ -3780,11 +3876,10 @@ impl RasterizeComputePipeline {
             .map(|(i, &ro)| rmesh_tile::storage_entry(i as u32, ro))
             .collect();
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("rasterize_compute_bgl"),
-                entries: &entries,
-            });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rasterize_compute_bgl"),
+            entries: &entries,
+        });
 
         // Group 1: aux_image (rw), aux_data (read), debug_image (rw)
         let aux_entries: Vec<wgpu::BindGroupLayoutEntry> = [false, true, false]
@@ -3951,7 +4046,7 @@ pub fn record_rasterize_compute(
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct LocateUniforms {
     pub num_queries: u32,
-    pub hint_tet: i32,   // global hint, or -1 to use per-query hint_tets
+    pub hint_tet: i32, // global hint, or -1 to use per-query hint_tets
     pub tet_count: u32,
     pub _pad: u32,
 }
@@ -3973,11 +4068,10 @@ impl LocatePipeline {
         let read_only = [true, true, true, true, true, true, false];
         let entries = storage_entries(7, wgpu::ShaderStages::COMPUTE, &read_only);
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("locate_bgl"),
-                entries: &entries,
-            });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("locate_bgl"),
+            entries: &entries,
+        });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("locate_pl"),
@@ -3994,7 +4088,10 @@ impl LocatePipeline {
             cache: None,
         });
 
-        Self { pipeline, bind_group_layout }
+        Self {
+            pipeline,
+            bind_group_layout,
+        }
     }
 
     pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
@@ -4087,10 +4184,26 @@ pub fn find_containing_tet_walk(
             indices[current * 4 + 3] as usize,
         ];
         let v = [
-            Vec3::new(vertices[vi[0] * 3], vertices[vi[0] * 3 + 1], vertices[vi[0] * 3 + 2]),
-            Vec3::new(vertices[vi[1] * 3], vertices[vi[1] * 3 + 1], vertices[vi[1] * 3 + 2]),
-            Vec3::new(vertices[vi[2] * 3], vertices[vi[2] * 3 + 1], vertices[vi[2] * 3 + 2]),
-            Vec3::new(vertices[vi[3] * 3], vertices[vi[3] * 3 + 1], vertices[vi[3] * 3 + 2]),
+            Vec3::new(
+                vertices[vi[0] * 3],
+                vertices[vi[0] * 3 + 1],
+                vertices[vi[0] * 3 + 2],
+            ),
+            Vec3::new(
+                vertices[vi[1] * 3],
+                vertices[vi[1] * 3 + 1],
+                vertices[vi[1] * 3 + 2],
+            ),
+            Vec3::new(
+                vertices[vi[2] * 3],
+                vertices[vi[2] * 3 + 1],
+                vertices[vi[2] * 3 + 2],
+            ),
+            Vec3::new(
+                vertices[vi[3] * 3],
+                vertices[vi[3] * 3 + 1],
+                vertices[vi[3] * 3 + 2],
+            ),
         ];
 
         let d = v[1] - v[0];
@@ -4158,28 +4271,27 @@ impl BlitPipeline {
             source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
         });
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("blit_bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("blit_pl"),
@@ -4282,22 +4394,19 @@ impl BlitPipelineNonFiltering {
             source: wgpu::ShaderSource::Wgsl(BLIT_NF_WGSL.into()),
         });
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("blit_nf_bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                ],
-            });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit_nf_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("blit_nf_pl"),
@@ -4334,7 +4443,10 @@ impl BlitPipelineNonFiltering {
             cache: None,
         });
 
-        Self { pipeline, bind_group_layout }
+        Self {
+            pipeline,
+            bind_group_layout,
+        }
     }
 }
 
@@ -4347,12 +4459,10 @@ pub fn create_blit_nf_bind_group(
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("blit_nf_bg"),
         layout: &blit.bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(source_view),
-            },
-        ],
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(source_view),
+        }],
     })
 }
 
@@ -4532,60 +4642,61 @@ impl DeferredShadePipeline {
         });
 
         // Group 1: DSM shadow atlas (3 Fourier texture arrays + metadata buffer)
-        let dsm_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("deferred_dsm_bgl"),
-            entries: &[
-                // 0-2: Fourier MRT texture arrays
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::Cube,
-                        multisampled: false,
+        let dsm_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("deferred_dsm_bgl"),
+                entries: &[
+                    // 0-2: Fourier MRT texture arrays
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::Cube,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::Cube,
-                        multisampled: false,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::Cube,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::Cube,
-                        multisampled: false,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::Cube,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                // 3: per-light shadow metadata
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    // 3: per-light shadow metadata
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                // 4: bilinear sampler for moment textures
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+                    // 4: bilinear sampler for moment textures
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("deferred_shade_pl"),
@@ -4636,7 +4747,13 @@ impl DeferredShadePipeline {
             mapped_at_creation: false,
         });
 
-        Self { pipeline, bind_group_layout, dsm_bind_group_layout, uniforms_buf, light_buf }
+        Self {
+            pipeline,
+            bind_group_layout,
+            dsm_bind_group_layout,
+            uniforms_buf,
+            light_buf,
+        }
     }
 }
 
@@ -4795,7 +4912,11 @@ impl IntervalTiledBuffers {
             mapped_at_creation: false,
         });
 
-        Self { interval_verts, interval_tet_data, interval_meta }
+        Self {
+            interval_verts,
+            interval_tet_data,
+            interval_meta,
+        }
     }
 }
 
@@ -4811,7 +4932,7 @@ impl IntervalGeneratePipeline {
         let read_only = [
             true, true, true, true, true, true, true, true, // 0-7
             false, false, false, // 8-10 (interval_verts, interval_tet_data, interval_meta)
-            true, // 11 (vertex_normals)
+            true,  // 11 (vertex_normals)
         ];
         let entries: Vec<wgpu::BindGroupLayoutEntry> = read_only
             .iter()
@@ -4844,7 +4965,10 @@ impl IntervalGeneratePipeline {
             cache: None,
         });
 
-        Self { pipeline, bg_layout }
+        Self {
+            pipeline,
+            bg_layout,
+        }
     }
 }
 
@@ -4930,11 +5054,16 @@ impl IntervalTiledRasterizePipeline {
             .replace("/*AUX_DIM*/0u", &format!("{}u", aux_dim))
             .replace("/*SM_AUX_SIZE*/1u", &format!("{}u", sm_aux_size));
         let shader = rmesh_util::compose::create_shader_module(
-            device, "interval_tiled_rasterize.wgsl", &source,
-        ).expect("Failed to compose interval_tiled_rasterize.wgsl");
+            device,
+            "interval_tiled_rasterize.wgsl",
+            &source,
+        )
+        .expect("Failed to compose interval_tiled_rasterize.wgsl");
 
         // Group 0: 12 bindings (7 read, 3 rw, 1 read, 1 rw)
-        let read_only = [true, true, true, true, true, true, true, false, false, false, true, false];
+        let read_only = [
+            true, true, true, true, true, true, true, false, false, false, true, false,
+        ];
         let entries: Vec<wgpu::BindGroupLayoutEntry> = read_only
             .iter()
             .enumerate()
@@ -4987,7 +5116,11 @@ impl IntervalTiledRasterizePipeline {
             mapped_at_creation: false,
         });
 
-        let aux_image_size = if aux_dim > 0 { n_pixels * (aux_dim as u64) * 4 } else { 4 };
+        let aux_image_size = if aux_dim > 0 {
+            n_pixels * (aux_dim as u64) * 4
+        } else {
+            4
+        };
         let aux_image = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("interval_tiled_aux_image"),
             size: aux_image_size,
@@ -5003,8 +5136,16 @@ impl IntervalTiledRasterizePipeline {
         });
 
         Self {
-            pipeline, bind_group_layout, rendered_image, xyzd_image, distortion_image,
-            aux_image, aux_dim, aux_data_dummy, width, height,
+            pipeline,
+            bind_group_layout,
+            rendered_image,
+            xyzd_image,
+            distortion_image,
+            aux_image,
+            aux_dim,
+            aux_data_dummy,
+            width,
+            height,
         }
     }
 
