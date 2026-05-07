@@ -136,9 +136,6 @@ pub struct PbrData {
     pub metallic: Vec<f32>,
     /// Per-tet F0 for dielectrics [M] f32 (parametric BRDF, typically ~0.04).
     pub f0_dielectric: Vec<f32>,
-    /// Per-tet retro-reflective coefficient [M] f32 (parametric BRDF).
-    /// Distinct from `retro_weights`/`retro_bias`, which are the older RetroHead MLP weights.
-    pub retro: Vec<f32>,
 }
 
 /// Load a .rmesh file (gzip-compressed binary).
@@ -426,7 +423,6 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
     let mut tone_curve = Vec::new();
     let mut metallic = Vec::new();
     let mut f0_dielectric = Vec::new();
-    let mut retro = Vec::new();
 
     for _ in 0..num_sections {
         if *offset + 16 > data.len() {
@@ -499,11 +495,6 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
             "f0_dielectric" => {
                 f0_dielectric = f16_payload_to_f32(payload, dtype);
             }
-            "retro" => {
-                // New parametric BRDF format: per-tet scalar [M].
-                // (Old "retro_head" tag is handled separately above as 5 MLP weights.)
-                retro = f16_payload_to_f32(payload, dtype);
-            }
             other => {
                 log::info!("  skipping unknown section '{}'", other);
             }
@@ -526,7 +517,6 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
         tone_curve,
         metallic,
         f0_dielectric,
-        retro,
     })
 }
 

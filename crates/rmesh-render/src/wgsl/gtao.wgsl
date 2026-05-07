@@ -35,7 +35,7 @@ struct GtaoUniforms {
 // Hi-Z: full mip chain over fused linear view-space Z. Z_SKY for true sky.
 @group(0) @binding(1) var hiz_tex: texture_2d<f32>;
 @group(0) @binding(2) var normals_tex: texture_2d<f32>;
-// Volume's expected-termination depth MRT: (depth*α, retro*α, depth²*α, α).
+// Volume's expected-termination depth MRT: (depth*α, 0, depth²*α, α).
 // Used to compute per-pixel σ for neighbor weighting + center-pixel AO fade.
 @group(0) @binding(3) var volume_depth_tex: texture_2d<f32>;
 

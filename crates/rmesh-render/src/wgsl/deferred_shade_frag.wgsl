@@ -4,15 +4,14 @@
 //   color_tex:   albedo.rgb * a, a
 //   aux0_tex:    roughness * a, metallic * a, f0_dielectric * a, a
 //   normals_tex: gradient.xyz * a, a
-//   depth_tex:   expected_depth * a, retro * a, expected_z2 * a, a
+//   depth_tex:   expected_depth * a, 0, expected_z2 * a, a
 // Plus hw depth buffer for world-position reconstruction and a precomputed
 // AO factor (R8Unorm) from the GTAO pass.
 // Group 1: cached Fourier DSM shadow atlas for transmittance lookup.
 //
 // Material model: GGX D + Smith G (height-correlated) + Schlick Fresnel
-// metallic workflow, plus a back-Lambertian retro lobe for retroreflective
-// surfaces. Output is linear color (Rgba16Float); a downstream blit applies
-// linear → sRGB encoding, so this shader does NOT gamma-correct.
+// metallic workflow. Output is linear color (Rgba16Float); a downstream blit
+// applies linear → sRGB encoding, so this shader does NOT gamma-correct.
 
 struct DeferredUniforms {
     inv_vp: mat4x4f,
@@ -67,12 +66,13 @@ struct ShadowLight {
 @group(0) @binding(1) var color_tex: texture_2d<f32>;     // albedo RGBA (premul alpha)
 @group(0) @binding(2) var aux0_tex: texture_2d<f32>;      // roughness, metallic, f0_dielectric, alpha
 @group(0) @binding(3) var normals_tex: texture_2d<f32>;   // raw field gradient.xyz * alpha, alpha
-@group(0) @binding(4) var depth_tex: texture_2d<f32>;     // expected depth, retro, 0, alpha
+@group(0) @binding(4) var depth_tex: texture_2d<f32>;     // expected depth, 0, expected_z2, alpha
 @group(0) @binding(5) var<storage, read> lights: array<Light>;
 @group(0) @binding(6) var hw_depth_tex: texture_depth_2d; // hardware depth buffer
 @group(0) @binding(7) var ao_tex: texture_2d<f32>;        // R8Unorm GTAO output
 @group(0) @binding(8) var ssgi_tex: texture_2d<f32>;      // Rgba16Float SSGI radiance
 @group(0) @binding(9) var lit_history_tex: texture_2d<f32>; // Rgba16Float, prev frame's deferred output
+@group(0) @binding(10) var ssr_tex: texture_2d<f32>;      // Rgba16Float SSR radiance (reflection direction)
 
 // Group 1: DSM shadow cubemap
 @group(1) @binding(0) var dsm_rt0: texture_cube<f32>;
@@ -87,20 +87,21 @@ const DBG_RAW_ALBEDO:  u32 = 1u;
 const DBG_TRUE_ALBEDO: u32 = 2u;
 const DBG_NORMALS:     u32 = 3u;
 const DBG_ROUGHNESS:   u32 = 4u;
-const DBG_PBR:         u32 = 5u;  // metallic / f0_dielectric / retro packed RGB
+const DBG_PBR:         u32 = 5u;  // roughness / metallic / f0_dielectric packed RGB
 const DBG_DEPTH:       u32 = 6u;
 const DBG_SPECULAR:    u32 = 7u;
 const DBG_DIFFUSE:     u32 = 8u;
 const DBG_SHADOW:      u32 = 9u;
-const DBG_RETRO:       u32 = 10u;
-const DBG_LAMBDA:      u32 = 11u;
-const DBG_PLASTER:     u32 = 12u;
-const DBG_ALPHA:       u32 = 13u;
-const DBG_PRIMITIVES:  u32 = 14u;
-const DBG_DSM:         u32 = 15u;
-const DBG_AO:          u32 = 16u;
-const DBG_SSGI:        u32 = 17u;
-const DBG_LIT_HISTORY: u32 = 18u;
+const DBG_LAMBDA:      u32 = 10u;
+const DBG_PLASTER:     u32 = 11u;
+const DBG_ALPHA:       u32 = 12u;
+const DBG_PRIMITIVES:  u32 = 13u;
+const DBG_DSM:         u32 = 14u;
+const DBG_AO:          u32 = 15u;
+const DBG_SSGI:        u32 = 16u;
+const DBG_LIT_HISTORY: u32 = 17u;
+const DBG_SSR:         u32 = 18u;
+const DBG_DEPTH_STD:   u32 = 19u;
 
 const PI: f32 = 3.14159265358979323846;
 const TWO_PI: f32 = 6.28318530717958647692;
@@ -116,7 +117,7 @@ fn fresnel_schlick(cos_theta: f32, F0: vec3f) -> vec3f {
 }
 
 fn d_ggx(n_dot_h: f32, a: f32) -> f32 {
-    let a2 = a * a;
+    let a2 = a;// * a;
     let n_h = clamp(n_dot_h, 0.0, 1.0);
     let denom = n_h * n_h * (a2 - 1.0) + 1.0;
     return a2 / (PI * denom * denom + 1e-7);
@@ -134,6 +135,19 @@ fn aces_narkowicz(x: vec3f) -> vec3f {
         (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14),
         vec3f(0.0), vec3f(1.0),
     );
+}
+
+// Lazarov 2013 / Karis fit — closed-form replacement for the 2D BRDF LUT.
+// Returns the energy-conserving Fresnel factor for ambient/IBL specular as
+// `F0 * scale + F90 * bias`, where scale and bias account for the GGX lobe
+// shape over (NoV, roughness). Use in place of `F_view` for ambient specular.
+fn env_brdf_approx(F0: vec3f, roughness: f32, n_dot_v: f32) -> vec3f {
+    let c0 = vec4f(-1.0, -0.0275, -0.572, 0.022);
+    let c1 = vec4f( 1.0,  0.0425,  1.040, -0.040);
+    let r = c0 * roughness + c1;
+    let a004 = min(r.x * r.x, exp2(-9.28 * n_dot_v)) * r.x + r.y;
+    let env = vec2f(-1.04, 1.04) * a004 + r.zw;
+    return F0 * env.x + vec3f(env.y);
 }
 
 // ---------------------------------------------------------------------------
@@ -230,10 +244,11 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let color_raw = textureLoad(color_tex, coords, 0);      // albedo (premul)
     let aux0_raw = textureLoad(aux0_tex, coords, 0);
     let normals_raw = textureLoad(normals_tex, coords, 0);
-    let depth_raw = textureLoad(depth_tex, coords, 0);       // expected depth + retro
+    let depth_raw = textureLoad(depth_tex, coords, 0);       // expected depth + E[z²]
     let hw_depth = textureLoad(hw_depth_tex, coords, 0);
     let ao = textureLoad(ao_tex, coords, 0).r;
     let ssgi_indirect = textureLoad(ssgi_tex, coords, 0).rgb;
+    let ssr_radiance  = textureLoad(ssr_tex, coords, 0).rgb;
 
     let alpha = color_raw.a;
     if (alpha < 0.01) {
@@ -252,19 +267,33 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let raw_gradient = normals_raw.rgb * inv_alpha;
     let normal = -normalize(vec3f(raw_gradient.x, raw_gradient.y, raw_gradient.z));
 
-    // Volume's expected termination depth + retro
-    let z_expected = depth_raw.r * inv_alpha;
-    let retro      = depth_raw.g * inv_alpha;
+    // Volume's expected termination depth. Slot 3 is filtered ("thick tets
+    // only") at the producer, so its α lags color's α — normalize by slot 3's
+    // own α, not color's. When slot 3 has no thick-tet coverage at this pixel
+    // (depth_alpha < 0.01), the volume contributes no usable depth and we
+    // fall back to hw_depth (or far) for world-pos reconstruction.
+    let depth_alpha = depth_raw.a;
+    let inv_da = 1.0 / max(depth_alpha, 1e-6);
+    let z_expected = depth_raw.r * inv_da;
 
     let near = uniforms.near_plane;
     let far  = uniforms.far_plane;
 
-    // Use hw depth where an opaque primitive wrote to it (hw_depth < 1.0),
-    // otherwise use the volume's expected termination depth.
-    var z_final = max(z_expected, near);
-    if hw_depth < 0.999 {
-        let z_hw = near * far / (far - hw_depth * (far - near));
-        z_final = min(z_final, z_hw);
+    // Pick the closer of volume-depth and hw-depth, but only consider the
+    // volume-depth when slot 3 actually has thick-tet coverage.
+    var z_final: f32;
+    if depth_alpha < 0.01 {
+        if hw_depth < 0.999 {
+            z_final = near * far / (far - hw_depth * (far - near));
+        } else {
+            z_final = far;
+        }
+    } else {
+        z_final = max(z_expected, near);
+        if hw_depth < 0.999 {
+            let z_hw = near * far / (far - hw_depth * (far - near));
+            z_final = min(z_final, z_hw);
+        }
     }
 
     // Reconstruct world position from depth + inverse VP
@@ -282,7 +311,8 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     // Match pbr_bsdf.PBRBsdf.forward: roughness clamped to [min_roughness, 1].
     let r_clamped = clamp(roughness, 0.08, 1.0);
     let alpha_g = r_clamped * r_clamped;
-    let F0 = mix(vec3f(f0_dielectric), albedo, metallic);
+    // let F0 = mix(vec3f(f0_dielectric), albedo, metallic);
+    let F0 = (1.0 - metallic) * f0_dielectric + metallic * albedo;
 
     // Energy-consistent diffuse scale — matches `diffuse_scaling(metallic, F0, NdotV)`
     // from pbr_bsdf.py: view-angle Fresnel, evaluated once per pixel.
@@ -331,43 +361,70 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
         let F = fresnel_schlick(LoH, F0);
         let D = d_ggx(NoH, alpha_g);
         let Vis = v_smith_ggx_correlated(NoV, NoL, alpha_g);
-        let spec = D * Vis * F;
+        // return (1.0 - metallic) * f0_d + metallic * albedo
+        // F0 = compute_F0(metallic, f0_diel, albedo_sel)
+        // spec_color = brdf_model(half_v, view_dir, norm_sel, rough_sel, F0)
+        let spec = D * Vis * F * NoL;
 
         var T = 1.0;
         if (uniforms.dsm_enabled != 0u) {
             T = evaluate_transmittance(world_pos, li, 1.0);
         }
 
-        // Plain Lambertian NoL — retro is computed/exposed via DBG_RETRO but
-        // not applied to lighting (matches pbr_renderer.render_relit).
+        // Plain Lambertian NoL.
         let l_color = light.color * light.intensity;
         let energy = T * atten;
         total_diffuse  += diff_base * NoL * energy * l_color;
-        total_specular += spec      * NoL * energy * l_color;
+        total_specular += spec      * energy * l_color;
     }
-    // Hemispherical ambient × AO. Energy split mirrors the per-light path:
-    // diffuse ambient is gated by `kd` (so metals get no ambient diffuse),
-    // and a cheap ambient specular (`F_view·hemi`) gives metals a tinted
-    // reflection from the sky/ground hemisphere when no env map is around.
+    // Hemispherical ambient × AO.
+    //
+    // The user-set sky/ground hemi is treated as a *far environment probe* —
+    // it only contributes via Fresnel-tinted specular reflection (env_F · hemi).
+    // It does NOT drive a diffuse irradiance term, because adding `kd · albedo
+    // · hemi` paints the receiver's albedo into what should read as a clean
+    // tinted reflection (visually indistinguishable from Lambertian ambient,
+    // and wrong on metals tinted by a colored hemi).
+    //
+    // Diffuse ambient comes from SSGI only — that's the actual gathered
+    // indirect radiance from on-screen bounces. With SSGI off, diffuse ambient
+    // is zero and the receiver relies on direct lights for its base color.
     let hemi = mix(uniforms.ground_color, uniforms.sky_color, normal.y * 0.5 + 0.5);
     let ao_factor = mix(1.0, ao, uniforms.ao_strength);
-    // Diffuse ambient: lerp from constant hemi-stand-in toward SSGI's actual
-    // gathered indirect radiance based on `ssgi_strength`. SSGI rays already
-    // multi-bounce via prior-frame feedback; here we still need `kd · albedo`
-    // to apply the receiving surface's BRDF (the receiver hadn't been mixed
-    // in yet — the SSGI buffer holds incoming radiance L_in).
-    let ambient_diffuse_const = kd * albedo * hemi;
-    let ambient_diffuse_ssgi  = kd * albedo * ssgi_indirect;
-    let ambient_diffuse = mix(ambient_diffuse_const, ambient_diffuse_ssgi, uniforms.ssgi_strength);
-    // Specular ambient: same shape as the diffuse path, so metals (which have
-    // kd≈0 and rely entirely on F_view·env) actually reflect colored SSGI
-    // radiance from neighbors instead of just the constant sky/ground gradient.
-    // Approximation: SSGI is a hemisphere-averaged radiance, not the reflection
-    // direction — strictly correct only for rough materials. Mirrors want SSR.
-    let ambient_specular_const = F_view * hemi;
-    let ambient_specular_ssgi  = F_view * ssgi_indirect;
-    let ambient_specular = mix(ambient_specular_const, ambient_specular_ssgi, uniforms.ssgi_strength);
-    let ambient_term = uniforms.ambient * (ambient_diffuse + ambient_specular) * ao_factor;
+
+    let ambient_diffuse = kd * albedo * ssgi_indirect * uniforms.ssgi_strength;
+
+    // Indirect specular radiance: smooth surfaces use the SSR ray (sharp,
+    // along reflect(V, N)); rough surfaces fall back to SSGI's hemisphere
+    // average. Smoothness² mix is the standard PBR specular envelope.
+    //
+    // NoV fade kills the SSR contribution at silhouettes, where reflect(V,N)
+    // skims along the surface (screen-space ray collapses, march false-hits
+    // the silhouette pixel itself). SSGI takes over there — same fallback as
+    // the off-screen / no-hit case inside ssr_compute.wgsl.
+    let smoothness = 1.0 - r_clamped;
+    let smoothness_sq = smoothness * smoothness;
+    let ssr_grazing_fade = smoothstep(0.05, 0.35, NoV);
+    let ssr_effective = mix(ssgi_indirect, ssr_radiance, ssr_grazing_fade);
+    let indirect_spec_radiance = mix(ssgi_indirect, ssr_effective, smoothness_sq);
+
+    // Lazarov env-BRDF fit: replaces F_view for the ambient/IBL specular so
+    // the Fresnel factor accounts for roughness (lobe broadening + bias),
+    // not just NoV. Without this, a r=1 surface and a r=0.05 surface would
+    // get identical specular intensity.
+    //
+    // No constant `env_F · hemi` term. For metals, env_F ≈ F0 = albedo, so
+    // env_F · hemi reduces to albedo · hemi — visually indistinguishable from
+    // a Lambertian albedo·hemi multiply, which paints the metal's base color
+    // across the whole surface and reads as a diffuse leak. Real environment
+    // reflection requires an actual environment signal; here that comes from
+    // SSR rays whose miss path falls back to SSGI's hemi gradient — so the
+    // user's sky/ground colors still tint metals, but only through rays that
+    // actually look toward those directions.
+    let env_F = env_brdf_approx(F0, r_clamped, NoV);
+    let ambient_specular = env_F * indirect_spec_radiance * uniforms.ssgi_strength;
+
+    let ambient_term = uniforms.ambient * (ambient_diffuse) * ao_factor;
 
     var lit = total_diffuse + total_specular + ambient_term;
     var final_color = aces_narkowicz(lit * uniforms.exposure);
@@ -379,12 +436,12 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
 
     // Debug mode overrides — bypass tonemap for visualizations
     let dm = uniforms.debug_mode;
-    if (dm == DBG_RAW_ALBEDO)       { final_color = albedo; }
-    else if (dm == DBG_TRUE_ALBEDO) { final_color = albedo; }
+    if (dm == DBG_RAW_ALBEDO)       { final_color = uniforms.exposure * albedo; }
+    else if (dm == DBG_TRUE_ALBEDO) { final_color = uniforms.exposure * albedo; }
     else if (dm == DBG_NORMALS)     { final_color = normal * 0.5 + 0.5; }
     else if (dm == DBG_ROUGHNESS)   { final_color = vec3f(roughness); }
     else if (dm == DBG_PBR)         { final_color = vec3f(roughness, metallic, f0_dielectric); }
-    else if (dm == DBG_DEPTH)       { final_color = vec3f(z_expected * 0.1); }
+    else if (dm == DBG_DEPTH)       { final_color = vec3f(uniforms.exposure * z_expected * 0.1); }
     else if (dm == DBG_SPECULAR)    { final_color = aces_narkowicz(total_specular * uniforms.exposure); }
     else if (dm == DBG_DIFFUSE)     { final_color = aces_narkowicz((total_diffuse + ambient_term) * uniforms.exposure); }
     else if (dm == DBG_SHADOW) {
@@ -393,12 +450,11 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
             for (var li = 0u; li < uniforms.num_lights; li = li + 1u) {
                 T_total += evaluate_transmittance(world_pos, li, 1.0);
             }
-            final_color = vec3f(T_total / max(f32(uniforms.num_lights), 1.0));
+            final_color = uniforms.exposure * vec3f(T_total / max(f32(uniforms.num_lights), 1.0));
         } else {
-            final_color = vec3f(1.0);
+            final_color = uniforms.exposure * vec3f(1.0);
         }
     }
-    else if (dm == DBG_RETRO)       { final_color = vec3f(retro); }
     else if (dm == DBG_LAMBDA) {
         // Reused: UV coords in light-space (first light) for debugging shadow projection.
         if uniforms.dsm_enabled != 0u && uniforms.num_lights > 0u {
@@ -427,6 +483,21 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     else if (dm == DBG_AO)          { final_color = vec3f(ao); }
     else if (dm == DBG_SSGI)        { final_color = ssgi_indirect; }
     else if (dm == DBG_LIT_HISTORY) { final_color = textureLoad(lit_history_tex, coords, 0).rgb; }
+    else if (dm == DBG_SSR)         { final_color = ssr_radiance; }
+    else if (dm == DBG_DEPTH_STD) {
+        // σ = √(E[z²]/α − (E[z]/α)²) — same quantity SSR/GTAO use to weight
+        // neighbor confidence. Raw view-Z units; reads as grayscale where
+        // bright = high uncertainty. Normalize by slot 3's own α (matches
+        // pixel_std in gtao.wgsl / ssr_compute.wgsl, which see only the
+        // post-filter "thick tets" population).
+        if depth_alpha < 0.01 {
+            final_color = vec3f(0.0);
+        } else {
+            let m1 = depth_raw.r * inv_da;
+            let m2 = depth_raw.b * inv_da;
+            final_color = vec3f(sqrt(max(m2 - m1 * m1, 0.0)));
+        }
+    }
 
     let display_out = vec4f(max(final_color, vec3f(0.0)), alpha);
     return DeferredOut(display_out, lit_history_out);

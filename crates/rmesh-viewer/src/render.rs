@@ -221,6 +221,7 @@ impl App {
         let mut ssgi_radius = self.ssgi_radius;
         let mut ssgi_temporal_alpha = self.ssgi_temporal_alpha;
         let mut ao_temporal_alpha = self.ao_temporal_alpha;
+        let mut ssr_temporal_alpha = self.ssr_temporal_alpha;
         let mut deferred_debug_mode = self.deferred_debug_mode;
         let mut dsm_query_depth = self.dsm_query_depth;
         // Get mesh bbox for dynamic slider ranges
@@ -273,6 +274,7 @@ impl App {
                             ui.add(egui::Slider::new(&mut ssgi_radius, 0.1..=5.0).logarithmic(true).text("SSGI Radius"));
                             ui.add(egui::Slider::new(&mut ao_temporal_alpha, 0.0..=1.0).text("AO Temporal α"));
                             ui.add(egui::Slider::new(&mut ssgi_temporal_alpha, 0.0..=1.0).text("SSGI Temporal α"));
+                            ui.add(egui::Slider::new(&mut ssr_temporal_alpha, 0.0..=1.0).text("SSR Temporal α"));
                             ui.horizontal(|ui| {
                                 ui.label("Sky");
                                 ui.color_edit_button_rgb(&mut sky_color);
@@ -281,17 +283,18 @@ impl App {
                             });
                             let debug_labels = [
                                 "Final", "Raw Albedo", "True Albedo", "Normals",
-                                "Roughness", "PBR (M/F0/Retro)", "Depth", "Specular",
-                                "Diffuse", "Shadow", "Retro", "Lambda",
+                                "Roughness", "PBR (R/M/F0)", "Depth", "Specular",
+                                "Diffuse", "Shadow", "Lambda",
                                 "Plaster", "Alpha", "Primitives", "DSM",
-                                "AO", "SSGI", "Lit History",
+                                "AO", "SSGI", "Lit History", "SSR",
+                                "Depth Std",
                             ];
                             ui.separator();
                             ui.label("Debug Layer");
                             for (i, label) in debug_labels.iter().enumerate() {
                                 ui.radio_value(&mut deferred_debug_mode, i as u32, *label);
                             }
-                            if deferred_debug_mode == 15 {
+                            if deferred_debug_mode == 14 {
                                 ui.separator();
                                 ui.add(egui::Slider::new(&mut dsm_query_depth, self.camera.near_z..=self.camera.far_z)
                                     .logarithmic(true)
@@ -459,6 +462,7 @@ impl App {
         self.ssgi_radius = ssgi_radius;
         self.ssgi_temporal_alpha = ssgi_temporal_alpha;
         self.ao_temporal_alpha = ao_temporal_alpha;
+        self.ssr_temporal_alpha = ssr_temporal_alpha;
         // Track current vp so next frame's temporal pass can reproject.
         self.prev_view_proj = vp;
         self.deferred_debug_mode = deferred_debug_mode;
@@ -697,7 +701,7 @@ impl App {
         // 2. Sorted forward pass: compute → radix sort → render
         //    Color uses LoadOp::Load (preserves primitive colors), depth test culls behind primitives
         let mrt_enabled = self.deferred_enabled && gpu.has_pbr_data;
-        let skip_volume = !self.show_scene || (self.deferred_enabled && self.deferred_debug_mode == 14);
+        let skip_volume = !self.show_scene || (self.deferred_enabled && self.deferred_debug_mode == 13);
         if skip_volume && mrt_enabled {
             // Clear MRT targets when volume is skipped to avoid ghosting
             let clear_ops = wgpu::Operations {
@@ -1272,6 +1276,91 @@ impl App {
                     wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                 );
 
+                // -------- SSR (specular reflections) --------
+                // Single Hi-Z ray-march along reflect(view, N). Same matrices /
+                // dimensions as SSGI; per-pixel jitter on the start step is
+                // the only randomness (no Monte Carlo over a lobe).
+                let ssr_uniforms = rmesh_render::SsrUniforms {
+                    inv_proj: proj_mat.inverse().to_cols_array_2d(),
+                    proj: proj_mat.to_cols_array_2d(),
+                    view: view_mat.to_cols_array_2d(),
+                    inv_view: view_mat.inverse().to_cols_array_2d(),
+                    width: w,
+                    height: h,
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    max_mip: gpu.hiz_texture.mip_count - 1,
+                    frame: gpu.frame_counter,
+                    radius_world: self.ssgi_radius,
+                    thickness: self.ssgi_radius * 0.5,
+                    sky_color: self.sky_color,
+                    _pad0: 0.0,
+                    ground_color: self.ground_color,
+                    _pad1: 0.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.ssr_pipeline.uniforms_buf, 0,
+                    bytemuck::bytes_of(&ssr_uniforms),
+                );
+                rmesh_render::record_ssr_pass(
+                    &mut encoder, &gpu.ssr_pipeline, &gpu.ssr_bg,
+                    &gpu.targets.ssr_view,
+                );
+
+                // SSR temporal: ssr_view (current) + ssr_history → ssr_temporal_view
+                let ssr_temporal_uniforms = rmesh_render::TemporalUniforms {
+                    inv_vp: cur_inv_vp.to_cols_array_2d(),
+                    prev_vp: prev_vp_mat.to_cols_array_2d(),
+                    width: w, height: h,
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    max_mip: gpu.hiz_texture.mip_count - 1,
+                    alpha: self.ssr_temporal_alpha,
+                    _pad0: 0.0, _pad1: 0.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.ssr_temporal_pipeline.uniforms_buf, 0,
+                    bytemuck::bytes_of(&ssr_temporal_uniforms),
+                );
+                rmesh_render::record_temporal_pass(
+                    &mut encoder, &gpu.ssr_temporal_pipeline, &gpu.ssr_temporal_bg,
+                    &gpu.targets.ssr_temporal_view,
+                );
+
+                // Copy ssr_temporal_view → ssr_view (final readable form for deferred).
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ssr_temporal_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ssr_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+
+                // Copy ssr_view → ssr_history for next frame's temporal pass.
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ssr_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ssr_history_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+
                 // Record deferred shade pass — writes display to deferred_output
                 // (location 0) and the true lit value to lit_current (location 1).
                 // location-1 is immune to debug-mode override, so SSGI's feedback
@@ -1307,7 +1396,7 @@ impl App {
         }
 
         // 3b. DSM debug view
-        let use_dsm_debug = self.deferred_enabled && self.deferred_debug_mode == 15;
+        let use_dsm_debug = self.deferred_enabled && self.deferred_debug_mode == 14;
         if use_dsm_debug {
             // Camera-perspective DSM debug (original mode 15)
             let fourier_views: [&wgpu::TextureView; rmesh_dsm::FOURIER_MRT_COUNT] =

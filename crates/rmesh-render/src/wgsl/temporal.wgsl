@@ -115,5 +115,17 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
 
     // History is real → 3×3 AABB clamp suppresses ghosting on disocclusion.
     let clamped = clamp(history, lo, hi);
-    return mix(clamped, current, u.alpha);
+
+    // Disocclusion-aware α: when the clamp had to drag history a long way
+    // to fit inside current's local AABB, the pixel just changed —
+    // disocclusion (camera revealed new geometry) or sudden lighting change
+    // (point light turned on, surface property changed). Trust history less
+    // by biasing α toward 1 (full current) for those pixels. Pixels whose
+    // history sits naturally inside the AABB get the user's α (smooth
+    // temporal). Avoids the multi-frame "fade in" of new shadows / bounces.
+    let aabb_size = length(hi - lo) + 1e-4;
+    let clamp_distance = length(history - clamped);
+    let confidence = 1.0 - smoothstep(0.0, aabb_size * 0.5, clamp_distance);
+    let effective_alpha = mix(1.0, u.alpha, confidence);
+    return mix(clamped, current, effective_alpha);
 }

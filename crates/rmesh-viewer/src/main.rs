@@ -54,15 +54,14 @@ use gpu_state::*;
 
 /// Create an Rgba32Float texture for copying the raytrace buffer output to blit.
 /// Hard-fail when the loaded PbrData is missing the parametric BRDF channels
-/// (metallic / f0_dielectric / retro / albedo / roughness). This is what we'd
-/// see for a .rmesh file produced by an old `convert.py` (env_feature/MLP era);
+/// (metallic / f0_dielectric / albedo / roughness). This is what we'd see
+/// for a .rmesh file produced by an old `convert.py` (env_feature/MLP era);
 /// the deferred shader has no way to render those, so refuse to upload garbage.
 fn require_parametric_pbr(pbr: &rmesh_data::PbrData, tet_count: usize) {
     let lens = [
         ("roughness",     pbr.roughness.len()),
         ("metallic",      pbr.metallic.len()),
         ("f0_dielectric", pbr.f0_dielectric.len()),
-        ("retro",         pbr.retro.len()),
         ("albedo",        pbr.albedo.len() / 3),
     ];
     let bad: Vec<_> = lens.iter().filter(|(_, l)| *l != tet_count).collect();
@@ -75,7 +74,7 @@ fn require_parametric_pbr(pbr: &rmesh_data::PbrData, tet_count: usize) {
             "PBR data missing parametric BRDF channels for {} tets ({}). \
              This .rmesh was likely produced with an older convert.py — \
              regenerate it with the parametric-BRDF convert.py that emits \
-             metallic / f0_dielectric / retro tagged sections.",
+             metallic / f0_dielectric tagged sections.",
             tet_count, detail,
         );
     }
@@ -141,6 +140,7 @@ struct App {
     /// History blend factor: 1.0 = no temporal accumulation, 0.0 = frozen.
     ssgi_temporal_alpha: f32,
     ao_temporal_alpha: f32,
+    ssr_temporal_alpha: f32,
     /// Previous frame's view-projection (for inline camera motion vectors).
     prev_view_proj: glam::Mat4,
     dsm_query_depth: f32,
@@ -181,8 +181,8 @@ impl App {
             pending_load: None,
             vsync: true,
             // Default to IntervalShader when PBR data is loaded — only this
-            // path runs interval_fragment.wgsl, which writes the metallic/F0/
-            // retro channels the deferred shader expects. Other modes write
+            // path runs interval_fragment.wgsl, which writes the metallic/F0
+            // channels the deferred shader expects. Other modes write
             // legacy (t_min, t_max, od, dist) into aux0 and the deferred shader
             // would misread them as PBR values (metallic ≈ t_max → all green).
             render_mode: if pbr.is_some() { RenderMode::IntervalShader } else { RenderMode::Regular },
@@ -191,7 +191,7 @@ impl App {
             fluid_params: FluidParams::default(),
             show_primitives: true,
             show_scene: true,
-            sort_16bit: true,
+            sort_16bit: false,
             interaction: TransformInteraction::new(),
             primitives: Vec::new(),
             next_primitive_id: 1,
@@ -207,6 +207,7 @@ impl App {
             ssgi_radius: 1.5,
             ssgi_temporal_alpha: 0.2,
             ao_temporal_alpha: 0.2,
+            ssr_temporal_alpha: 0.2,
             prev_view_proj: glam::Mat4::IDENTITY,
             dsm_query_depth: 1.0,
             cached_dsm_lights: Vec::new(),
@@ -372,21 +373,19 @@ impl App {
         });
         let sh_degree = self.sh_coeffs.degree;
 
-        // Upload PBR aux data if available: [M * 8] f32 packed as
-        //   [roughness, metallic, f0_dielectric, retro, _unused, albedo.rgb]
+        // Upload PBR aux data if available: [M * 6] f32 packed as
+        //   [roughness, metallic, f0_dielectric, albedo.r, albedo.g, albedo.b]
         // Matches the parametric BRDF format produced by convert.py.
         let aux_data_buf = if let Some(ref pbr) = self.pbr_data {
             let tet_count = self.scene_data.tet_count as usize;
             require_parametric_pbr(pbr, tet_count);
-            let mut aux = vec![0.0f32; tet_count * 8];
+            let mut aux = vec![0.0f32; tet_count * 6];
             for t in 0..tet_count {
-                aux[t * 8 + 0] = pbr.roughness[t];
-                aux[t * 8 + 1] = pbr.metallic[t];
-                aux[t * 8 + 2] = pbr.f0_dielectric[t];
-                aux[t * 8 + 3] = pbr.retro[t];
-                aux[t * 8 + 4] = 0.0;
+                aux[t * 6 + 0] = pbr.roughness[t];
+                aux[t * 6 + 1] = pbr.metallic[t];
+                aux[t * 6 + 2] = pbr.f0_dielectric[t];
                 for c in 0..3 {
-                    aux[t * 8 + 5 + c] = pbr.albedo[t * 3 + c];
+                    aux[t * 6 + 3 + c] = pbr.albedo[t * 3 + c];
                 }
             }
             // Override vertex normals from PBR data
@@ -644,7 +643,25 @@ impl App {
             &hiz_texture.full_view,
         );
 
-        // Clear history textures on first frame so SSGI/AO temporal reads
+        // SSR pipeline + temporal (third TemporalPipeline instance, Rgba16Float).
+        let ssr_pipeline = rmesh_render::SsrPipeline::new(&device);
+        let ssr_bg = rmesh_render::create_ssr_bind_group(
+            &device, &ssr_pipeline,
+            &hiz_texture.full_view,
+            &targets.normals_view,
+            &targets.lit_history_view,
+            &targets.ssgi_view,
+            &targets.depth_view,
+        );
+        let ssr_temporal_pipeline = rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::Rgba16Float);
+        let ssr_temporal_bg = rmesh_render::create_temporal_bind_group(
+            &device, &ssr_temporal_pipeline,
+            &targets.ssr_view,
+            &targets.ssr_history_view,
+            &hiz_texture.full_view,
+        );
+
+        // Clear history textures on first frame so SSGI/AO/SSR temporal reads
         // are deterministic. Without this, contents are vendor-defined.
         {
             let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -654,6 +671,12 @@ impl App {
             rmesh_render::clear_texture_view(&mut enc, &targets.lit_history_view, black);
             rmesh_render::clear_texture_view(&mut enc, &targets.ssgi_history_view, black);
             rmesh_render::clear_texture_view(&mut enc, &targets.ao_history_view, black);
+            rmesh_render::clear_texture_view(&mut enc, &targets.ssr_history_view, black);
+            // Clear ssr_view too so the very first deferred read is deterministic
+            // (the SSR pass runs every frame, but its output goes through the
+            // temporal copy back to ssr_view — first frame's pre-temporal value
+            // is fine, but cleared seed avoids any vendor-defined garbage).
+            rmesh_render::clear_texture_view(&mut enc, &targets.ssr_view, black);
             queue.submit(std::iter::once(enc.finish()));
         }
 
@@ -662,7 +685,7 @@ impl App {
         let (deferred_pipeline, deferred_bg, deferred_output, deferred_output_view, deferred_blit_bg, deferred_dsm_dummy_bg) = if has_pbr {
             log::info!("Creating deferred PBR shading pipeline...");
             let dp = rmesh_render::DeferredShadePipeline::new(&device, color_format);
-            let bg = rmesh_render::create_deferred_bind_group(&device, &dp, &targets, &primitive_targets.depth_view, &targets.ao_view, &targets.ssgi_view, &targets.lit_history_view);
+            let bg = rmesh_render::create_deferred_bind_group(&device, &dp, &targets, &primitive_targets.depth_view, &targets.ao_view, &targets.ssgi_view, &targets.lit_history_view, &targets.ssr_view);
             // Dummy DSM bind group (1x1 atlas, no lights)
             let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&device);
             let dummy_dsm_bg = rmesh_render::create_deferred_dsm_bind_group(
@@ -853,6 +876,10 @@ impl App {
             ssgi_temporal_bg,
             ao_temporal_pipeline,
             ao_temporal_bg,
+            ssr_pipeline,
+            ssr_bg,
+            ssr_temporal_pipeline,
+            ssr_temporal_bg,
             frame_counter: 0,
             deferred_output,
             deferred_output_view,
@@ -1064,18 +1091,16 @@ impl App {
             // Upload PBR aux data if available
             gpu.has_pbr_data = self.pbr_data.is_some();
             if let Some(ref pbr) = self.pbr_data {
-                // Aux layout: [roughness, metallic, f0_dielectric, retro, _unused, albedo.rgb]
+                // Aux layout: [roughness, metallic, f0_dielectric, albedo.r, albedo.g, albedo.b]
                 let tc = self.scene_data.tet_count as usize;
                 require_parametric_pbr(pbr, tc);
-                let mut aux = vec![0.0f32; tc * 8];
+                let mut aux = vec![0.0f32; tc * 6];
                 for t in 0..tc {
-                    aux[t * 8 + 0] = pbr.roughness[t];
-                    aux[t * 8 + 1] = pbr.metallic[t];
-                    aux[t * 8 + 2] = pbr.f0_dielectric[t];
-                    aux[t * 8 + 3] = pbr.retro[t];
-                    aux[t * 8 + 4] = 0.0;
+                    aux[t * 6 + 0] = pbr.roughness[t];
+                    aux[t * 6 + 1] = pbr.metallic[t];
+                    aux[t * 6 + 2] = pbr.f0_dielectric[t];
                     for c in 0..3 {
-                        aux[t * 8 + 5 + c] = pbr.albedo[t * 3 + c];
+                        aux[t * 6 + 3 + c] = pbr.albedo[t * 3 + c];
                     }
                 }
                 if !pbr.vertex_normals.is_empty() {
@@ -1094,7 +1119,7 @@ impl App {
                 // Recreate deferred pipeline
                 let color_format = wgpu::TextureFormat::Rgba16Float;
                 let dp = rmesh_render::DeferredShadePipeline::new(&gpu.device, color_format);
-                gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(&gpu.device, &dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view, &gpu.targets.ssgi_view, &gpu.targets.lit_history_view));
+                gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(&gpu.device, &dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view, &gpu.targets.ssgi_view, &gpu.targets.lit_history_view, &gpu.targets.ssr_view));
                 // Reset DSM state (will be regenerated on next frame with lights)
                 let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&gpu.device);
                 gpu.deferred_dsm_dummy_bg = Some(rmesh_render::create_deferred_dsm_bind_group(
@@ -1300,6 +1325,22 @@ impl App {
                 &gpu.hiz_texture.full_view,
             );
 
+            // Recreate SSR + SSR temporal bind groups.
+            gpu.ssr_bg = rmesh_render::create_ssr_bind_group(
+                &gpu.device, &gpu.ssr_pipeline,
+                &gpu.hiz_texture.full_view,
+                &gpu.targets.normals_view,
+                &gpu.targets.lit_history_view,
+                &gpu.targets.ssgi_view,
+                &gpu.targets.depth_view,
+            );
+            gpu.ssr_temporal_bg = rmesh_render::create_temporal_bind_group(
+                &gpu.device, &gpu.ssr_temporal_pipeline,
+                &gpu.targets.ssr_view,
+                &gpu.targets.ssr_history_view,
+                &gpu.hiz_texture.full_view,
+            );
+
             // Re-clear history textures (resize gives new vendor-defined contents).
             {
                 let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1309,13 +1350,15 @@ impl App {
                 rmesh_render::clear_texture_view(&mut enc, &gpu.targets.lit_history_view, black);
                 rmesh_render::clear_texture_view(&mut enc, &gpu.targets.ssgi_history_view, black);
                 rmesh_render::clear_texture_view(&mut enc, &gpu.targets.ao_history_view, black);
+                rmesh_render::clear_texture_view(&mut enc, &gpu.targets.ssr_history_view, black);
+                rmesh_render::clear_texture_view(&mut enc, &gpu.targets.ssr_view, black);
                 gpu.queue.submit(std::iter::once(enc.finish()));
             }
 
             // Recreate deferred resources since MRT texture views changed
             if let Some(ref dp) = gpu.deferred_pipeline {
                 gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(
-                    &gpu.device, dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view, &gpu.targets.ssgi_view, &gpu.targets.lit_history_view,
+                    &gpu.device, dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view, &gpu.targets.ssgi_view, &gpu.targets.lit_history_view, &gpu.targets.ssr_view,
                 ));
                 let out_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("deferred_output"),

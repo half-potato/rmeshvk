@@ -53,6 +53,7 @@ const HIZ_DOWNSAMPLE_WGSL: &str = include_str!("wgsl/hiz_downsample.wgsl");
 const AO_BILATERAL_WGSL: &str = include_str!("wgsl/ao_bilateral.wgsl");
 const SSGI_COMPUTE_WGSL: &str = include_str!("wgsl/ssgi_compute.wgsl");
 const SSGI_BILATERAL_WGSL: &str = include_str!("wgsl/ssgi_bilateral.wgsl");
+const SSR_COMPUTE_WGSL: &str = include_str!("wgsl/ssr_compute.wgsl");
 const TEMPORAL_WGSL: &str = include_str!("wgsl/temporal.wgsl");
 
 // ---------------------------------------------------------------------------
@@ -1546,6 +1547,16 @@ pub struct RenderTargets {
     /// Previous frame's true lit ("lit history") for SSGI to sample. Updated
     /// each frame via texture-to-texture copy from `lit_current_texture`.
     pub lit_history_texture: wgpu::Texture,
+    /// SSR radiance (Rgba16Float, RGB = sampled radiance along reflection
+    /// direction). Final post-temporal value lands here and is consumed by
+    /// the deferred shader.
+    pub ssr_texture: wgpu::Texture,
+    /// SSR temporal-pass output. Sits between SSR compute and the per-frame
+    /// copy-back into `ssr_texture`.
+    pub ssr_temporal_texture: wgpu::Texture,
+    /// SSR history (previous frame's post-temporal SSR). Sampled by the
+    /// SSR temporal pass for reprojection.
+    pub ssr_history_texture: wgpu::Texture,
     /// View into color texture
     pub color_view: wgpu::TextureView,
     /// View into aux texture
@@ -1567,6 +1578,9 @@ pub struct RenderTargets {
     pub ao_history_view: wgpu::TextureView,
     pub lit_current_view: wgpu::TextureView,
     pub lit_history_view: wgpu::TextureView,
+    pub ssr_view: wgpu::TextureView,
+    pub ssr_temporal_view: wgpu::TextureView,
+    pub ssr_history_view: wgpu::TextureView,
     pub width: u32,
     pub height: u32,
 }
@@ -1706,6 +1720,15 @@ impl RenderTargets {
         let lit_history_texture = make_target("lit_history", wgpu::TextureFormat::Rgba16Float, cdst);
         let ao_temporal_texture = make_target("ao_temporal", wgpu::TextureFormat::R8Unorm, none);
         let ao_history_texture = make_target("ao_history", wgpu::TextureFormat::R8Unorm, cdst);
+        // ssr_view receives the temporal copy AND is the source of the
+        // history copy each frame, so it needs both COPY_DST and COPY_SRC.
+        let ssr_texture = make_target(
+            "ssr",
+            wgpu::TextureFormat::Rgba16Float,
+            csrc | cdst,
+        );
+        let ssr_temporal_texture = make_target("ssr_temporal", wgpu::TextureFormat::Rgba16Float, csrc);
+        let ssr_history_texture = make_target("ssr_history", wgpu::TextureFormat::Rgba16Float, cdst);
 
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let aux0_view = aux0_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1721,6 +1744,9 @@ impl RenderTargets {
         let ao_history_view = ao_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let lit_current_view = lit_current_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let lit_history_view = lit_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssr_view = ssr_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssr_temporal_view = ssr_temporal_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssr_history_view = ssr_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
         Self {
             color_texture,
             aux0_texture,
@@ -1736,6 +1762,9 @@ impl RenderTargets {
             ao_history_texture,
             lit_current_texture,
             lit_history_texture,
+            ssr_texture,
+            ssr_temporal_texture,
+            ssr_history_texture,
             color_view,
             aux0_view,
             normals_view,
@@ -1750,6 +1779,9 @@ impl RenderTargets {
             ao_history_view,
             lit_current_view,
             lit_history_view,
+            ssr_view,
+            ssr_temporal_view,
+            ssr_history_view,
             width,
             height,
         }
@@ -4826,6 +4858,17 @@ impl DeferredShadePipeline {
                     },
                     count: None,
                 },
+                // 10: SSR radiance (Rgba16Float, sampled along reflect(V, N))
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -4965,6 +5008,7 @@ pub fn create_deferred_bind_group(
     ao_view: &wgpu::TextureView,
     ssgi_view: &wgpu::TextureView,
     lit_history_view: &wgpu::TextureView,
+    ssr_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("deferred_shade_bg"),
@@ -5009,6 +5053,10 @@ pub fn create_deferred_bind_group(
             wgpu::BindGroupEntry {
                 binding: 9,
                 resource: wgpu::BindingResource::TextureView(lit_history_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(ssr_view),
             },
         ],
     })
@@ -6086,6 +6134,210 @@ pub fn record_ssgi_blur_pass(
         ..Default::default()
     });
     rpass.set_pipeline(&blur.pipeline);
+    rpass.set_bind_group(0, bind_group, &[]);
+    rpass.draw(0..3, 0..1);
+}
+
+// ===========================================================================
+// SSR — single Hi-Z ray-march along reflect(view, N). Sharp specular
+// reflections for low-roughness materials; rougher surfaces fall back to
+// the SSGI hemi-average via the deferred shader's smoothness² mix.
+// ===========================================================================
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SsrUniforms {
+    pub inv_proj: [[f32; 4]; 4],
+    pub proj:     [[f32; 4]; 4],
+    pub view:     [[f32; 4]; 4],
+    pub inv_view: [[f32; 4]; 4],
+    pub width: u32,
+    pub height: u32,
+    pub near: f32,
+    pub far: f32,
+    pub max_mip: u32,
+    pub frame: u32,
+    pub radius_world: f32,
+    pub thickness: f32,
+    pub sky_color: [f32; 3],
+    pub _pad0: f32,
+    pub ground_color: [f32; 3],
+    pub _pad1: f32,
+}
+
+pub struct SsrPipeline {
+    pub pipeline: wgpu::RenderPipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+    pub uniforms_buf: wgpu::Buffer,
+}
+
+impl SsrPipeline {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ssr_compute.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(SSR_COMPUTE_WGSL.into()),
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssr_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 4: SSGI view — used as the soft miss fallback so single-ray
+                // SSR misses don't visually pop against hits.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 5: Volume depth MRT (E[z]·α, 0, E[z²]·α, α) — drives the
+                // per-pixel σ used to jitter the reflection origin.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ssr_pl"),
+            bind_group_layouts: &[&bgl],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ssr_pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ssr_uniforms"),
+            size: std::mem::size_of::<SsrUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self { pipeline, bind_group_layout: bgl, uniforms_buf }
+    }
+}
+
+pub fn create_ssr_bind_group(
+    device: &wgpu::Device,
+    ssr: &SsrPipeline,
+    hiz_full_view: &wgpu::TextureView,
+    normals_view: &wgpu::TextureView,
+    lit_history_view: &wgpu::TextureView,
+    ssgi_view: &wgpu::TextureView,
+    volume_depth_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("ssr_bg"),
+        layout: &ssr.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: ssr.uniforms_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(hiz_full_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(normals_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(lit_history_view) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(ssgi_view) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(volume_depth_view) },
+        ],
+    })
+}
+
+pub fn record_ssr_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    ssr: &SsrPipeline,
+    bind_group: &wgpu::BindGroup,
+    out_view: &wgpu::TextureView,
+) {
+    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("ssr_pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: out_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    });
+    rpass.set_pipeline(&ssr.pipeline);
     rpass.set_bind_group(0, bind_group, &[]);
     rpass.draw(0..3, 0..1);
 }

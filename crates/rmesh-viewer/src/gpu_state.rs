@@ -188,6 +188,12 @@ pub struct GpuState {
     pub ssgi_temporal_bg: wgpu::BindGroup,
     pub ao_temporal_pipeline: rmesh_render::TemporalPipeline,
     pub ao_temporal_bg: wgpu::BindGroup,
+    /// SSR (specular reflections via Hi-Z reflection-direction ray-march) +
+    /// its temporal pipeline (third instance of TemporalPipeline, Rgba16Float).
+    pub ssr_pipeline: rmesh_render::SsrPipeline,
+    pub ssr_bg: wgpu::BindGroup,
+    pub ssr_temporal_pipeline: rmesh_render::TemporalPipeline,
+    pub ssr_temporal_bg: wgpu::BindGroup,
     /// Frame counter for SSGI per-pixel jitter rotation.
     pub frame_counter: u32,
     /// Separate output texture for deferred pass (can't read+write color_view simultaneously)
