@@ -138,6 +138,11 @@ struct App {
     gtao_radius: f32,
     ssgi_strength: f32,
     ssgi_radius: f32,
+    /// History blend factor: 1.0 = no temporal accumulation, 0.0 = frozen.
+    ssgi_temporal_alpha: f32,
+    ao_temporal_alpha: f32,
+    /// Previous frame's view-projection (for inline camera motion vectors).
+    prev_view_proj: glam::Mat4,
     dsm_query_depth: f32,
     /// Cached light state for DSM dirty detection.
     cached_dsm_lights: Vec<rmesh_render::GpuLight>,
@@ -200,6 +205,9 @@ impl App {
             gtao_radius: 0.5,
             ssgi_strength: 1.0,
             ssgi_radius: 1.5,
+            ssgi_temporal_alpha: 0.2,
+            ao_temporal_alpha: 0.2,
+            prev_view_proj: glam::Mat4::IDENTITY,
             dsm_query_depth: 1.0,
             cached_dsm_lights: Vec::new(),
             cached_dsm_num_lights: 0,
@@ -575,13 +583,14 @@ impl App {
             &targets.depth_view,
         );
 
-        // AO bilateral blur (separable, depth+normal aware). H reads ao_view
-        // → writes ao_blur_temp_view; V reads ao_blur_temp_view → writes ao_view.
+        // AO bilateral blur (separable, depth+normal aware). With temporal
+        // accumulation in front of it, H reads ao_temporal_view (the
+        // temporal-blended AO) and V writes back to ao_view (final).
         let ao_blur_pipeline = rmesh_render::AoBlurPipeline::new(&device);
         let ao_blur_bg_h = rmesh_render::create_ao_blur_bind_group(
             &device, &ao_blur_pipeline,
             &ao_blur_pipeline.uniforms_h,
-            &targets.ao_view,
+            &targets.ao_temporal_view,
             &hiz_texture.full_view,
             &targets.normals_view,
         );
@@ -601,11 +610,13 @@ impl App {
             &targets.normals_view,
             &targets.lit_history_view,
         );
+        // SSGI blur reads the temporal-blended SSGI (ssgi_temporal_view), not
+        // the raw ssgi_view. V still writes back to ssgi_view (final).
         let ssgi_blur_pipeline = rmesh_render::SsgiBlurPipeline::new(&device);
         let ssgi_blur_bg_h = rmesh_render::create_ssgi_blur_bind_group(
             &device, &ssgi_blur_pipeline,
             &ssgi_blur_pipeline.uniforms_h,
-            &targets.ssgi_view,
+            &targets.ssgi_temporal_view,
             &hiz_texture.full_view,
             &targets.normals_view,
         );
@@ -617,12 +628,41 @@ impl App {
             &targets.normals_view,
         );
 
+        // Temporal accumulation pipelines (one per output format).
+        let ssgi_temporal_pipeline = rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::Rgba16Float);
+        let ssgi_temporal_bg = rmesh_render::create_temporal_bind_group(
+            &device, &ssgi_temporal_pipeline,
+            &targets.ssgi_view,
+            &targets.ssgi_history_view,
+            &hiz_texture.full_view,
+        );
+        let ao_temporal_pipeline = rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::R8Unorm);
+        let ao_temporal_bg = rmesh_render::create_temporal_bind_group(
+            &device, &ao_temporal_pipeline,
+            &targets.ao_view,
+            &targets.ao_history_view,
+            &hiz_texture.full_view,
+        );
+
+        // Clear history textures on first frame so SSGI/AO temporal reads
+        // are deterministic. Without this, contents are vendor-defined.
+        {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("history_init_clear"),
+            });
+            let black = wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+            rmesh_render::clear_texture_view(&mut enc, &targets.lit_history_view, black);
+            rmesh_render::clear_texture_view(&mut enc, &targets.ssgi_history_view, black);
+            rmesh_render::clear_texture_view(&mut enc, &targets.ao_history_view, black);
+            queue.submit(std::iter::once(enc.finish()));
+        }
+
         // Deferred PBR shading pipeline (only when PBR data is loaded)
         let has_pbr = self.pbr_data.is_some();
         let (deferred_pipeline, deferred_bg, deferred_output, deferred_output_view, deferred_blit_bg, deferred_dsm_dummy_bg) = if has_pbr {
             log::info!("Creating deferred PBR shading pipeline...");
             let dp = rmesh_render::DeferredShadePipeline::new(&device, color_format);
-            let bg = rmesh_render::create_deferred_bind_group(&device, &dp, &targets, &primitive_targets.depth_view, &targets.ao_view, &targets.ssgi_view);
+            let bg = rmesh_render::create_deferred_bind_group(&device, &dp, &targets, &primitive_targets.depth_view, &targets.ao_view, &targets.ssgi_view, &targets.lit_history_view);
             // Dummy DSM bind group (1x1 atlas, no lights)
             let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&device);
             let dummy_dsm_bg = rmesh_render::create_deferred_dsm_bind_group(
@@ -809,6 +849,10 @@ impl App {
             ssgi_blur_pipeline,
             ssgi_blur_bg_h,
             ssgi_blur_bg_v,
+            ssgi_temporal_pipeline,
+            ssgi_temporal_bg,
+            ao_temporal_pipeline,
+            ao_temporal_bg,
             frame_counter: 0,
             deferred_output,
             deferred_output_view,
@@ -1050,7 +1094,7 @@ impl App {
                 // Recreate deferred pipeline
                 let color_format = wgpu::TextureFormat::Rgba16Float;
                 let dp = rmesh_render::DeferredShadePipeline::new(&gpu.device, color_format);
-                gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(&gpu.device, &dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view, &gpu.targets.ssgi_view));
+                gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(&gpu.device, &dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view, &gpu.targets.ssgi_view, &gpu.targets.lit_history_view));
                 // Reset DSM state (will be regenerated on next frame with lights)
                 let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&gpu.device);
                 gpu.deferred_dsm_dummy_bg = Some(rmesh_render::create_deferred_dsm_bind_group(
@@ -1204,11 +1248,11 @@ impl App {
                 &gpu.targets.depth_view,
             );
 
-            // Recreate AO blur bind groups (texture views changed).
+            // Recreate AO blur bind groups. H reads ao_temporal_view (post-temporal).
             gpu.ao_blur_bg_h = rmesh_render::create_ao_blur_bind_group(
                 &gpu.device, &gpu.ao_blur_pipeline,
                 &gpu.ao_blur_pipeline.uniforms_h,
-                &gpu.targets.ao_view,
+                &gpu.targets.ao_temporal_view,
                 &gpu.hiz_texture.full_view,
                 &gpu.targets.normals_view,
             );
@@ -1220,7 +1264,7 @@ impl App {
                 &gpu.targets.normals_view,
             );
 
-            // Recreate SSGI bind groups.
+            // Recreate SSGI bind groups. H reads ssgi_temporal_view (post-temporal).
             gpu.ssgi_bg = rmesh_render::create_ssgi_bind_group(
                 &gpu.device, &gpu.ssgi_pipeline,
                 &gpu.hiz_texture.full_view,
@@ -1230,7 +1274,7 @@ impl App {
             gpu.ssgi_blur_bg_h = rmesh_render::create_ssgi_blur_bind_group(
                 &gpu.device, &gpu.ssgi_blur_pipeline,
                 &gpu.ssgi_blur_pipeline.uniforms_h,
-                &gpu.targets.ssgi_view,
+                &gpu.targets.ssgi_temporal_view,
                 &gpu.hiz_texture.full_view,
                 &gpu.targets.normals_view,
             );
@@ -1242,10 +1286,36 @@ impl App {
                 &gpu.targets.normals_view,
             );
 
+            // Recreate temporal bind groups (input/history views changed).
+            gpu.ssgi_temporal_bg = rmesh_render::create_temporal_bind_group(
+                &gpu.device, &gpu.ssgi_temporal_pipeline,
+                &gpu.targets.ssgi_view,
+                &gpu.targets.ssgi_history_view,
+                &gpu.hiz_texture.full_view,
+            );
+            gpu.ao_temporal_bg = rmesh_render::create_temporal_bind_group(
+                &gpu.device, &gpu.ao_temporal_pipeline,
+                &gpu.targets.ao_view,
+                &gpu.targets.ao_history_view,
+                &gpu.hiz_texture.full_view,
+            );
+
+            // Re-clear history textures (resize gives new vendor-defined contents).
+            {
+                let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("history_resize_clear"),
+                });
+                let black = wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+                rmesh_render::clear_texture_view(&mut enc, &gpu.targets.lit_history_view, black);
+                rmesh_render::clear_texture_view(&mut enc, &gpu.targets.ssgi_history_view, black);
+                rmesh_render::clear_texture_view(&mut enc, &gpu.targets.ao_history_view, black);
+                gpu.queue.submit(std::iter::once(enc.finish()));
+            }
+
             // Recreate deferred resources since MRT texture views changed
             if let Some(ref dp) = gpu.deferred_pipeline {
                 gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(
-                    &gpu.device, dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view, &gpu.targets.ssgi_view,
+                    &gpu.device, dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view, &gpu.targets.ssgi_view, &gpu.targets.lit_history_view,
                 ));
                 let out_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("deferred_output"),

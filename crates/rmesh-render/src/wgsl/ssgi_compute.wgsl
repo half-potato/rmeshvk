@@ -137,6 +137,9 @@ fn march_ray(p_origin_view: vec3f, d_view: vec3f, t_max: f32, jitter: f32) -> Ra
     let uv1 = s1.xy;
     let z0  = s0.z;
     let z1  = s1.z;
+    // #8 Perspective-correct z along the ray: interpolate 1/z, not z.
+    let inv_z0 = 1.0 / max(z0, u.near);
+    let inv_z1 = 1.0 / max(z1, u.near);
 
     // Average pixel stride across the ray; used to pick the starting Hi-Z mip.
     let dim = vec2f(f32(u.width), f32(u.height));
@@ -152,22 +155,39 @@ fn march_ray(p_origin_view: vec3f, d_view: vec3f, t_max: f32, jitter: f32) -> Ra
             r.color = hemi_fallback(normalize(world_dir));
             return r;
         }
-        // Linear-Z interpolation; a perspective-correct version would interpolate
-        // 1/z, but for short SSGI rays the difference is small.
-        let z_ray = mix(z0, z1, t);
+        let z_ray = 1.0 / mix(inv_z0, inv_z1, t);
         // Pick mip from this step's pixel stride along the ray.
         let stride = max(pix_len * (t - prev_t), 1.0);
-        prev_t = t;
         let mip = u32(clamp(floor(log2(stride)), 0.0, f32(u.max_mip)));
         let z_hiz = hiz_load(uv_t, mip);
-        if (z_hiz >= Z_SKY_HALF) { continue; }   // sky cell, no occluder
-        if (z_ray > z_hiz && z_ray < z_hiz + u.thickness) {
-            // Hit! Read previous-frame radiance at this uv.
+        // #7 Depth-relative thickness: floor at u.thickness for near-camera
+        // rays, scale with depth for distant ones.
+        let thick = max(u.thickness, z_ray * 0.05);
+        if (z_hiz < Z_SKY_HALF && z_ray > z_hiz && z_ray < z_hiz + thick) {
+            // #4 Coarse hit found in cell at `mip`. Refine to mip 0 within
+            // the current segment [prev_t, t] via 6-step bisection so the
+            // sample point isn't off by up to a mip-cell width.
+            var lo = prev_t;
+            var hi = t;
+            for (var k: u32 = 0u; k < 6u; k = k + 1u) {
+                let mid = 0.5 * (lo + hi);
+                let uv_m = mix(uv0, uv1, mid);
+                let z_m  = 1.0 / mix(inv_z0, inv_z1, mid);
+                let z_h  = hiz_load(uv_m, 0u);
+                let thick_m = max(u.thickness, z_m * 0.05);
+                if (z_h < Z_SKY_HALF && z_m > z_h && z_m < z_h + thick_m) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            let uv_hit = mix(uv0, uv1, hi);
             let dim_i = vec2i(textureDimensions(lit_history_tex));
-            let c = vec2i(clamp(uv_t * vec2f(dim_i), vec2f(0.0), vec2f(dim_i - vec2i(1, 1))));
+            let c = vec2i(clamp(uv_hit * vec2f(dim_i), vec2f(0.0), vec2f(dim_i - vec2i(1, 1))));
             r.color = textureLoad(lit_history_tex, c, 0).rgb;
             return r;
         }
+        prev_t = t;
     }
 
     // Reached max steps without a hit → fall back to hemi.
@@ -212,8 +232,10 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
         let dir_t = cosine_sample_hemisphere(hxy);          // tangent space
         let dir_v = normalize(tbn * dir_t);                 // view space
 
-        // Tiny offset along the normal to avoid self-hit at the origin pixel.
-        let p_o = p_view + n_view * 0.001;
+        // #9 Self-hit bias scales with view-space depth so it stays
+        // appropriate at any scene scale.
+        let bias = abs(p_view.z) * 5e-4;
+        let p_o = p_view + n_view * bias;
         let res = march_ray(p_o, dir_v, u.radius_world, step_jit);
         sum = sum + res.color;
     }

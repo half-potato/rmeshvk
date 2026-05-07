@@ -182,6 +182,12 @@ pub struct GpuState {
     pub ssgi_blur_pipeline: rmesh_render::SsgiBlurPipeline,
     pub ssgi_blur_bg_h: wgpu::BindGroup,
     pub ssgi_blur_bg_v: wgpu::BindGroup,
+    /// Temporal accumulation pipelines for SSGI (Rgba16Float) and AO (R8Unorm).
+    /// One shared shader, two pipelines per output format.
+    pub ssgi_temporal_pipeline: rmesh_render::TemporalPipeline,
+    pub ssgi_temporal_bg: wgpu::BindGroup,
+    pub ao_temporal_pipeline: rmesh_render::TemporalPipeline,
+    pub ao_temporal_bg: wgpu::BindGroup,
     /// Frame counter for SSGI per-pixel jitter rotation.
     pub frame_counter: u32,
     /// Separate output texture for deferred pass (can't read+write color_view simultaneously)

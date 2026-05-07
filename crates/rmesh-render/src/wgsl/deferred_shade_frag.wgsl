@@ -72,6 +72,7 @@ struct ShadowLight {
 @group(0) @binding(6) var hw_depth_tex: texture_depth_2d; // hardware depth buffer
 @group(0) @binding(7) var ao_tex: texture_2d<f32>;        // R8Unorm GTAO output
 @group(0) @binding(8) var ssgi_tex: texture_2d<f32>;      // Rgba16Float SSGI radiance
+@group(0) @binding(9) var lit_history_tex: texture_2d<f32>; // Rgba16Float, prev frame's deferred output
 
 // Group 1: DSM shadow cubemap
 @group(1) @binding(0) var dsm_rt0: texture_cube<f32>;
@@ -99,6 +100,7 @@ const DBG_PRIMITIVES:  u32 = 14u;
 const DBG_DSM:         u32 = 15u;
 const DBG_AO:          u32 = 16u;
 const DBG_SSGI:        u32 = 17u;
+const DBG_LIT_HISTORY: u32 = 18u;
 
 const PI: f32 = 3.14159265358979323846;
 const TWO_PI: f32 = 6.28318530717958647692;
@@ -211,8 +213,17 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     return out;
 }
 
+// Two outputs: the display target (where debug-mode visualizations land) and
+// the lit_history target (the true lit color, never overridden by debug
+// modes). Splitting them keeps the SSGI feedback chain valid even when the
+// user is staring at a debug view.
+struct DeferredOut {
+    @location(0) display: vec4f,
+    @location(1) lit:     vec4f,
+}
+
 @fragment
-fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
+fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let coords = vec2u(u32(frag_coord.x), u32(frag_coord.y));
 
     // Load MRT textures
@@ -226,7 +237,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
 
     let alpha = color_raw.a;
     if (alpha < 0.01) {
-        return vec4f(0.0, 0.0, 0.0, 0.0);
+        return DeferredOut(vec4f(0.0, 0.0, 0.0, 0.0), vec4f(0.0, 0.0, 0.0, 0.0));
     }
 
     // Un-premultiply
@@ -334,7 +345,6 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
         total_diffuse  += diff_base * NoL * energy * l_color;
         total_specular += spec      * NoL * energy * l_color;
     }
-    total_specular = 0*total_specular;
     // Hemispherical ambient × AO. Energy split mirrors the per-light path:
     // diffuse ambient is gated by `kd` (so metals get no ambient diffuse),
     // and a cheap ambient specular (`F_view·hemi`) gives metals a tinted
@@ -349,13 +359,23 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let ambient_diffuse_const = kd * albedo * hemi;
     let ambient_diffuse_ssgi  = kd * albedo * ssgi_indirect;
     let ambient_diffuse = mix(ambient_diffuse_const, ambient_diffuse_ssgi, uniforms.ssgi_strength);
-    let ambient_specular = F_view * hemi;
-    // let ambient_term = uniforms.ambient * (ambient_diffuse + ambient_specular) * ao_factor;
-    let ambient_term = uniforms.ambient * (ambient_diffuse) * ao_factor;
+    // Specular ambient: same shape as the diffuse path, so metals (which have
+    // kd≈0 and rely entirely on F_view·env) actually reflect colored SSGI
+    // radiance from neighbors instead of just the constant sky/ground gradient.
+    // Approximation: SSGI is a hemisphere-averaged radiance, not the reflection
+    // direction — strictly correct only for rough materials. Mirrors want SSR.
+    let ambient_specular_const = F_view * hemi;
+    let ambient_specular_ssgi  = F_view * ssgi_indirect;
+    let ambient_specular = mix(ambient_specular_const, ambient_specular_ssgi, uniforms.ssgi_strength);
+    let ambient_term = uniforms.ambient * (ambient_diffuse + ambient_specular) * ao_factor;
 
     var lit = total_diffuse + total_specular + ambient_term;
-    // var final_color = aces_narkowicz(lit * uniforms.exposure);
-    var final_color = lit * uniforms.exposure;
+    var final_color = aces_narkowicz(lit * uniforms.exposure);
+
+    // Snapshot the true lit value for the lit_history feedback — this is what
+    // SSGI samples next frame. Must be taken BEFORE any debug-mode override
+    // below; otherwise the SSGI feedback chain gets poisoned with debug viz.
+    let lit_history_out = vec4f(max(final_color, vec3f(0.0)), alpha);
 
     // Debug mode overrides — bypass tonemap for visualizations
     let dm = uniforms.debug_mode;
@@ -406,6 +426,8 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     else if (dm == DBG_PRIMITIVES)  { /* final_color already correct — volume pass skipped on CPU */ }
     else if (dm == DBG_AO)          { final_color = vec3f(ao); }
     else if (dm == DBG_SSGI)        { final_color = ssgi_indirect; }
+    else if (dm == DBG_LIT_HISTORY) { final_color = textureLoad(lit_history_tex, coords, 0).rgb; }
 
-    return vec4f(max(final_color, vec3f(0.0)), alpha);
+    let display_out = vec4f(max(final_color, vec3f(0.0)), alpha);
+    return DeferredOut(display_out, lit_history_out);
 }

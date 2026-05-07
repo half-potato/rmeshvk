@@ -43,6 +43,9 @@ impl App {
         let view_mat = self.camera.view_matrix();
         let proj_mat = self.camera.projection_matrix(aspect);
         let vp = proj_mat * view_mat;
+        // Snapshot the previous frame's view-projection BEFORE any state
+        // update — the temporal pass needs it to reproject the history sample.
+        let prev_vp_snapshot = self.prev_view_proj;
 
         let inv_view = view_mat.inverse();
         let cam_right = inv_view.col(0).truncate();
@@ -216,6 +219,8 @@ impl App {
         let mut gtao_radius = self.gtao_radius;
         let mut ssgi_strength = self.ssgi_strength;
         let mut ssgi_radius = self.ssgi_radius;
+        let mut ssgi_temporal_alpha = self.ssgi_temporal_alpha;
+        let mut ao_temporal_alpha = self.ao_temporal_alpha;
         let mut deferred_debug_mode = self.deferred_debug_mode;
         let mut dsm_query_depth = self.dsm_query_depth;
         // Get mesh bbox for dynamic slider ranges
@@ -266,6 +271,8 @@ impl App {
                             ui.add(egui::Slider::new(&mut gtao_radius, 0.05..=2.0).logarithmic(true).text("AO Radius"));
                             ui.add(egui::Slider::new(&mut ssgi_strength, 0.0..=1.0).text("SSGI Strength"));
                             ui.add(egui::Slider::new(&mut ssgi_radius, 0.1..=5.0).logarithmic(true).text("SSGI Radius"));
+                            ui.add(egui::Slider::new(&mut ao_temporal_alpha, 0.0..=1.0).text("AO Temporal α"));
+                            ui.add(egui::Slider::new(&mut ssgi_temporal_alpha, 0.0..=1.0).text("SSGI Temporal α"));
                             ui.horizontal(|ui| {
                                 ui.label("Sky");
                                 ui.color_edit_button_rgb(&mut sky_color);
@@ -277,7 +284,7 @@ impl App {
                                 "Roughness", "PBR (M/F0/Retro)", "Depth", "Specular",
                                 "Diffuse", "Shadow", "Retro", "Lambda",
                                 "Plaster", "Alpha", "Primitives", "DSM",
-                                "AO", "SSGI",
+                                "AO", "SSGI", "Lit History",
                             ];
                             ui.separator();
                             ui.label("Debug Layer");
@@ -450,6 +457,10 @@ impl App {
         self.gtao_radius = gtao_radius;
         self.ssgi_strength = ssgi_strength;
         self.ssgi_radius = ssgi_radius;
+        self.ssgi_temporal_alpha = ssgi_temporal_alpha;
+        self.ao_temporal_alpha = ao_temporal_alpha;
+        // Track current vp so next frame's temporal pass can reproject.
+        self.prev_view_proj = vp;
         self.deferred_debug_mode = deferred_debug_mode;
         self.dsm_query_depth = dsm_query_depth;
 
@@ -1094,9 +1105,33 @@ impl App {
                     &mut encoder, &gpu.gtao_pipeline, &gpu.gtao_bg, &gpu.targets.ao_view,
                 );
 
-                // Bilateral AO blur (separable, depth+normal aware).
-                // sigma_z is in world units; scaled with the AO radius so the
-                // edge-stop loosens for larger AO and tightens for smaller AO.
+                // Per-frame matrices for the temporal pass: current inv_vp +
+                // previous-frame view-projection (inline camera motion vectors).
+                let cur_vp = vp;
+                let cur_inv_vp = cur_vp.inverse();
+                let prev_vp_mat = prev_vp_snapshot;
+
+                // AO temporal: ao_view + ao_history → ao_temporal_view
+                let ao_temporal_uniforms = rmesh_render::TemporalUniforms {
+                    inv_vp: cur_inv_vp.to_cols_array_2d(),
+                    prev_vp: prev_vp_mat.to_cols_array_2d(),
+                    width: w, height: h,
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    max_mip: gpu.hiz_texture.mip_count - 1,
+                    alpha: self.ao_temporal_alpha,
+                    _pad0: 0.0, _pad1: 0.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.ao_temporal_pipeline.uniforms_buf, 0,
+                    bytemuck::bytes_of(&ao_temporal_uniforms),
+                );
+                rmesh_render::record_temporal_pass(
+                    &mut encoder, &gpu.ao_temporal_pipeline, &gpu.ao_temporal_bg,
+                    &gpu.targets.ao_temporal_view,
+                );
+
+                // Bilateral AO blur — H reads ao_temporal_view, V writes ao_view.
                 let blur_h = rmesh_render::AoBlurUniforms {
                     dir_x: 1, dir_y: 0,
                     sigma_z: self.gtao_radius * 0.25,
@@ -1113,7 +1148,7 @@ impl App {
                 gpu.queue.write_buffer(
                     &gpu.ao_blur_pipeline.uniforms_v, 0, bytemuck::bytes_of(&blur_v),
                 );
-                // H: ao_view → ao_blur_temp_view
+                // H: ao_temporal_view → ao_blur_temp_view
                 rmesh_render::record_ao_blur_pass(
                     &mut encoder, &gpu.ao_blur_pipeline, &gpu.ao_blur_bg_h,
                     &gpu.targets.ao_blur_temp_view,
@@ -1122,6 +1157,23 @@ impl App {
                 rmesh_render::record_ao_blur_pass(
                     &mut encoder, &gpu.ao_blur_pipeline, &gpu.ao_blur_bg_v,
                     &gpu.targets.ao_view,
+                );
+
+                // Copy ao_view → ao_history for next frame's temporal pass.
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ao_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ao_history_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                 );
 
                 // SSGI: ray-march Hi-Z, sample lit_history at hits, denoise.
@@ -1156,6 +1208,26 @@ impl App {
                     &gpu.targets.ssgi_view,
                 );
 
+                // SSGI temporal: ssgi_view + ssgi_history → ssgi_temporal_view
+                let ssgi_temporal_uniforms = rmesh_render::TemporalUniforms {
+                    inv_vp: cur_inv_vp.to_cols_array_2d(),
+                    prev_vp: prev_vp_mat.to_cols_array_2d(),
+                    width: w, height: h,
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    max_mip: gpu.hiz_texture.mip_count - 1,
+                    alpha: self.ssgi_temporal_alpha,
+                    _pad0: 0.0, _pad1: 0.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.ssgi_temporal_pipeline.uniforms_buf, 0,
+                    bytemuck::bytes_of(&ssgi_temporal_uniforms),
+                );
+                rmesh_render::record_temporal_pass(
+                    &mut encoder, &gpu.ssgi_temporal_pipeline, &gpu.ssgi_temporal_bg,
+                    &gpu.targets.ssgi_temporal_view,
+                );
+
                 let ssgi_blur_h = rmesh_render::SsgiBlurUniforms {
                     dir_x: 1, dir_y: 0,
                     sigma_z: self.ssgi_radius * 0.5,
@@ -1172,7 +1244,7 @@ impl App {
                 gpu.queue.write_buffer(
                     &gpu.ssgi_blur_pipeline.uniforms_v, 0, bytemuck::bytes_of(&ssgi_blur_v),
                 );
-                // H: ssgi_view → ssgi_blur_temp_view
+                // H: ssgi_temporal_view → ssgi_blur_temp_view
                 rmesh_render::record_ssgi_blur_pass(
                     &mut encoder, &gpu.ssgi_blur_pipeline, &gpu.ssgi_blur_bg_h,
                     &gpu.targets.ssgi_blur_temp_view,
@@ -1183,34 +1255,54 @@ impl App {
                     &gpu.targets.ssgi_view,
                 );
 
-                // Record deferred shade pass — writes to separate output texture
+                // Copy ssgi_view → ssgi_history for next frame's temporal pass.
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ssgi_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ssgi_history_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+
+                // Record deferred shade pass — writes display to deferred_output
+                // (location 0) and the true lit value to lit_current (location 1).
+                // location-1 is immune to debug-mode override, so SSGI's feedback
+                // chain stays valid even while the user is staring at a debug
+                // visualization. We render to lit_current rather than lit_history
+                // because lit_history is sampled in the same pass (binding 9 for
+                // DBG_LIT_HISTORY) and wgpu disallows that combination.
                 let dsm_bg = gpu.deferred_dsm_bg.as_ref()
                     .or(gpu.deferred_dsm_dummy_bg.as_ref())
                     .unwrap();
                 rmesh_render::record_deferred_shade(
                     &mut encoder, deferred, bg, dsm_bg, out_view,
+                    &gpu.targets.lit_current_view,
                 );
 
-                // Copy this frame's lit output → lit_history for next-frame
-                // SSGI to sample. Texture-to-texture copy (no shader needed
-                // because formats match).
-                if let Some(ref out_tex) = gpu.deferred_output {
-                    encoder.copy_texture_to_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: out_tex,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &gpu.targets.lit_history_texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                    );
-                }
+                // Copy lit_current → lit_history for next frame's SSGI to sample.
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.lit_current_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.lit_history_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
             }
         }
 

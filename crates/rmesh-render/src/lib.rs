@@ -53,6 +53,7 @@ const HIZ_DOWNSAMPLE_WGSL: &str = include_str!("wgsl/hiz_downsample.wgsl");
 const AO_BILATERAL_WGSL: &str = include_str!("wgsl/ao_bilateral.wgsl");
 const SSGI_COMPUTE_WGSL: &str = include_str!("wgsl/ssgi_compute.wgsl");
 const SSGI_BILATERAL_WGSL: &str = include_str!("wgsl/ssgi_bilateral.wgsl");
+const TEMPORAL_WGSL: &str = include_str!("wgsl/temporal.wgsl");
 
 // ---------------------------------------------------------------------------
 // PBR deferred shading types
@@ -1529,8 +1530,21 @@ pub struct RenderTargets {
     pub ssgi_texture: wgpu::Texture,
     /// SSGI bilateral H-pass intermediate.
     pub ssgi_blur_temp_texture: wgpu::Texture,
-    /// Previous frame's deferred output ("lit history") for SSGI to sample.
-    /// Written at end-of-frame via texture-to-texture copy from deferred output.
+    /// SSGI temporal-pass output. Sits between ssgi_compute and the bilateral.
+    pub ssgi_temporal_texture: wgpu::Texture,
+    /// SSGI history (Rgba16Float). Updated each frame via copy from ssgi_view
+    /// (the post-blur final). Sampled by the SSGI temporal pass.
+    pub ssgi_history_texture: wgpu::Texture,
+    /// AO temporal-pass output. Sits between GTAO and the AO bilateral.
+    pub ao_temporal_texture: wgpu::Texture,
+    /// AO history (R8Unorm). Same role as ssgi_history but for the GTAO output.
+    pub ao_history_texture: wgpu::Texture,
+    /// Current-frame "true lit" output from deferred shade location(1).
+    /// Written each deferred pass; copied into lit_history afterward so SSGI
+    /// has feedback data immune to debug-mode overrides on location(0).
+    pub lit_current_texture: wgpu::Texture,
+    /// Previous frame's true lit ("lit history") for SSGI to sample. Updated
+    /// each frame via texture-to-texture copy from `lit_current_texture`.
     pub lit_history_texture: wgpu::Texture,
     /// View into color texture
     pub color_view: wgpu::TextureView,
@@ -1547,6 +1561,11 @@ pub struct RenderTargets {
     /// Views for SSGI textures.
     pub ssgi_view: wgpu::TextureView,
     pub ssgi_blur_temp_view: wgpu::TextureView,
+    pub ssgi_temporal_view: wgpu::TextureView,
+    pub ssgi_history_view: wgpu::TextureView,
+    pub ao_temporal_view: wgpu::TextureView,
+    pub ao_history_view: wgpu::TextureView,
+    pub lit_current_view: wgpu::TextureView,
     pub lit_history_view: wgpu::TextureView,
     pub width: u32,
     pub height: u32,
@@ -1659,22 +1678,34 @@ impl RenderTargets {
             view_formats: &[],
         });
 
-        let make_rgba16_target = |label: &'static str, copy: bool| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | if copy { wgpu::TextureUsages::COPY_DST } else { wgpu::TextureUsages::empty() },
-            view_formats: &[],
-        });
-        let ssgi_texture = make_rgba16_target("ssgi", false);
-        let ssgi_blur_temp_texture = make_rgba16_target("ssgi_blur_temp", false);
-        // lit_history needs COPY_DST for the deferred-output → history copy.
-        let lit_history_texture = make_rgba16_target("lit_history", true);
+        let make_target = |label: &'static str, format: wgpu::TextureFormat, extra: wgpu::TextureUsages| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | extra,
+                view_formats: &[],
+            })
+        };
+        let none = wgpu::TextureUsages::empty();
+        let cdst = wgpu::TextureUsages::COPY_DST;
+        let csrc = wgpu::TextureUsages::COPY_SRC;
+        // ssgi_view is the post-blur final and gets copied to ssgi_history → COPY_SRC.
+        let ssgi_texture = make_target("ssgi", wgpu::TextureFormat::Rgba16Float, csrc);
+        let ssgi_blur_temp_texture = make_target("ssgi_blur_temp", wgpu::TextureFormat::Rgba16Float, none);
+        let ssgi_temporal_texture = make_target("ssgi_temporal", wgpu::TextureFormat::Rgba16Float, none);
+        let ssgi_history_texture = make_target("ssgi_history", wgpu::TextureFormat::Rgba16Float, cdst);
+        // lit_current is the deferred shader's location(1) target — copied to
+        // lit_history each frame so SSGI feedback survives debug-mode overrides.
+        let lit_current_texture = make_target("lit_current", wgpu::TextureFormat::Rgba16Float, csrc);
+        let lit_history_texture = make_target("lit_history", wgpu::TextureFormat::Rgba16Float, cdst);
+        let ao_temporal_texture = make_target("ao_temporal", wgpu::TextureFormat::R8Unorm, none);
+        let ao_history_texture = make_target("ao_history", wgpu::TextureFormat::R8Unorm, cdst);
 
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let aux0_view = aux0_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1684,6 +1715,11 @@ impl RenderTargets {
         let ao_blur_temp_view = ao_blur_temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let ssgi_view = ssgi_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let ssgi_blur_temp_view = ssgi_blur_temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssgi_temporal_view = ssgi_temporal_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssgi_history_view = ssgi_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ao_temporal_view = ao_temporal_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ao_history_view = ao_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let lit_current_view = lit_current_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let lit_history_view = lit_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
         Self {
             color_texture,
@@ -1694,6 +1730,11 @@ impl RenderTargets {
             ao_blur_temp_texture,
             ssgi_texture,
             ssgi_blur_temp_texture,
+            ssgi_temporal_texture,
+            ssgi_history_texture,
+            ao_temporal_texture,
+            ao_history_texture,
+            lit_current_texture,
             lit_history_texture,
             color_view,
             aux0_view,
@@ -1703,6 +1744,11 @@ impl RenderTargets {
             ao_blur_temp_view,
             ssgi_view,
             ssgi_blur_temp_view,
+            ssgi_temporal_view,
+            ssgi_history_view,
+            ao_temporal_view,
+            ao_history_view,
+            lit_current_view,
             lit_history_view,
             width,
             height,
@@ -4768,6 +4814,18 @@ impl DeferredShadePipeline {
                     },
                     count: None,
                 },
+                // 9: lit_history (Rgba16Float, previous frame's deferred output —
+                // exposed for debug visualization to verify the SSGI feedback chain)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -4852,11 +4910,22 @@ impl DeferredShadePipeline {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: color_format,
-                    blend: None, // Overwrite — not blending
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &[
+                    // location(0): display target — debug-overridable.
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // location(1): lit_history feedback — always the true lit
+                    // value, even when a debug mode is active. Lets SSGI keep
+                    // sampling real lighting while the user is staring at debug.
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
                 compilation_options: Default::default(),
             }),
             multiview_mask: None,
@@ -4895,6 +4964,7 @@ pub fn create_deferred_bind_group(
     hw_depth_view: &wgpu::TextureView,
     ao_view: &wgpu::TextureView,
     ssgi_view: &wgpu::TextureView,
+    lit_history_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("deferred_shade_bg"),
@@ -4935,6 +5005,10 @@ pub fn create_deferred_bind_group(
             wgpu::BindGroupEntry {
                 binding: 8,
                 resource: wgpu::BindingResource::TextureView(ssgi_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(lit_history_view),
             },
         ],
     })
@@ -4987,19 +5061,36 @@ pub fn record_deferred_shade(
     deferred: &DeferredShadePipeline,
     bind_group: &wgpu::BindGroup,
     dsm_bind_group: &wgpu::BindGroup,
-    target_view: &wgpu::TextureView,
+    display_view: &wgpu::TextureView,
+    lit_current_view: &wgpu::TextureView,
 ) {
     let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("deferred_shade"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: target_view,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                store: wgpu::StoreOp::Store,
-            },
-            depth_slice: None,
-        })],
+        color_attachments: &[
+            Some(wgpu::RenderPassColorAttachment {
+                view: display_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            }),
+            // lit_current = this frame's true lit value (location 1). Copied
+            // into lit_history after the pass so SSGI samples it next frame.
+            // We can't render directly into lit_history because it's also
+            // sampled in this same pass for DBG_LIT_HISTORY (and read by SSGI
+            // earlier in the frame).
+            Some(wgpu::RenderPassColorAttachment {
+                view: lit_current_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            }),
+        ],
         depth_stencil_attachment: None,
         ..Default::default()
     });
@@ -5997,6 +6088,225 @@ pub fn record_ssgi_blur_pass(
     rpass.set_pipeline(&blur.pipeline);
     rpass.set_bind_group(0, bind_group, &[]);
     rpass.draw(0..3, 0..1);
+}
+
+// ===========================================================================
+// Temporal accumulation — shared shader for SSGI and AO.
+// Reprojects history via prev_vp, neighborhood-clamps, blends with current.
+// One pipeline per output format (Rgba16Float for SSGI, R8Unorm for AO).
+// ===========================================================================
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TemporalUniforms {
+    pub inv_vp:  [[f32; 4]; 4],
+    pub prev_vp: [[f32; 4]; 4],
+    pub width: u32,
+    pub height: u32,
+    pub near: f32,
+    pub far: f32,
+    pub max_mip: u32,
+    pub alpha: f32,
+    pub _pad0: f32,
+    pub _pad1: f32,
+}
+
+pub struct TemporalPipeline {
+    pub pipeline: wgpu::RenderPipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+    pub uniforms_buf: wgpu::Buffer,
+    pub sampler: wgpu::Sampler,
+}
+
+impl TemporalPipeline {
+    /// Build a temporal-accumulation pipeline. `target_format` is
+    /// `Rgba16Float` for SSGI, `R8Unorm` for AO.
+    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("temporal.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(TEMPORAL_WGSL.into()),
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("temporal_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 1: current
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 2: history (sampled bilinearly via the sampler in slot 4)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 3: Hi-Z (for current-pixel depth → world-pos reconstruction)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 4: bilinear sampler for history reprojection
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("temporal_pl"),
+            bind_group_layouts: &[&bgl],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("temporal_pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("temporal_uniforms"),
+            size: std::mem::size_of::<TemporalUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("temporal_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        Self { pipeline, bind_group_layout: bgl, uniforms_buf, sampler }
+    }
+}
+
+pub fn create_temporal_bind_group(
+    device: &wgpu::Device,
+    pipeline: &TemporalPipeline,
+    current_view: &wgpu::TextureView,
+    history_view: &wgpu::TextureView,
+    hiz_full_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("temporal_bg"),
+        layout: &pipeline.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: pipeline.uniforms_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(current_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(history_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(hiz_full_view) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&pipeline.sampler) },
+        ],
+    })
+}
+
+pub fn record_temporal_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &TemporalPipeline,
+    bind_group: &wgpu::BindGroup,
+    out_view: &wgpu::TextureView,
+) {
+    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("temporal_pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: out_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    });
+    rpass.set_pipeline(&pipeline.pipeline);
+    rpass.set_bind_group(0, bind_group, &[]);
+    rpass.draw(0..3, 0..1);
+}
+
+/// Clear a texture to a constant color via a load-op-only render pass.
+/// Used at startup to make history textures (lit_history, ssgi_history,
+/// ao_history) deterministic on the first frame.
+pub fn clear_texture_view(
+    encoder: &mut wgpu::CommandEncoder,
+    view: &wgpu::TextureView,
+    color: wgpu::Color,
+) {
+    let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("clear_history_pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(color),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    });
 }
 
 // ===========================================================================
