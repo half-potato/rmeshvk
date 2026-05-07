@@ -29,7 +29,7 @@ struct DeferredUniforms {
     sky_color: vec3f,
     ao_strength: f32,
     ground_color: vec3f,
-    _pad: f32,
+    ssgi_strength: f32,
 }
 
 struct Light {
@@ -71,6 +71,7 @@ struct ShadowLight {
 @group(0) @binding(5) var<storage, read> lights: array<Light>;
 @group(0) @binding(6) var hw_depth_tex: texture_depth_2d; // hardware depth buffer
 @group(0) @binding(7) var ao_tex: texture_2d<f32>;        // R8Unorm GTAO output
+@group(0) @binding(8) var ssgi_tex: texture_2d<f32>;      // Rgba16Float SSGI radiance
 
 // Group 1: DSM shadow cubemap
 @group(1) @binding(0) var dsm_rt0: texture_cube<f32>;
@@ -97,6 +98,7 @@ const DBG_ALPHA:       u32 = 13u;
 const DBG_PRIMITIVES:  u32 = 14u;
 const DBG_DSM:         u32 = 15u;
 const DBG_AO:          u32 = 16u;
+const DBG_SSGI:        u32 = 17u;
 
 const PI: f32 = 3.14159265358979323846;
 const TWO_PI: f32 = 6.28318530717958647692;
@@ -220,6 +222,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let depth_raw = textureLoad(depth_tex, coords, 0);       // expected depth + retro
     let hw_depth = textureLoad(hw_depth_tex, coords, 0);
     let ao = textureLoad(ao_tex, coords, 0).r;
+    let ssgi_indirect = textureLoad(ssgi_tex, coords, 0).rgb;
 
     let alpha = color_raw.a;
     if (alpha < 0.01) {
@@ -338,7 +341,14 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     // reflection from the sky/ground hemisphere when no env map is around.
     let hemi = mix(uniforms.ground_color, uniforms.sky_color, normal.y * 0.5 + 0.5);
     let ao_factor = mix(1.0, ao, uniforms.ao_strength);
-    let ambient_diffuse  = kd     * albedo * hemi;
+    // Diffuse ambient: lerp from constant hemi-stand-in toward SSGI's actual
+    // gathered indirect radiance based on `ssgi_strength`. SSGI rays already
+    // multi-bounce via prior-frame feedback; here we still need `kd · albedo`
+    // to apply the receiving surface's BRDF (the receiver hadn't been mixed
+    // in yet — the SSGI buffer holds incoming radiance L_in).
+    let ambient_diffuse_const = kd * albedo * hemi;
+    let ambient_diffuse_ssgi  = kd * albedo * ssgi_indirect;
+    let ambient_diffuse = mix(ambient_diffuse_const, ambient_diffuse_ssgi, uniforms.ssgi_strength);
     let ambient_specular = F_view * hemi;
     // let ambient_term = uniforms.ambient * (ambient_diffuse + ambient_specular) * ao_factor;
     let ambient_term = uniforms.ambient * (ambient_diffuse) * ao_factor;
@@ -395,6 +405,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     else if (dm == DBG_ALPHA)       { final_color = vec3f(alpha); }
     else if (dm == DBG_PRIMITIVES)  { /* final_color already correct — volume pass skipped on CPU */ }
     else if (dm == DBG_AO)          { final_color = vec3f(ao); }
+    else if (dm == DBG_SSGI)        { final_color = ssgi_indirect; }
 
     return vec4f(max(final_color, vec3f(0.0)), alpha);
 }

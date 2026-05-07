@@ -214,6 +214,8 @@ impl App {
         let mut exposure = self.exposure;
         let mut ao_strength = self.ao_strength;
         let mut gtao_radius = self.gtao_radius;
+        let mut ssgi_strength = self.ssgi_strength;
+        let mut ssgi_radius = self.ssgi_radius;
         let mut deferred_debug_mode = self.deferred_debug_mode;
         let mut dsm_query_depth = self.dsm_query_depth;
         // Get mesh bbox for dynamic slider ranges
@@ -262,6 +264,8 @@ impl App {
                             ui.add(egui::Slider::new(&mut exposure, 0.05..=8.0).logarithmic(true).text("Exposure"));
                             ui.add(egui::Slider::new(&mut ao_strength, 0.0..=2.0).text("AO Strength"));
                             ui.add(egui::Slider::new(&mut gtao_radius, 0.05..=2.0).logarithmic(true).text("AO Radius"));
+                            ui.add(egui::Slider::new(&mut ssgi_strength, 0.0..=1.0).text("SSGI Strength"));
+                            ui.add(egui::Slider::new(&mut ssgi_radius, 0.1..=5.0).logarithmic(true).text("SSGI Radius"));
                             ui.horizontal(|ui| {
                                 ui.label("Sky");
                                 ui.color_edit_button_rgb(&mut sky_color);
@@ -273,7 +277,7 @@ impl App {
                                 "Roughness", "PBR (M/F0/Retro)", "Depth", "Specular",
                                 "Diffuse", "Shadow", "Retro", "Lambda",
                                 "Plaster", "Alpha", "Primitives", "DSM",
-                                "AO",
+                                "AO", "SSGI",
                             ];
                             ui.separator();
                             ui.label("Debug Layer");
@@ -444,6 +448,8 @@ impl App {
         self.exposure = exposure;
         self.ao_strength = ao_strength;
         self.gtao_radius = gtao_radius;
+        self.ssgi_strength = ssgi_strength;
+        self.ssgi_radius = ssgi_radius;
         self.deferred_debug_mode = deferred_debug_mode;
         self.dsm_query_depth = dsm_query_depth;
 
@@ -1040,7 +1046,7 @@ impl App {
                     sky_color: self.sky_color,
                     ao_strength: self.ao_strength,
                     ground_color: self.ground_color,
-                    _pad: 0.0,
+                    ssgi_strength: self.ssgi_strength,
                 };
                 gpu.queue.write_buffer(
                     &deferred.uniforms_buf, 0,
@@ -1118,6 +1124,65 @@ impl App {
                     &gpu.targets.ao_view,
                 );
 
+                // SSGI: ray-march Hi-Z, sample lit_history at hits, denoise.
+                // The ssgi_radius bounds ray length in world units; the
+                // bilateral's sigma_z follows (depth-stop scales with the AO
+                // sampling radius for consistency).
+                gpu.frame_counter = gpu.frame_counter.wrapping_add(1);
+                let ssgi_uniforms = rmesh_render::SsgiUniforms {
+                    inv_proj: proj_mat.inverse().to_cols_array_2d(),
+                    proj: proj_mat.to_cols_array_2d(),
+                    view: view_mat.to_cols_array_2d(),
+                    inv_view: view_mat.inverse().to_cols_array_2d(),
+                    width: w,
+                    height: h,
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    max_mip: gpu.hiz_texture.mip_count - 1,
+                    frame: gpu.frame_counter,
+                    radius_world: self.ssgi_radius,
+                    thickness: self.ssgi_radius * 0.5,
+                    sky_color: self.sky_color,
+                    _pad0: 0.0,
+                    ground_color: self.ground_color,
+                    _pad1: 0.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.ssgi_pipeline.uniforms_buf, 0,
+                    bytemuck::bytes_of(&ssgi_uniforms),
+                );
+                rmesh_render::record_ssgi_pass(
+                    &mut encoder, &gpu.ssgi_pipeline, &gpu.ssgi_bg,
+                    &gpu.targets.ssgi_view,
+                );
+
+                let ssgi_blur_h = rmesh_render::SsgiBlurUniforms {
+                    dir_x: 1, dir_y: 0,
+                    sigma_z: self.ssgi_radius * 0.5,
+                    sigma_n: 8.0,
+                };
+                let ssgi_blur_v = rmesh_render::SsgiBlurUniforms {
+                    dir_x: 0, dir_y: 1,
+                    sigma_z: self.ssgi_radius * 0.5,
+                    sigma_n: 8.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.ssgi_blur_pipeline.uniforms_h, 0, bytemuck::bytes_of(&ssgi_blur_h),
+                );
+                gpu.queue.write_buffer(
+                    &gpu.ssgi_blur_pipeline.uniforms_v, 0, bytemuck::bytes_of(&ssgi_blur_v),
+                );
+                // H: ssgi_view → ssgi_blur_temp_view
+                rmesh_render::record_ssgi_blur_pass(
+                    &mut encoder, &gpu.ssgi_blur_pipeline, &gpu.ssgi_blur_bg_h,
+                    &gpu.targets.ssgi_blur_temp_view,
+                );
+                // V: ssgi_blur_temp_view → ssgi_view (deferred reads this)
+                rmesh_render::record_ssgi_blur_pass(
+                    &mut encoder, &gpu.ssgi_blur_pipeline, &gpu.ssgi_blur_bg_v,
+                    &gpu.targets.ssgi_view,
+                );
+
                 // Record deferred shade pass — writes to separate output texture
                 let dsm_bg = gpu.deferred_dsm_bg.as_ref()
                     .or(gpu.deferred_dsm_dummy_bg.as_ref())
@@ -1125,6 +1190,27 @@ impl App {
                 rmesh_render::record_deferred_shade(
                     &mut encoder, deferred, bg, dsm_bg, out_view,
                 );
+
+                // Copy this frame's lit output → lit_history for next-frame
+                // SSGI to sample. Texture-to-texture copy (no shader needed
+                // because formats match).
+                if let Some(ref out_tex) = gpu.deferred_output {
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: out_tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &gpu.targets.lit_history_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    );
+                }
             }
         }
 

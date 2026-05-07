@@ -51,6 +51,8 @@ const GTAO_WGSL: &str = include_str!("wgsl/gtao.wgsl");
 const HIZ_LINEARIZE_WGSL: &str = include_str!("wgsl/hiz_linearize.wgsl");
 const HIZ_DOWNSAMPLE_WGSL: &str = include_str!("wgsl/hiz_downsample.wgsl");
 const AO_BILATERAL_WGSL: &str = include_str!("wgsl/ao_bilateral.wgsl");
+const SSGI_COMPUTE_WGSL: &str = include_str!("wgsl/ssgi_compute.wgsl");
+const SSGI_BILATERAL_WGSL: &str = include_str!("wgsl/ssgi_bilateral.wgsl");
 
 // ---------------------------------------------------------------------------
 // PBR deferred shading types
@@ -88,7 +90,7 @@ pub struct DeferredUniforms {
     pub sky_color: [f32; 3],
     pub ao_strength: f32,
     pub ground_color: [f32; 3],
-    pub _pad: f32,
+    pub ssgi_strength: f32,
 }
 
 /// Maximum number of lights supported.
@@ -1522,6 +1524,14 @@ pub struct RenderTargets {
     /// AO bilateral-blur intermediate (R8Unorm). H pass writes here, V pass
     /// reads it and writes back to `ao_texture`.
     pub ao_blur_temp_texture: wgpu::Texture,
+    /// SSGI radiance (Rgba16Float). Written by ssgi_compute, denoised in
+    /// place via the SSGI bilateral, read by deferred.
+    pub ssgi_texture: wgpu::Texture,
+    /// SSGI bilateral H-pass intermediate.
+    pub ssgi_blur_temp_texture: wgpu::Texture,
+    /// Previous frame's deferred output ("lit history") for SSGI to sample.
+    /// Written at end-of-frame via texture-to-texture copy from deferred output.
+    pub lit_history_texture: wgpu::Texture,
     /// View into color texture
     pub color_view: wgpu::TextureView,
     /// View into aux texture
@@ -1534,6 +1544,10 @@ pub struct RenderTargets {
     pub ao_view: wgpu::TextureView,
     /// View into AO blur intermediate.
     pub ao_blur_temp_view: wgpu::TextureView,
+    /// Views for SSGI textures.
+    pub ssgi_view: wgpu::TextureView,
+    pub ssgi_blur_temp_view: wgpu::TextureView,
+    pub lit_history_view: wgpu::TextureView,
     pub width: u32,
     pub height: u32,
 }
@@ -1645,12 +1659,32 @@ impl RenderTargets {
             view_formats: &[],
         });
 
+        let make_rgba16_target = |label: &'static str, copy: bool| device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | if copy { wgpu::TextureUsages::COPY_DST } else { wgpu::TextureUsages::empty() },
+            view_formats: &[],
+        });
+        let ssgi_texture = make_rgba16_target("ssgi", false);
+        let ssgi_blur_temp_texture = make_rgba16_target("ssgi_blur_temp", false);
+        // lit_history needs COPY_DST for the deferred-output → history copy.
+        let lit_history_texture = make_rgba16_target("lit_history", true);
+
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let aux0_view = aux0_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let normals_view = normals_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let ao_view = ao_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let ao_blur_temp_view = ao_blur_temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssgi_view = ssgi_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssgi_blur_temp_view = ssgi_blur_temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let lit_history_view = lit_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
         Self {
             color_texture,
             aux0_texture,
@@ -1658,12 +1692,18 @@ impl RenderTargets {
             depth_texture,
             ao_texture,
             ao_blur_temp_texture,
+            ssgi_texture,
+            ssgi_blur_temp_texture,
+            lit_history_texture,
             color_view,
             aux0_view,
             normals_view,
             depth_view,
             ao_view,
             ao_blur_temp_view,
+            ssgi_view,
+            ssgi_blur_temp_view,
+            lit_history_view,
             width,
             height,
         }
@@ -4717,6 +4757,17 @@ impl DeferredShadePipeline {
                     },
                     count: None,
                 },
+                // 8: SSGI radiance (Rgba16Float, denoised indirect-diffuse)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -4843,6 +4894,7 @@ pub fn create_deferred_bind_group(
     targets: &RenderTargets,
     hw_depth_view: &wgpu::TextureView,
     ao_view: &wgpu::TextureView,
+    ssgi_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("deferred_shade_bg"),
@@ -4879,6 +4931,10 @@ pub fn create_deferred_bind_group(
             wgpu::BindGroupEntry {
                 binding: 7,
                 resource: wgpu::BindingResource::TextureView(ao_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(ssgi_view),
             },
         ],
     })
@@ -5589,6 +5645,348 @@ pub fn record_ao_blur_pass(
             resolve_target: None,
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    });
+    rpass.set_pipeline(&blur.pipeline);
+    rpass.set_bind_group(0, bind_group, &[]);
+    rpass.draw(0..3, 0..1);
+}
+
+// ===========================================================================
+// SSGI — diffuse screen-space global illumination.
+// Ray-marches Hi-Z, samples lit_history at hits, falls back to hemi color
+// for misses. Output is averaged radiance L_in (Rgba16Float). Caller's
+// deferred shader multiplies by `kd · albedo` to complete the bounce.
+// Includes a separate Rgba16Float bilateral denoiser (mirrors AO blur).
+// ===========================================================================
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SsgiUniforms {
+    pub inv_proj: [[f32; 4]; 4],
+    pub proj:     [[f32; 4]; 4],
+    pub view:     [[f32; 4]; 4],
+    pub inv_view: [[f32; 4]; 4],
+    pub width: u32,
+    pub height: u32,
+    pub near: f32,
+    pub far: f32,
+    pub max_mip: u32,
+    pub frame: u32,
+    pub radius_world: f32,
+    pub thickness: f32,
+    pub sky_color: [f32; 3],
+    pub _pad0: f32,
+    pub ground_color: [f32; 3],
+    pub _pad1: f32,
+}
+
+pub struct SsgiPipeline {
+    pub pipeline: wgpu::RenderPipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+    pub uniforms_buf: wgpu::Buffer,
+}
+
+impl SsgiPipeline {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ssgi_compute.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(SSGI_COMPUTE_WGSL.into()),
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssgi_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ssgi_pl"),
+            bind_group_layouts: &[&bgl],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ssgi_pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ssgi_uniforms"),
+            size: std::mem::size_of::<SsgiUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self { pipeline, bind_group_layout: bgl, uniforms_buf }
+    }
+}
+
+pub fn create_ssgi_bind_group(
+    device: &wgpu::Device,
+    ssgi: &SsgiPipeline,
+    hiz_full_view: &wgpu::TextureView,
+    normals_view: &wgpu::TextureView,
+    lit_history_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("ssgi_bg"),
+        layout: &ssgi.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: ssgi.uniforms_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(hiz_full_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(normals_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(lit_history_view) },
+        ],
+    })
+}
+
+pub fn record_ssgi_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    ssgi: &SsgiPipeline,
+    bind_group: &wgpu::BindGroup,
+    out_view: &wgpu::TextureView,
+) {
+    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("ssgi_pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: out_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    });
+    rpass.set_pipeline(&ssgi.pipeline);
+    rpass.set_bind_group(0, bind_group, &[]);
+    rpass.draw(0..3, 0..1);
+}
+
+// ---- SSGI bilateral (Rgba16Float; same shape as AoBlurPipeline) ----
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SsgiBlurUniforms {
+    pub dir_x: i32,
+    pub dir_y: i32,
+    pub sigma_z: f32,
+    pub sigma_n: f32,
+}
+
+pub struct SsgiBlurPipeline {
+    pub pipeline: wgpu::RenderPipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+    pub uniforms_h: wgpu::Buffer,
+    pub uniforms_v: wgpu::Buffer,
+}
+
+impl SsgiBlurPipeline {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ssgi_bilateral.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(SSGI_BILATERAL_WGSL.into()),
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssgi_blur_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ssgi_blur_pl"),
+            bind_group_layouts: &[&bgl],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ssgi_blur_pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let mk = |label: &'static str| device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: std::mem::size_of::<SsgiBlurUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uniforms_h = mk("ssgi_blur_uniforms_h");
+        let uniforms_v = mk("ssgi_blur_uniforms_v");
+
+        Self { pipeline, bind_group_layout: bgl, uniforms_h, uniforms_v }
+    }
+}
+
+pub fn create_ssgi_blur_bind_group(
+    device: &wgpu::Device,
+    blur: &SsgiBlurPipeline,
+    uniforms_buf: &wgpu::Buffer,
+    ssgi_in_view: &wgpu::TextureView,
+    depth_view: &wgpu::TextureView,
+    normals_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("ssgi_blur_bg"),
+        layout: &blur.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: uniforms_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ssgi_in_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(normals_view) },
+        ],
+    })
+}
+
+pub fn record_ssgi_blur_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    blur: &SsgiBlurPipeline,
+    bind_group: &wgpu::BindGroup,
+    out_view: &wgpu::TextureView,
+) {
+    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("ssgi_blur_pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: out_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
                 store: wgpu::StoreOp::Store,
             },
             depth_slice: None,

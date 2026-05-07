@@ -136,6 +136,8 @@ struct App {
     exposure: f32,
     ao_strength: f32,
     gtao_radius: f32,
+    ssgi_strength: f32,
+    ssgi_radius: f32,
     dsm_query_depth: f32,
     /// Cached light state for DSM dirty detection.
     cached_dsm_lights: Vec<rmesh_render::GpuLight>,
@@ -196,6 +198,8 @@ impl App {
             exposure: 1.0,
             ao_strength: 1.0,
             gtao_radius: 0.5,
+            ssgi_strength: 1.0,
+            ssgi_radius: 1.5,
             dsm_query_depth: 1.0,
             cached_dsm_lights: Vec::new(),
             cached_dsm_num_lights: 0,
@@ -589,12 +593,36 @@ impl App {
             &targets.normals_view,
         );
 
+        // SSGI: compute (Hi-Z ray march, samples lit_history) + bilateral denoise.
+        let ssgi_pipeline = rmesh_render::SsgiPipeline::new(&device);
+        let ssgi_bg = rmesh_render::create_ssgi_bind_group(
+            &device, &ssgi_pipeline,
+            &hiz_texture.full_view,
+            &targets.normals_view,
+            &targets.lit_history_view,
+        );
+        let ssgi_blur_pipeline = rmesh_render::SsgiBlurPipeline::new(&device);
+        let ssgi_blur_bg_h = rmesh_render::create_ssgi_blur_bind_group(
+            &device, &ssgi_blur_pipeline,
+            &ssgi_blur_pipeline.uniforms_h,
+            &targets.ssgi_view,
+            &hiz_texture.full_view,
+            &targets.normals_view,
+        );
+        let ssgi_blur_bg_v = rmesh_render::create_ssgi_blur_bind_group(
+            &device, &ssgi_blur_pipeline,
+            &ssgi_blur_pipeline.uniforms_v,
+            &targets.ssgi_blur_temp_view,
+            &hiz_texture.full_view,
+            &targets.normals_view,
+        );
+
         // Deferred PBR shading pipeline (only when PBR data is loaded)
         let has_pbr = self.pbr_data.is_some();
         let (deferred_pipeline, deferred_bg, deferred_output, deferred_output_view, deferred_blit_bg, deferred_dsm_dummy_bg) = if has_pbr {
             log::info!("Creating deferred PBR shading pipeline...");
             let dp = rmesh_render::DeferredShadePipeline::new(&device, color_format);
-            let bg = rmesh_render::create_deferred_bind_group(&device, &dp, &targets, &primitive_targets.depth_view, &targets.ao_view);
+            let bg = rmesh_render::create_deferred_bind_group(&device, &dp, &targets, &primitive_targets.depth_view, &targets.ao_view, &targets.ssgi_view);
             // Dummy DSM bind group (1x1 atlas, no lights)
             let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&device);
             let dummy_dsm_bg = rmesh_render::create_deferred_dsm_bind_group(
@@ -608,7 +636,7 @@ impl App {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: color_format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
             let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -776,6 +804,12 @@ impl App {
             ao_blur_pipeline,
             ao_blur_bg_h,
             ao_blur_bg_v,
+            ssgi_pipeline,
+            ssgi_bg,
+            ssgi_blur_pipeline,
+            ssgi_blur_bg_h,
+            ssgi_blur_bg_v,
+            frame_counter: 0,
             deferred_output,
             deferred_output_view,
             deferred_blit_bg,
@@ -1016,7 +1050,7 @@ impl App {
                 // Recreate deferred pipeline
                 let color_format = wgpu::TextureFormat::Rgba16Float;
                 let dp = rmesh_render::DeferredShadePipeline::new(&gpu.device, color_format);
-                gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(&gpu.device, &dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view));
+                gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(&gpu.device, &dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view, &gpu.targets.ssgi_view));
                 // Reset DSM state (will be regenerated on next frame with lights)
                 let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&gpu.device);
                 gpu.deferred_dsm_dummy_bg = Some(rmesh_render::create_deferred_dsm_bind_group(
@@ -1034,7 +1068,7 @@ impl App {
                     mip_level_count: 1, sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: color_format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
                 });
                 let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1186,10 +1220,32 @@ impl App {
                 &gpu.targets.normals_view,
             );
 
+            // Recreate SSGI bind groups.
+            gpu.ssgi_bg = rmesh_render::create_ssgi_bind_group(
+                &gpu.device, &gpu.ssgi_pipeline,
+                &gpu.hiz_texture.full_view,
+                &gpu.targets.normals_view,
+                &gpu.targets.lit_history_view,
+            );
+            gpu.ssgi_blur_bg_h = rmesh_render::create_ssgi_blur_bind_group(
+                &gpu.device, &gpu.ssgi_blur_pipeline,
+                &gpu.ssgi_blur_pipeline.uniforms_h,
+                &gpu.targets.ssgi_view,
+                &gpu.hiz_texture.full_view,
+                &gpu.targets.normals_view,
+            );
+            gpu.ssgi_blur_bg_v = rmesh_render::create_ssgi_blur_bind_group(
+                &gpu.device, &gpu.ssgi_blur_pipeline,
+                &gpu.ssgi_blur_pipeline.uniforms_v,
+                &gpu.targets.ssgi_blur_temp_view,
+                &gpu.hiz_texture.full_view,
+                &gpu.targets.normals_view,
+            );
+
             // Recreate deferred resources since MRT texture views changed
             if let Some(ref dp) = gpu.deferred_pipeline {
                 gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(
-                    &gpu.device, dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view,
+                    &gpu.device, dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view, &gpu.targets.ssgi_view,
                 ));
                 let out_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("deferred_output"),
@@ -1198,7 +1254,7 @@ impl App {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Rgba16Float,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
                 });
                 let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());

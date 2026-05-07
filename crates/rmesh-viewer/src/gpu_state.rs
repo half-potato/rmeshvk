@@ -176,6 +176,14 @@ pub struct GpuState {
     pub ao_blur_pipeline: rmesh_render::AoBlurPipeline,
     pub ao_blur_bg_h: wgpu::BindGroup,
     pub ao_blur_bg_v: wgpu::BindGroup,
+    /// SSGI compute (Hi-Z ray-march, samples lit_history) + bilateral denoise.
+    pub ssgi_pipeline: rmesh_render::SsgiPipeline,
+    pub ssgi_bg: wgpu::BindGroup,
+    pub ssgi_blur_pipeline: rmesh_render::SsgiBlurPipeline,
+    pub ssgi_blur_bg_h: wgpu::BindGroup,
+    pub ssgi_blur_bg_v: wgpu::BindGroup,
+    /// Frame counter for SSGI per-pixel jitter rotation.
+    pub frame_counter: u32,
     /// Separate output texture for deferred pass (can't read+write color_view simultaneously)
     pub deferred_output: Option<wgpu::Texture>,
     pub deferred_output_view: Option<wgpu::TextureView>,
