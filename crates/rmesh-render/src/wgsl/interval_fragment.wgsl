@@ -4,10 +4,10 @@
 // distance, and evaluates the volume rendering integral.
 //
 // MRT outputs (all Rgba16Float, .a = alpha for correct hardware blend):
-//   location(0): plaster.rgb * a, a
-//   location(1): roughness * a, env_f0 * a, env_f1 * a, a
+//   location(0): albedo.rgb * a, a
+//   location(1): roughness * a, metallic * a, f0_dielectric * a, a
 //   location(2): field_gradient.xyz * a, a  — raw, normalized only in deferred
-//   location(3): albedo.rgb * a, a
+//   location(3): expected_depth * a, retro * a, 0, a
 
 struct Uniforms {
     vp_col0: vec4<f32>,
@@ -110,13 +110,13 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     let alpha_t = exp(-od);
     let alpha = 1.0 - alpha_t;
 
-    // Per-tet aux channels lookup
+    // Per-tet aux channels lookup (parametric BRDF layout)
     let aux_base = in.tet_id * AUX_DIM;
-    let roughness = aux_data[aux_base + 0u];
-    let env_f0 = aux_data[aux_base + 1u];
-    let env_f1 = aux_data[aux_base + 2u];
-    let env_f2 = aux_data[aux_base + 3u];
-    let env_f3 = aux_data[aux_base + 4u];
+    let roughness     = aux_data[aux_base + 0u];
+    let metallic      = aux_data[aux_base + 1u];
+    let f0_dielectric = aux_data[aux_base + 2u];
+    let retro         = aux_data[aux_base + 3u];
+    // aux_base + 4u is unused
     let alb_r = aux_data[aux_base + 5u];
     let alb_g = aux_data[aux_base + 6u];
     let alb_b = aux_data[aux_base + 7u];
@@ -125,18 +125,24 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     let albedo = vec3f(alb_r, alb_g, alb_b);
     out.color = vec4f(albedo * alpha, alpha);
 
-    // Slot 1: aux (roughness, env features)
-    out.aux0 = vec4f(roughness * alpha, env_f0 * alpha, env_f1 * alpha, alpha);
+    // Slot 1: PBR material (roughness, metallic, f0_dielectric)
+    out.aux0 = vec4f(roughness * alpha, metallic * alpha, f0_dielectric * alpha, alpha);
 
     // Slot 2: normals (raw gradient, normalized in deferred)
     out.normals = vec4f(in.field_gradient * alpha, alpha);
 
-    // Slot 3: expected termination depth + env_f2/f3
+    // Slot 3: expected termination depth + retro + E[z²] (for std)
+    // .b holds the second-moment contribution, composited via the same premul-
+    // alpha blend as .r. Approximation: per-segment treats the termination as
+    // a 2-point distribution at {z_f w.p. w1/α, z_b w.p. w0/α}, so the
+    // segment's E[z²]·α = w0·z_b² + w1·z_f². Conservatively upper-bounds the
+    // exact within-segment variance (which is fine for the std-based AO fade).
     let phi_val = phi(od);
     let w0 = phi_val - alpha_t;   // weight for back (z_b)
     let w1 = 1.0 - phi_val;       // weight for front (z_f)
-    let depth_premul = w0 * z_b + w1 * z_f;
-    out.expected_depth = vec4f(depth_premul, env_f2 * alpha, env_f3 * alpha, alpha);
+    let depth_premul  = w0 * z_b + w1 * z_f;
+    let depth2_premul = w0 * z_b * z_b + w1 * z_f * z_f;
+    out.expected_depth = vec4f(depth_premul, retro * alpha, depth2_premul, alpha);
 
     return out;
 }

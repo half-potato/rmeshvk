@@ -209,6 +209,11 @@ impl App {
         let rt_locate_ms = self.rt_locate_ms;
         let mut deferred_enabled = self.deferred_enabled;
         let mut ambient = self.ambient;
+        let mut sky_color = self.sky_color;
+        let mut ground_color = self.ground_color;
+        let mut exposure = self.exposure;
+        let mut ao_strength = self.ao_strength;
+        let mut gtao_radius = self.gtao_radius;
         let mut deferred_debug_mode = self.deferred_debug_mode;
         let mut dsm_query_depth = self.dsm_query_depth;
         // Get mesh bbox for dynamic slider ranges
@@ -254,11 +259,21 @@ impl App {
                         ui.add_enabled(has_pbr, egui::Checkbox::new(&mut deferred_enabled, "Deferred Shading"));
                         if deferred_enabled && has_pbr {
                             ui.add(egui::Slider::new(&mut ambient, 0.0..=1.0).text("Ambient"));
+                            ui.add(egui::Slider::new(&mut exposure, 0.05..=8.0).logarithmic(true).text("Exposure"));
+                            ui.add(egui::Slider::new(&mut ao_strength, 0.0..=2.0).text("AO Strength"));
+                            ui.add(egui::Slider::new(&mut gtao_radius, 0.05..=2.0).logarithmic(true).text("AO Radius"));
+                            ui.horizontal(|ui| {
+                                ui.label("Sky");
+                                ui.color_edit_button_rgb(&mut sky_color);
+                                ui.label("Ground");
+                                ui.color_edit_button_rgb(&mut ground_color);
+                            });
                             let debug_labels = [
                                 "Final", "Raw Albedo", "True Albedo", "Normals",
-                                "Roughness", "Env Feature", "Depth", "Specular",
+                                "Roughness", "PBR (M/F0/Retro)", "Depth", "Specular",
                                 "Diffuse", "Shadow", "Retro", "Lambda",
                                 "Plaster", "Alpha", "Primitives", "DSM",
+                                "AO",
                             ];
                             ui.separator();
                             ui.label("Debug Layer");
@@ -424,6 +439,11 @@ impl App {
         self.sort_16bit = sort_16bit;
         self.deferred_enabled = deferred_enabled;
         self.ambient = ambient;
+        self.sky_color = sky_color;
+        self.ground_color = ground_color;
+        self.exposure = exposure;
+        self.ao_strength = ao_strength;
+        self.gtao_radius = gtao_radius;
         self.deferred_debug_mode = deferred_debug_mode;
         self.dsm_query_depth = dsm_query_depth;
 
@@ -1016,11 +1036,86 @@ impl App {
                     near_plane: self.camera.near_z,
                     far_plane: self.camera.far_z,
                     dsm_enabled,
+                    exposure: self.exposure,
+                    sky_color: self.sky_color,
+                    ao_strength: self.ao_strength,
+                    ground_color: self.ground_color,
                     _pad: 0.0,
                 };
                 gpu.queue.write_buffer(
                     &deferred.uniforms_buf, 0,
                     bytemuck::bytes_of(&deferred_uniforms),
+                );
+
+                // GTAO uniforms — driven from the same camera matrices.
+                let proj_cols = proj_mat.to_cols_array_2d();
+                let proj_scale = proj_cols[1][1] * (h as f32) * 0.5;
+                let gtao_uniforms = rmesh_render::GtaoUniforms {
+                    inv_proj: proj_mat.inverse().to_cols_array_2d(),
+                    view: view_mat.to_cols_array_2d(),
+                    width: w,
+                    height: h,
+                    radius_world: self.gtao_radius,
+                    thickness: self.gtao_radius * 4.0,
+                    proj_scale,
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    max_mip: gpu.hiz_texture.mip_count - 1,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.gtao_pipeline.uniforms_buf, 0,
+                    bytemuck::bytes_of(&gtao_uniforms),
+                );
+
+                // Hi-Z build: linearize fused depth into mip 0, then min-down each mip.
+                let hiz_uniforms = rmesh_render::HizUniforms {
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    _pad0: 0.0,
+                    _pad1: 0.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.hiz_pipelines.uniforms_buf, 0,
+                    bytemuck::bytes_of(&hiz_uniforms),
+                );
+                rmesh_render::record_hiz_pass(
+                    &mut encoder, &gpu.hiz_pipelines, &gpu.hiz_texture,
+                    &gpu.hiz_linearize_bg, &gpu.hiz_downsample_bgs,
+                );
+
+                // GTAO pass: Hi-Z + normals + volume depth → AO texture
+                rmesh_render::record_gtao_pass(
+                    &mut encoder, &gpu.gtao_pipeline, &gpu.gtao_bg, &gpu.targets.ao_view,
+                );
+
+                // Bilateral AO blur (separable, depth+normal aware).
+                // sigma_z is in world units; scaled with the AO radius so the
+                // edge-stop loosens for larger AO and tightens for smaller AO.
+                let blur_h = rmesh_render::AoBlurUniforms {
+                    dir_x: 1, dir_y: 0,
+                    sigma_z: self.gtao_radius * 0.25,
+                    sigma_n: 8.0,
+                };
+                let blur_v = rmesh_render::AoBlurUniforms {
+                    dir_x: 0, dir_y: 1,
+                    sigma_z: self.gtao_radius * 0.25,
+                    sigma_n: 8.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.ao_blur_pipeline.uniforms_h, 0, bytemuck::bytes_of(&blur_h),
+                );
+                gpu.queue.write_buffer(
+                    &gpu.ao_blur_pipeline.uniforms_v, 0, bytemuck::bytes_of(&blur_v),
+                );
+                // H: ao_view → ao_blur_temp_view
+                rmesh_render::record_ao_blur_pass(
+                    &mut encoder, &gpu.ao_blur_pipeline, &gpu.ao_blur_bg_h,
+                    &gpu.targets.ao_blur_temp_view,
+                );
+                // V: ao_blur_temp_view → ao_view (final, deferred reads this)
+                rmesh_render::record_ao_blur_pass(
+                    &mut encoder, &gpu.ao_blur_pipeline, &gpu.ao_blur_bg_v,
+                    &gpu.targets.ao_view,
                 );
 
                 // Record deferred shade pass — writes to separate output texture

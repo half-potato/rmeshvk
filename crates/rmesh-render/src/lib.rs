@@ -47,6 +47,10 @@ const INTERVAL_GENERATE_WGSL: &str = include_str!("wgsl/interval_generate.wgsl")
 const INTERVAL_TILED_RASTERIZE_WGSL: &str = include_str!("wgsl/interval_tiled_rasterize.wgsl");
 const SHADOW_RAY_GEN_WGSL: &str = include_str!("wgsl/shadow_ray_gen.wgsl");
 const DEFERRED_SHADE_FRAG_WGSL: &str = include_str!("wgsl/deferred_shade_frag.wgsl");
+const GTAO_WGSL: &str = include_str!("wgsl/gtao.wgsl");
+const HIZ_LINEARIZE_WGSL: &str = include_str!("wgsl/hiz_linearize.wgsl");
+const HIZ_DOWNSAMPLE_WGSL: &str = include_str!("wgsl/hiz_downsample.wgsl");
+const AO_BILATERAL_WGSL: &str = include_str!("wgsl/ao_bilateral.wgsl");
 
 // ---------------------------------------------------------------------------
 // PBR deferred shading types
@@ -89,6 +93,22 @@ pub struct DeferredUniforms {
 
 /// Maximum number of lights supported.
 pub const MAX_LIGHTS: usize = 16;
+
+/// Uniforms for the GTAO ambient-occlusion pass. Matches WGSL `GtaoUniforms`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GtaoUniforms {
+    pub inv_proj: [[f32; 4]; 4],
+    pub view: [[f32; 4]; 4],
+    pub width: u32,
+    pub height: u32,
+    pub radius_world: f32,
+    pub thickness: f32,
+    pub proj_scale: f32,
+    pub near: f32,
+    pub far: f32,
+    pub max_mip: u32,
+}
 
 // ---------------------------------------------------------------------------
 // GPU Buffers
@@ -1497,6 +1517,11 @@ pub struct RenderTargets {
     pub normals_texture: wgpu::Texture,
     /// Depth output texture (Rgba16Float, premultiplied alpha blend)
     pub depth_texture: wgpu::Texture,
+    /// AO output texture (R8Unorm) — written by GTAO pass, read by deferred.
+    pub ao_texture: wgpu::Texture,
+    /// AO bilateral-blur intermediate (R8Unorm). H pass writes here, V pass
+    /// reads it and writes back to `ao_texture`.
+    pub ao_blur_temp_texture: wgpu::Texture,
     /// View into color texture
     pub color_view: wgpu::TextureView,
     /// View into aux texture
@@ -1505,6 +1530,10 @@ pub struct RenderTargets {
     pub normals_view: wgpu::TextureView,
     /// View into depth texture
     pub depth_view: wgpu::TextureView,
+    /// View into AO texture
+    pub ao_view: wgpu::TextureView,
+    /// View into AO blur intermediate.
+    pub ao_blur_temp_view: wgpu::TextureView,
     pub width: u32,
     pub height: u32,
 }
@@ -1583,19 +1612,58 @@ impl RenderTargets {
             view_formats: &[],
         });
 
+        let ao_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ao_target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        let ao_blur_temp_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ao_blur_temp"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let aux0_view = aux0_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let normals_view = normals_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ao_view = ao_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ao_blur_temp_view = ao_blur_temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
         Self {
             color_texture,
             aux0_texture,
             normals_texture,
             depth_texture,
+            ao_texture,
+            ao_blur_temp_texture,
             color_view,
             aux0_view,
             normals_view,
             depth_view,
+            ao_view,
+            ao_blur_temp_view,
             width,
             height,
         }
@@ -4638,6 +4706,17 @@ impl DeferredShadePipeline {
                     },
                     count: None,
                 },
+                // 7: AO texture (R8Unorm, written by GTAO pass)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -4763,6 +4842,7 @@ pub fn create_deferred_bind_group(
     deferred: &DeferredShadePipeline,
     targets: &RenderTargets,
     hw_depth_view: &wgpu::TextureView,
+    ao_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("deferred_shade_bg"),
@@ -4795,6 +4875,10 @@ pub fn create_deferred_bind_group(
             wgpu::BindGroupEntry {
                 binding: 6,
                 resource: wgpu::BindingResource::TextureView(hw_depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(ao_view),
             },
         ],
     })
@@ -4867,6 +4951,654 @@ pub fn record_deferred_shade(
     rpass.set_bind_group(0, bind_group, &[]);
     rpass.set_bind_group(1, dsm_bind_group, &[]);
     rpass.draw(0..3, 0..1); // fullscreen triangle
+}
+
+// ===========================================================================
+// GTAO Pipeline
+// ===========================================================================
+
+/// Fullscreen-fragment horizon-based AO pass. Reads hw_depth + normals,
+/// writes a single-channel R8Unorm AO factor.
+pub struct GtaoPipeline {
+    pub pipeline: wgpu::RenderPipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+    pub uniforms_buf: wgpu::Buffer,
+}
+
+impl GtaoPipeline {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gtao.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(GTAO_WGSL.into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gtao_bgl"),
+            entries: &[
+                // 0: GtaoUniforms
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 1: Hi-Z (full mip chain, R32Float linear view-space Z)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 2: world-space normals (raw, premul-alpha)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 3: volume expected-depth MRT (Rgba16Float; .r = depth*a, .a = a)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("gtao_pl"),
+            bind_group_layouts: &[&bind_group_layout],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("gtao_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gtao_uniforms"),
+            size: std::mem::size_of::<GtaoUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self { pipeline, bind_group_layout, uniforms_buf }
+    }
+}
+
+/// Create the GTAO bind group from the depth + normals views.
+pub fn create_gtao_bind_group(
+    device: &wgpu::Device,
+    gtao: &GtaoPipeline,
+    hiz_full_view: &wgpu::TextureView,
+    normals_view: &wgpu::TextureView,
+    volume_depth_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("gtao_bg"),
+        layout: &gtao.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: gtao.uniforms_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(hiz_full_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(normals_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(volume_depth_view),
+            },
+        ],
+    })
+}
+
+/// Record the GTAO render pass: reads depth+normals, writes AO into `ao_view`.
+pub fn record_gtao_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    gtao: &GtaoPipeline,
+    bind_group: &wgpu::BindGroup,
+    ao_view: &wgpu::TextureView,
+) {
+    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("gtao_pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: ao_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                // Clear to AO=1 (no occlusion); fragments overwrite where they shade.
+                load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    });
+    rpass.set_pipeline(&gtao.pipeline);
+    rpass.set_bind_group(0, bind_group, &[]);
+    rpass.draw(0..3, 0..1);
+}
+
+// ===========================================================================
+// Hi-Z (hierarchical depth pyramid) over the fused linear-Z buffer.
+// Mip 0 fuses hw depth (opaque primitives) and volume's expected-termination
+// depth into linear view-space Z. Each coarser mip stores the min() of its
+// 2x2 parent — the tightest possible occluder distance for any pixel covered
+// by the mip cell. Used by GTAO for cone-style stepping and (later) by SSGI
+// for ray-march traversal.
+// ===========================================================================
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct HizUniforms {
+    pub near: f32,
+    pub far: f32,
+    pub _pad0: f32,
+    pub _pad1: f32,
+}
+
+pub struct HizPipelines {
+    pub linearize_pipeline: wgpu::RenderPipeline,
+    pub linearize_bgl: wgpu::BindGroupLayout,
+    pub downsample_pipeline: wgpu::RenderPipeline,
+    pub downsample_bgl: wgpu::BindGroupLayout,
+    pub uniforms_buf: wgpu::Buffer,
+}
+
+impl HizPipelines {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let linearize_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("hiz_linearize.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(HIZ_LINEARIZE_WGSL.into()),
+        });
+        let downsample_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("hiz_downsample.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(HIZ_DOWNSAMPLE_WGSL.into()),
+        });
+
+        let linearize_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("hiz_linearize_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let downsample_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("hiz_downsample_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let r32_target = wgpu::ColorTargetState {
+            format: wgpu::TextureFormat::R32Float,
+            blend: None,
+            write_mask: wgpu::ColorWrites::RED,
+        };
+
+        let lin_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("hiz_linearize_pl"),
+            bind_group_layouts: &[&linearize_bgl],
+            immediate_size: 0,
+        });
+        let linearize_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hiz_linearize_pipeline"),
+            layout: Some(&lin_pl),
+            vertex: wgpu::VertexState {
+                module: &linearize_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &linearize_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(r32_target.clone())],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let dn_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("hiz_downsample_pl"),
+            bind_group_layouts: &[&downsample_bgl],
+            immediate_size: 0,
+        });
+        let downsample_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hiz_downsample_pipeline"),
+            layout: Some(&dn_pl),
+            vertex: wgpu::VertexState {
+                module: &downsample_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &downsample_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(r32_target)],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hiz_uniforms"),
+            size: std::mem::size_of::<HizUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            linearize_pipeline,
+            linearize_bgl,
+            downsample_pipeline,
+            downsample_bgl,
+            uniforms_buf,
+        }
+    }
+}
+
+/// A hierarchical Z buffer: R32Float, mip-chained.
+/// `full_view` exposes all mips for read-side sampling.
+/// `mip_views` are single-mip views — one read-only per mip, plus per-mip
+/// render-attachment views (same descriptor — wgpu allows binding either
+/// role from the same view as long as not simultaneously).
+pub struct HizTexture {
+    pub texture: wgpu::Texture,
+    pub full_view: wgpu::TextureView,
+    pub mip_views: Vec<wgpu::TextureView>,
+    pub mip_count: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl HizTexture {
+    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        // mip count = floor(log2(max(w, h))) + 1, at least 1.
+        let max_dim = width.max(height).max(1);
+        let mip_count = 32 - max_dim.leading_zeros();
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("hiz_texture"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: mip_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let full_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("hiz_full_view"),
+            ..Default::default()
+        });
+        let mip_views: Vec<wgpu::TextureView> = (0..mip_count)
+            .map(|m| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("hiz_mip_view"),
+                    base_mip_level: m,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Self { texture, full_view, mip_views, mip_count, width, height }
+    }
+}
+
+pub fn create_hiz_linearize_bind_group(
+    device: &wgpu::Device,
+    hiz: &HizPipelines,
+    hw_depth_view: &wgpu::TextureView,
+    volume_depth_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hiz_linearize_bg"),
+        layout: &hiz.linearize_bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: hiz.uniforms_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(hw_depth_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(volume_depth_view) },
+        ],
+    })
+}
+
+pub fn create_hiz_downsample_bind_group(
+    device: &wgpu::Device,
+    hiz: &HizPipelines,
+    parent_mip_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hiz_downsample_bg"),
+        layout: &hiz.downsample_bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(parent_mip_view) },
+        ],
+    })
+}
+
+/// Run the full Hi-Z build: linearize into mip 0, then min-downsample each
+/// descendant mip. Caller has already uploaded HizUniforms (near/far) and
+/// constructed the linearize bind group + per-mip downsample bind groups.
+pub fn record_hiz_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    hiz: &HizPipelines,
+    tex: &HizTexture,
+    linearize_bg: &wgpu::BindGroup,
+    downsample_bgs: &[wgpu::BindGroup],
+) {
+    // Mip 0: linearize + fuse hw + volume depth.
+    {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("hiz_linearize_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &tex.mip_views[0],
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0e20, g: 0.0, b: 0.0, a: 0.0 }),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        rpass.set_pipeline(&hiz.linearize_pipeline);
+        rpass.set_bind_group(0, linearize_bg, &[]);
+        rpass.draw(0..3, 0..1);
+    }
+
+    // Mips 1..mip_count: min-downsample from parent.
+    // downsample_bgs[i] binds mip i (parent), pass writes to mip i+1.
+    for i in 0..(tex.mip_count as usize - 1) {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("hiz_downsample_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &tex.mip_views[i + 1],
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0e20, g: 0.0, b: 0.0, a: 0.0 }),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        rpass.set_pipeline(&hiz.downsample_pipeline);
+        rpass.set_bind_group(0, &downsample_bgs[i], &[]);
+        rpass.draw(0..3, 0..1);
+    }
+}
+
+// ===========================================================================
+// AO bilateral blur — separable depth+normal-aware blur for the GTAO output.
+// Two passes (H, V) with the same pipeline, different bind groups (different
+// I/O views and a `direction` uniform).
+// ===========================================================================
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AoBlurUniforms {
+    pub dir_x: i32,    // (1, 0) for horizontal pass, (0, 1) for vertical
+    pub dir_y: i32,
+    pub sigma_z: f32,  // depth tolerance (world units)
+    pub sigma_n: f32,  // normal cosine power (e.g. 8 = cos^8)
+}
+
+pub struct AoBlurPipeline {
+    pub pipeline: wgpu::RenderPipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+    pub uniforms_h: wgpu::Buffer,
+    pub uniforms_v: wgpu::Buffer,
+}
+
+impl AoBlurPipeline {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ao_bilateral.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(AO_BILATERAL_WGSL.into()),
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ao_blur_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ao_blur_pl"),
+            bind_group_layouts: &[&bgl],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ao_blur_pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::RED,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let mk_uniforms = |label: &'static str| device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: std::mem::size_of::<AoBlurUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uniforms_h = mk_uniforms("ao_blur_uniforms_h");
+        let uniforms_v = mk_uniforms("ao_blur_uniforms_v");
+
+        Self { pipeline, bind_group_layout: bgl, uniforms_h, uniforms_v }
+    }
+}
+
+pub fn create_ao_blur_bind_group(
+    device: &wgpu::Device,
+    blur: &AoBlurPipeline,
+    uniforms_buf: &wgpu::Buffer,
+    ao_in_view: &wgpu::TextureView,
+    depth_view: &wgpu::TextureView,
+    normals_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("ao_blur_bg"),
+        layout: &blur.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: uniforms_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ao_in_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(normals_view) },
+        ],
+    })
+}
+
+/// Run one bilateral blur pass: read AO from `bind_group`'s input, write to
+/// `out_view`. Caller has already uploaded the per-pass `BlurUniforms`.
+pub fn record_ao_blur_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    blur: &AoBlurPipeline,
+    bind_group: &wgpu::BindGroup,
+    out_view: &wgpu::TextureView,
+) {
+    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("ao_blur_pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: out_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    });
+    rpass.set_pipeline(&blur.pipeline);
+    rpass.set_bind_group(0, bind_group, &[]);
+    rpass.draw(0..3, 0..1);
 }
 
 // ===========================================================================

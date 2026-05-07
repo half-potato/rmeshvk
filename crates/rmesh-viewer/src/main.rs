@@ -53,6 +53,34 @@ mod render;
 use gpu_state::*;
 
 /// Create an Rgba32Float texture for copying the raytrace buffer output to blit.
+/// Hard-fail when the loaded PbrData is missing the parametric BRDF channels
+/// (metallic / f0_dielectric / retro / albedo / roughness). This is what we'd
+/// see for a .rmesh file produced by an old `convert.py` (env_feature/MLP era);
+/// the deferred shader has no way to render those, so refuse to upload garbage.
+fn require_parametric_pbr(pbr: &rmesh_data::PbrData, tet_count: usize) {
+    let lens = [
+        ("roughness",     pbr.roughness.len()),
+        ("metallic",      pbr.metallic.len()),
+        ("f0_dielectric", pbr.f0_dielectric.len()),
+        ("retro",         pbr.retro.len()),
+        ("albedo",        pbr.albedo.len() / 3),
+    ];
+    let bad: Vec<_> = lens.iter().filter(|(_, l)| *l != tet_count).collect();
+    if !bad.is_empty() {
+        let detail = bad.iter()
+            .map(|(name, l)| format!("{}={}", name, l))
+            .collect::<Vec<_>>()
+            .join(", ");
+        panic!(
+            "PBR data missing parametric BRDF channels for {} tets ({}). \
+             This .rmesh was likely produced with an older convert.py — \
+             regenerate it with the parametric-BRDF convert.py that emits \
+             metallic / f0_dielectric / retro tagged sections.",
+            tet_count, detail,
+        );
+    }
+}
+
 fn create_rt_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("rt_output_texture"),
@@ -103,6 +131,11 @@ struct App {
     deferred_enabled: bool,
     deferred_debug_mode: u32,
     ambient: f32,
+    sky_color: [f32; 3],
+    ground_color: [f32; 3],
+    exposure: f32,
+    ao_strength: f32,
+    gtao_radius: f32,
     dsm_query_depth: f32,
     /// Cached light state for DSM dirty detection.
     cached_dsm_lights: Vec<rmesh_render::GpuLight>,
@@ -140,7 +173,12 @@ impl App {
             loaded_path: None,
             pending_load: None,
             vsync: true,
-            render_mode: RenderMode::Regular,
+            // Default to IntervalShader when PBR data is loaded — only this
+            // path runs interval_fragment.wgsl, which writes the metallic/F0/
+            // retro channels the deferred shader expects. Other modes write
+            // legacy (t_min, t_max, od, dist) into aux0 and the deferred shader
+            // would misread them as PBR values (metallic ≈ t_max → all green).
+            render_mode: if pbr.is_some() { RenderMode::IntervalShader } else { RenderMode::Regular },
             mesh_shader_supported: false,
             fluid_enabled: false,
             fluid_params: FluidParams::default(),
@@ -152,7 +190,12 @@ impl App {
             next_primitive_id: 1,
             deferred_enabled: pbr.is_some(),
             deferred_debug_mode: 0,
-            ambient: 0.00,
+            ambient: 0.3,
+            sky_color: [0.55, 0.7, 0.95],
+            ground_color: [0.25, 0.22, 0.18],
+            exposure: 1.0,
+            ao_strength: 1.0,
+            gtao_radius: 0.5,
             dsm_query_depth: 1.0,
             cached_dsm_lights: Vec::new(),
             cached_dsm_num_lights: 0,
@@ -317,17 +360,21 @@ impl App {
         });
         let sh_degree = self.sh_coeffs.degree;
 
-        // Upload PBR aux data if available: [M * 8] f32 packed as [roughness, env_feat(4), albedo(3)]
+        // Upload PBR aux data if available: [M * 8] f32 packed as
+        //   [roughness, metallic, f0_dielectric, retro, _unused, albedo.rgb]
+        // Matches the parametric BRDF format produced by convert.py.
         let aux_data_buf = if let Some(ref pbr) = self.pbr_data {
             let tet_count = self.scene_data.tet_count as usize;
+            require_parametric_pbr(pbr, tet_count);
             let mut aux = vec![0.0f32; tet_count * 8];
             for t in 0..tet_count {
-                aux[t * 8] = if t < pbr.roughness.len() { pbr.roughness[t] } else { 0.5 };
-                for c in 0..4 {
-                    aux[t * 8 + 1 + c] = if t * 4 + c < pbr.env_feature.len() { pbr.env_feature[t * 4 + c] } else { 0.0 };
-                }
+                aux[t * 8 + 0] = pbr.roughness[t];
+                aux[t * 8 + 1] = pbr.metallic[t];
+                aux[t * 8 + 2] = pbr.f0_dielectric[t];
+                aux[t * 8 + 3] = pbr.retro[t];
+                aux[t * 8 + 4] = 0.0;
                 for c in 0..3 {
-                    aux[t * 8 + 5 + c] = if t * 3 + c < pbr.albedo.len() { pbr.albedo[t * 3 + c] } else { 0.5 };
+                    aux[t * 8 + 5 + c] = pbr.albedo[t * 3 + c];
                 }
             }
             // Override vertex normals from PBR data
@@ -498,12 +545,56 @@ impl App {
             None,
         );
 
+        // Hi-Z mip pyramid over fused linear-Z. Built each frame; feeds GTAO
+        // (and later SSGI). Pipelines are global; texture + bind groups are
+        // resized when the surface size changes.
+        let hiz_pipelines = rmesh_render::HizPipelines::new(&device);
+        let hiz_texture = rmesh_render::HizTexture::new(&device, size.width.max(1), size.height.max(1));
+        let hiz_linearize_bg = rmesh_render::create_hiz_linearize_bind_group(
+            &device, &hiz_pipelines,
+            &primitive_targets.depth_view,
+            &targets.depth_view,
+        );
+        let hiz_downsample_bgs: Vec<wgpu::BindGroup> = (0..(hiz_texture.mip_count as usize - 1))
+            .map(|i| rmesh_render::create_hiz_downsample_bind_group(
+                &device, &hiz_pipelines, &hiz_texture.mip_views[i],
+            ))
+            .collect();
+
+        // GTAO pass — always created. AO target is in `targets`. Reads Hi-Z
+        // for fused depth (sample any mip) and the volume MRT for std.
+        let gtao_pipeline = rmesh_render::GtaoPipeline::new(&device);
+        let gtao_bg = rmesh_render::create_gtao_bind_group(
+            &device, &gtao_pipeline,
+            &hiz_texture.full_view,
+            &targets.normals_view,
+            &targets.depth_view,
+        );
+
+        // AO bilateral blur (separable, depth+normal aware). H reads ao_view
+        // → writes ao_blur_temp_view; V reads ao_blur_temp_view → writes ao_view.
+        let ao_blur_pipeline = rmesh_render::AoBlurPipeline::new(&device);
+        let ao_blur_bg_h = rmesh_render::create_ao_blur_bind_group(
+            &device, &ao_blur_pipeline,
+            &ao_blur_pipeline.uniforms_h,
+            &targets.ao_view,
+            &hiz_texture.full_view,
+            &targets.normals_view,
+        );
+        let ao_blur_bg_v = rmesh_render::create_ao_blur_bind_group(
+            &device, &ao_blur_pipeline,
+            &ao_blur_pipeline.uniforms_v,
+            &targets.ao_blur_temp_view,
+            &hiz_texture.full_view,
+            &targets.normals_view,
+        );
+
         // Deferred PBR shading pipeline (only when PBR data is loaded)
         let has_pbr = self.pbr_data.is_some();
         let (deferred_pipeline, deferred_bg, deferred_output, deferred_output_view, deferred_blit_bg, deferred_dsm_dummy_bg) = if has_pbr {
             log::info!("Creating deferred PBR shading pipeline...");
             let dp = rmesh_render::DeferredShadePipeline::new(&device, color_format);
-            let bg = rmesh_render::create_deferred_bind_group(&device, &dp, &targets, &primitive_targets.depth_view);
+            let bg = rmesh_render::create_deferred_bind_group(&device, &dp, &targets, &primitive_targets.depth_view, &targets.ao_view);
             // Dummy DSM bind group (1x1 atlas, no lights)
             let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&device);
             let dummy_dsm_bg = rmesh_render::create_deferred_dsm_bind_group(
@@ -676,6 +767,15 @@ impl App {
             aux_data_buf,
             deferred_pipeline,
             deferred_bg,
+            gtao_pipeline,
+            gtao_bg,
+            hiz_pipelines,
+            hiz_texture,
+            hiz_linearize_bg,
+            hiz_downsample_bgs,
+            ao_blur_pipeline,
+            ao_blur_bg_h,
+            ao_blur_bg_v,
             deferred_output,
             deferred_output_view,
             deferred_blit_bg,
@@ -886,15 +986,18 @@ impl App {
             // Upload PBR aux data if available
             gpu.has_pbr_data = self.pbr_data.is_some();
             if let Some(ref pbr) = self.pbr_data {
+                // Aux layout: [roughness, metallic, f0_dielectric, retro, _unused, albedo.rgb]
                 let tc = self.scene_data.tet_count as usize;
+                require_parametric_pbr(pbr, tc);
                 let mut aux = vec![0.0f32; tc * 8];
                 for t in 0..tc {
-                    aux[t * 8] = if t < pbr.roughness.len() { pbr.roughness[t] } else { 0.5 };
-                    for c in 0..4 {
-                        aux[t * 8 + 1 + c] = if t * 4 + c < pbr.env_feature.len() { pbr.env_feature[t * 4 + c] } else { 0.0 };
-                    }
+                    aux[t * 8 + 0] = pbr.roughness[t];
+                    aux[t * 8 + 1] = pbr.metallic[t];
+                    aux[t * 8 + 2] = pbr.f0_dielectric[t];
+                    aux[t * 8 + 3] = pbr.retro[t];
+                    aux[t * 8 + 4] = 0.0;
                     for c in 0..3 {
-                        aux[t * 8 + 5 + c] = if t * 3 + c < pbr.albedo.len() { pbr.albedo[t * 3 + c] } else { 0.5 };
+                        aux[t * 8 + 5 + c] = pbr.albedo[t * 3 + c];
                     }
                 }
                 if !pbr.vertex_normals.is_empty() {
@@ -913,7 +1016,7 @@ impl App {
                 // Recreate deferred pipeline
                 let color_format = wgpu::TextureFormat::Rgba16Float;
                 let dp = rmesh_render::DeferredShadePipeline::new(&gpu.device, color_format);
-                gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(&gpu.device, &dp, &gpu.targets, &gpu.primitive_targets.depth_view));
+                gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(&gpu.device, &dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view));
                 // Reset DSM state (will be regenerated on next frame with lights)
                 let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&gpu.device);
                 gpu.deferred_dsm_dummy_bg = Some(rmesh_render::create_deferred_dsm_bind_group(
@@ -1046,10 +1149,47 @@ impl App {
             // Recreate primitive depth target
             gpu.primitive_targets = PrimitiveTargets::new(&gpu.device, new_size.width, new_size.height);
 
+            // Recreate Hi-Z (texture + per-mip bind groups) since size changed.
+            gpu.hiz_texture = rmesh_render::HizTexture::new(&gpu.device, new_size.width, new_size.height);
+            gpu.hiz_linearize_bg = rmesh_render::create_hiz_linearize_bind_group(
+                &gpu.device, &gpu.hiz_pipelines,
+                &gpu.primitive_targets.depth_view,
+                &gpu.targets.depth_view,
+            );
+            gpu.hiz_downsample_bgs = (0..(gpu.hiz_texture.mip_count as usize - 1))
+                .map(|i| rmesh_render::create_hiz_downsample_bind_group(
+                    &gpu.device, &gpu.hiz_pipelines, &gpu.hiz_texture.mip_views[i],
+                ))
+                .collect();
+
+            // Recreate GTAO bind group: Hi-Z full view + normals + volume depth.
+            gpu.gtao_bg = rmesh_render::create_gtao_bind_group(
+                &gpu.device, &gpu.gtao_pipeline,
+                &gpu.hiz_texture.full_view,
+                &gpu.targets.normals_view,
+                &gpu.targets.depth_view,
+            );
+
+            // Recreate AO blur bind groups (texture views changed).
+            gpu.ao_blur_bg_h = rmesh_render::create_ao_blur_bind_group(
+                &gpu.device, &gpu.ao_blur_pipeline,
+                &gpu.ao_blur_pipeline.uniforms_h,
+                &gpu.targets.ao_view,
+                &gpu.hiz_texture.full_view,
+                &gpu.targets.normals_view,
+            );
+            gpu.ao_blur_bg_v = rmesh_render::create_ao_blur_bind_group(
+                &gpu.device, &gpu.ao_blur_pipeline,
+                &gpu.ao_blur_pipeline.uniforms_v,
+                &gpu.targets.ao_blur_temp_view,
+                &gpu.hiz_texture.full_view,
+                &gpu.targets.normals_view,
+            );
+
             // Recreate deferred resources since MRT texture views changed
             if let Some(ref dp) = gpu.deferred_pipeline {
                 gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(
-                    &gpu.device, dp, &gpu.targets, &gpu.primitive_targets.depth_view,
+                    &gpu.device, dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view,
                 ));
                 let out_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("deferred_output"),
