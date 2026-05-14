@@ -327,7 +327,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let world_h = uniforms.inv_vp * clip_pos;
     let world_pos = world_h.xyz / world_h.w;
 
-    let use_two_sample = depth_alpha >= 0.01 && z_sigma > 1e-4;
+    let use_two_sample = false;//depth_alpha >= 0.01 && z_sigma > 1e-4;
     let z_shadow_a = max(z_expected - 0.41421356 * z_sigma, near);
     let z_shadow_b = min(z_expected + 2.41421356 * z_sigma, far);
     let ndc_z_a = (far * (z_shadow_a - near)) / (z_shadow_a * (far - near));
@@ -352,7 +352,6 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let F_view = fresnel_schlick(NoV, F0);
     let kd = (vec3f(1.0) - F_view) * (1.0 - metallic);
     // Note: no 1/π — matches pbr_renderer.render_relit (parametric branch).
-    let diff_base = kd * albedo;
 
     // Accumulate per-light direct lighting
     var total_diffuse  = vec3f(0.0);
@@ -384,7 +383,6 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
 
         let L = to_light;
         let NoL = max(dot(N, L), 0.0);
-        if (NoL <= 0.0) { continue; }
 
         let H = normalize(L + V);
         let NoH = max(dot(N, H), 0.0);
@@ -413,25 +411,15 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
         // Plain Lambertian NoL.
         let l_color = light.color * light.intensity;
         let energy = T * atten;
-        total_diffuse  += diff_base * NoL * energy * l_color;
+        total_diffuse  += kd * energy * l_color * albedo;
         total_specular += spec      * energy * l_color;
     }
-    // Hemispherical ambient × AO.
-    //
-    // The user-set sky/ground hemi is treated as a *far environment probe* —
-    // it only contributes via Fresnel-tinted specular reflection (env_F · hemi).
-    // It does NOT drive a diffuse irradiance term, because adding `kd · albedo
-    // · hemi` paints the receiver's albedo into what should read as a clean
-    // tinted reflection (visually indistinguishable from Lambertian ambient,
-    // and wrong on metals tinted by a colored hemi).
-    //
-    // Diffuse ambient comes from SSGI only — that's the actual gathered
-    // indirect radiance from on-screen bounces. With SSGI off, diffuse ambient
-    // is zero and the receiver relies on direct lights for its base color.
-    let hemi = mix(uniforms.ground_color, uniforms.sky_color, normal.y * 0.5 + 0.5);
-    let ao_factor = mix(1.0, ao, uniforms.ao_strength);
 
-    let ambient_diffuse = kd * albedo * ssgi_indirect * uniforms.ssgi_strength;
+    // Hemispherical ambient × AO.
+    let ao_factor = mix(1.0, ao, uniforms.ao_strength);
+    let env_F = env_brdf_approx(F0, r_clamped, NoV);
+
+    let ambient_diffuse = (1-env_F) * (1.0 - metallic) * albedo * ssgi_indirect * uniforms.ssgi_strength;
 
     // Indirect specular radiance: smooth surfaces use the SSR ray (sharp,
     // along reflect(V, N)); rough surfaces fall back to SSGI's hemisphere
@@ -443,24 +431,13 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     // the off-screen / no-hit case inside ssr_compute.wgsl.
     let smoothness = 1.0 - r_clamped;
     let smoothness_sq = smoothness * smoothness;
-    let ssr_grazing_fade = smoothstep(0.05, 0.35, NoV);
-    let ssr_effective = mix(ssgi_indirect, ssr_radiance, ssr_grazing_fade);
-    let indirect_spec_radiance = mix(ssgi_indirect, ssr_effective, smoothness_sq);
+    let indirect_spec_radiance = mix(ssgi_indirect, ssr_radiance, smoothness_sq);
 
     // Lazarov env-BRDF fit: replaces F_view for the ambient/IBL specular so
     // the Fresnel factor accounts for roughness (lobe broadening + bias),
     // not just NoV. Without this, a r=1 surface and a r=0.05 surface would
     // get identical specular intensity.
     //
-    // No constant `env_F · hemi` term. For metals, env_F ≈ F0 = albedo, so
-    // env_F · hemi reduces to albedo · hemi — visually indistinguishable from
-    // a Lambertian albedo·hemi multiply, which paints the metal's base color
-    // across the whole surface and reads as a diffuse leak. Real environment
-    // reflection requires an actual environment signal; here that comes from
-    // SSR rays whose miss path falls back to SSGI's hemi gradient — so the
-    // user's sky/ground colors still tint metals, but only through rays that
-    // actually look toward those directions.
-    let env_F = env_brdf_approx(F0, r_clamped, NoV);
     let ambient_specular = env_F * indirect_spec_radiance * uniforms.ssgi_strength;
 
     let ambient_term = uniforms.ambient * (ambient_diffuse) * ao_factor;
@@ -482,17 +459,13 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     else if (dm == DBG_PBR)         { final_color = vec3f(roughness, metallic, f0_dielectric); }
     else if (dm == DBG_DEPTH)       { final_color = vec3f(uniforms.exposure * z_expected * 0.1); }
     else if (dm == DBG_SPECULAR)    { final_color = aces_narkowicz(total_specular * uniforms.exposure); }
-    else if (dm == DBG_DIFFUSE)     { final_color = aces_narkowicz((total_diffuse + ambient_term) * uniforms.exposure); }
+    else if (dm == DBG_DIFFUSE)     { final_color = aces_narkowicz((total_diffuse) * uniforms.exposure); }
     else if (dm == DBG_SHADOW) {
         var T_total = 0.0;
-        if uniforms.dsm_enabled != 0u {
-            for (var li = 0u; li < uniforms.num_lights; li = li + 1u) {
-                T_total += evaluate_transmittance(world_pos, li);
-            }
-            final_color = uniforms.exposure * vec3f(T_total / max(f32(uniforms.num_lights), 1.0));
-        } else {
-            final_color = uniforms.exposure * vec3f(1.0);
+        for (var li = 0u; li < uniforms.num_lights; li = li + 1u) {
+            T_total += evaluate_transmittance(world_pos, li);
         }
+        final_color = uniforms.exposure * vec3f(T_total / max(f32(uniforms.num_lights), 1.0));
     }
     else if (dm == DBG_LAMBDA) {
         // Reused: UV coords in light-space (first light) for debugging shadow projection.

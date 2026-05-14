@@ -181,5 +181,5 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     // Center-pixel AO fade: same idea applied to the originating pixel.
     let sig_c = pixel_std(coords);
     let conf_center = 1.0 - smoothstep(0.0, g.radius_world * 0.5, sig_c);
-    return vec4f(mix(1.0, ao, conf_center));
+    return vec4f(ao);
 }
