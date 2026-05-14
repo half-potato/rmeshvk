@@ -281,24 +281,6 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let inv_da = 1.0 / max(depth_alpha, 1e-6);
     let z_expected = depth_raw.r * inv_da;
 
-    // Shadow-integration samples along the view ray. Model the alpha-weighted
-    // depth PDF as Exp(λ) anchored at z_expected − σ with scale s = σ, so the
-    // mean still matches z_expected. 2-point Gauss–Laguerre quadrature places
-    // samples at z₀ + s·{2−√2, 2+√2} with weights {(2+√2)/4, (2−√2)/4} ≈
-    // {0.854, 0.146}. The asymmetric weights cap floater damage at ~15% even
-    // when the far sample lands in empty space.
-    // Only meaningful when slot 3 has thick-tet coverage; otherwise fall back to
-    // single-sample at world_pos (which came from hw_depth).
-    let z_var = max(depth_raw.b - depth_raw.r * depth_raw.r, 0.0) / depth_alpha;
-    // Clamp σ_v to a fraction of z_expected. At silhouette edges σ_v inflates
-    // because the alpha-weighted depth distribution captures the volume's
-    // thinness at the edge (not real depth spread), which would otherwise push
-    // the far sample z_b = z_expected + 2.414·σ_v deep into empty space behind
-    // the volume — where the DSM returns T ≈ 1 and the 0.146-weighted sample
-    // brightens the edge. Interior pixels have σ_v ≪ z_expected so the clamp
-    // is inactive there.
-    let z_sigma = min(sqrt(z_var), z_expected);
-
     let near = uniforms.near_plane;
     let far  = uniforms.far_plane;
 
@@ -326,16 +308,6 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let clip_pos = vec4f(ndc_x, ndc_y, ndc_z, 1.0);
     let world_h = uniforms.inv_vp * clip_pos;
     let world_pos = world_h.xyz / world_h.w;
-
-    let use_two_sample = false;//depth_alpha >= 0.01 && z_sigma > 1e-4;
-    let z_shadow_a = max(z_expected - 0.41421356 * z_sigma, near);
-    let z_shadow_b = min(z_expected + 2.41421356 * z_sigma, far);
-    let ndc_z_a = (far * (z_shadow_a - near)) / (z_shadow_a * (far - near));
-    let ndc_z_b = (far * (z_shadow_b - near)) / (z_shadow_b * (far - near));
-    let world_ha = uniforms.inv_vp * vec4f(ndc_x, ndc_y, ndc_z_a, 1.0);
-    let world_hb = uniforms.inv_vp * vec4f(ndc_x, ndc_y, ndc_z_b, 1.0);
-    let world_pos_a = world_ha.xyz / world_ha.w;
-    let world_pos_b = world_hb.xyz / world_hb.w;
 
     // Per-pixel constants for the BRDF (parametric metallic workflow).
     let V = normalize(uniforms.cam_pos - world_pos);
@@ -399,19 +371,13 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
 
         var T = 1.0;
         if (uniforms.dsm_enabled != 0u) {
-            if (use_two_sample) {
-                let Ta = evaluate_transmittance(world_pos_a, li);
-                let Tb = evaluate_transmittance(world_pos_b, li);
-                T = 0.85355339 * Ta + 0.14644661 * Tb;
-            } else {
-                T = evaluate_transmittance(world_pos, li);
-            }
+            T = evaluate_transmittance(world_pos, li);
         }
 
         // Plain Lambertian NoL.
         let l_color = light.color * light.intensity;
         let energy = T * atten;
-        total_diffuse  += kd * energy * l_color * albedo;
+        total_diffuse  += kd * energy * l_color * albedo * NoL;
         total_specular += spec      * energy * l_color;
     }
 
@@ -440,7 +406,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     //
     let ambient_specular = env_F * indirect_spec_radiance * uniforms.ssgi_strength;
 
-    let ambient_term = uniforms.ambient * (ambient_diffuse) * ao_factor;
+    let ambient_term = uniforms.ambient * ambient_diffuse * ao_factor;
 
     var lit = total_diffuse + total_specular + ambient_term;
     var final_color = aces_narkowicz(lit * uniforms.exposure);
@@ -492,7 +458,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     else if (dm == DBG_PLASTER)     { final_color = albedo; }
     else if (dm == DBG_ALPHA)       { final_color = vec3f(alpha); }
     else if (dm == DBG_PRIMITIVES)  { /* final_color already correct — volume pass skipped on CPU */ }
-    else if (dm == DBG_AO)          { final_color = vec3f(ao); }
+    else if (dm == DBG_AO)          { final_color = uniforms.exposure*vec3f(ao); }
     else if (dm == DBG_SSGI)        { final_color = ssgi_indirect; }
     else if (dm == DBG_LIT_HISTORY) { final_color = textureLoad(lit_history_tex, coords, 0).rgb; }
     else if (dm == DBG_SSR)         { final_color = ssr_radiance; }

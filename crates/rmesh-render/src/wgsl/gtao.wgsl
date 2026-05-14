@@ -1,22 +1,30 @@
-// Horizon-based ambient occlusion (GTAO-lite) over a Hi-Z chain.
+// Ground-Truth Ambient Occlusion (Jiménez 2016) over a Hi-Z chain.
 //
 // Fullscreen fragment pass. Reads the Hi-Z mip pyramid (linear view-space Z,
 // fused from hw depth and the volume's expected-termination depth) and the
 // volume normals MRT; writes a single-channel R8Unorm AO factor in [0, 1]
 // (1 = no occlusion, 0 = fully occluded).
 //
-// Per pixel:
+// Canonical GTAO horizon-search:
 //   - center linear Z from Hi-Z mip 0; reconstruct view-space pos
 //   - transform world-space gradient → view-space normal
-//   - sample 4 screen-space directions × N steps; per step pick a Hi-Z mip
-//     whose footprint matches the step's stride (cone-style sampling)
-//   - per-pixel rotation/jitter via interleaved gradient noise
-//   - neighbor occlusion contribution is weighted by the neighbor's depth
+//   - per slice (azimuth φ), project the view normal into the slice plane,
+//     measure signed normal angle `n` from view direction
+//   - sample 2*N steps along the slice (forward + backward) and track
+//     signed horizon angles h1, h2 (clamped to the visible cone)
+//   - per-sample occlusion is attenuated by a smooth `1 - (d/r)^falloff_pow`
+//     falloff (canonical GTAO) instead of a hard depth cutoff
+//   - per-slice visibility uses the closed-form integral
+//       v_i = 0.5 * (sin(h1 - n) + sin(h2 + n))   ∈ [-1, +1]
+//   - neighbor occluder contribution is weighted by the neighbor's depth
 //     std (read from the volume MRT) — fuzzy neighbors aren't sharp occluders
 //   - final AO is faded toward 1 by the center pixel's own depth std
 
 const PI: f32 = 3.14159265358979323846;
+const HALF_PI: f32 = 1.57079632679489661923;
 const Z_SKY: f32 = 1.0e20;
+// Canonical GTAO distance falloff exponent. Larger = sharper near-radius cutoff.
+const FALLOFF_POW: f32 = 2.0;
 
 struct GtaoUniforms {
     inv_proj: mat4x4f,    // clip → view-space pos
@@ -24,7 +32,7 @@ struct GtaoUniforms {
     width: u32,
     height: u32,
     radius_world: f32,
-    thickness: f32,
+    thickness: f32,       // unused; retained for buffer-layout compatibility
     proj_scale: f32,      // = proj[1][1] * height * 0.5
     near: f32,
     far: f32,
@@ -99,6 +107,8 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     if (z_center >= Z_SKY * 0.5) { return vec4f(1.0); }   // sky → no occlusion
 
     let p = view_pos_from_linear_z(uv, z_center);
+    // View direction: from fragment toward camera (camera at origin in view space).
+    let view_dir = normalize(-p);
 
     // World normal → view-space (matches deferred shader's flip).
     let n_raw = textureLoad(normals_tex, coords, 0);
@@ -118,25 +128,62 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let NUM_DIRS: u32 = 4u;
     let NUM_STEPS: u32 = 6u;
 
-    var sum_occl = 0.0;
+    var sum_visibility = 0.0;
 
     for (var di: u32 = 0u; di < NUM_DIRS; di = di + 1u) {
         let phi = phi_rand * PI + (f32(di) / f32(NUM_DIRS)) * PI;
         let dir2d = vec2f(cos(phi), sin(phi));
 
-        var max_pos = 0.0;
-        var max_neg = 0.0;
+        // Build the view-space slice frame. Take a tiny screen-space probe to
+        // get the in-slice tangent (the +dir direction in view space).
+        let uv_probe = uv + dir2d / dim;
+        let p_probe = view_pos_from_linear_z(uv_probe, z_center);
+        let slice_dir_raw = p_probe - p;
+        if (dot(slice_dir_raw, slice_dir_raw) < 1e-12) {
+            sum_visibility = sum_visibility + 1.0;
+            continue;
+        }
+        let slice_dir = normalize(slice_dir_raw);
+
+        // Out-of-slice axis (perpendicular to view_dir and slice_dir).
+        let slice_axis = cross(view_dir, slice_dir);
+        let slice_axis_len = length(slice_axis);
+        if (slice_axis_len < 1e-6) {
+            sum_visibility = sum_visibility + 1.0;
+            continue;
+        }
+        let slice_axis_n = slice_axis / slice_axis_len;
+
+        // Project the view normal into the slice plane.
+        let n_proj_vec = n_view - slice_axis_n * dot(n_view, slice_axis_n);
+        let n_proj_len = length(n_proj_vec);
+        if (n_proj_len < 1e-4) {
+            sum_visibility = sum_visibility + 1.0;
+            continue;
+        }
+        let n_proj = n_proj_vec / n_proj_len;
+
+        // Signed angle of projected normal from view_dir, in slice plane,
+        // positive toward +slice_dir.
+        let cos_n = clamp(dot(n_proj, view_dir), -1.0, 1.0);
+        let sgn_n = sign(dot(n_proj, slice_dir));
+        let n = sgn_n * acos(cos_n);
+
+        // Signed horizon angles, measured from view_dir in the slice plane.
+        // h1 on +slice_dir side, h2 on −slice_dir side (h2 is also signed
+        // such that "positive" means it's the magnitude of the angle from
+        // view_dir going toward −slice_dir).
+        // Initialize at the visible-cone bounds (no occluder yet).
+        var h1 = n + HALF_PI;
+        var h2 = HALF_PI - n;
 
         for (var s: u32 = 1u; s <= NUM_STEPS; s = s + 1u) {
             let t = (f32(s) - 1.0 + off_rand) / f32(NUM_STEPS - 1u);
             let stride_pixels = max(t * pixel_radius, 1.0);
-            // Pick a Hi-Z mip whose footprint roughly matches the step's stride.
-            // Each mip level halves the sample count along the cone; cheap noise
-            // reduction at distance and faster texture access.
             let mip = u32(clamp(floor(log2(stride_pixels)), 0.0, f32(g.max_mip)));
             let off = dir2d * t * pixel_radius / dim;
 
-            // Forward sample
+            // ----- +slice_dir side -----
             let uv_p = uv + off;
             if (uv_p.x >= 0.0 && uv_p.x <= 1.0 && uv_p.y >= 0.0 && uv_p.y <= 1.0) {
                 let z_p = hiz_load(uv_p, mip);
@@ -144,17 +191,35 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
                     let p_p = view_pos_from_linear_z(uv_p, z_p);
                     let delta = p_p - p;
                     let len = length(delta);
-                    if (len < g.thickness && len > 1e-4) {
-                        let cos_h = max(dot(delta / len, n_view), 0.0);
+                    let d_over_r = len / max(g.radius_world, 1e-6);
+                    if (len > 1e-4 && d_over_r < 1.0) {
+                        let sample_dir = delta / len;
+                        // 2D coords in slice plane: x along view_dir, y along +slice_dir.
+                        let sx = dot(sample_dir, view_dir);
+                        let sy = dot(sample_dir, slice_dir);
+                        // Signed horizon angle of this sample from view_dir
+                        // (positive = above view_dir on +slice_dir side).
+                        let theta = atan2(sy, sx);
+
+                        // Smooth distance falloff (canonical GTAO) +
+                        // neighbor-confidence weight from volume σ.
+                        let falloff = 1.0 - pow(d_over_r, FALLOFF_POW);
                         let c_p = vec2u(clamp(uv_p * dim, vec2f(0.0), dim - vec2f(1.0)));
                         let sig_p = pixel_std(c_p);
                         let neighbor_conf = 1.0 - smoothstep(0.0, g.radius_world * 0.5, sig_p);
-                        max_pos = max(max_pos, cos_h * neighbor_conf);
+                        let w = clamp(falloff * neighbor_conf, 0.0, 1.0);
+
+                        // Occluders shrink the visible cone: pull h1 down toward theta
+                        // by weight w, but only if the sample actually raises occlusion
+                        // (theta < h1 means the sample sits inside the current cone).
+                        if (theta < h1) {
+                            h1 = mix(h1, theta, w);
+                        }
                     }
                 }
             }
 
-            // Backward sample
+            // ----- −slice_dir side -----
             let uv_n = uv - off;
             if (uv_n.x >= 0.0 && uv_n.x <= 1.0 && uv_n.y >= 0.0 && uv_n.y <= 1.0) {
                 let z_n = hiz_load(uv_n, mip);
@@ -162,24 +227,41 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
                     let p_n = view_pos_from_linear_z(uv_n, z_n);
                     let delta = p_n - p;
                     let len = length(delta);
-                    if (len < g.thickness && len > 1e-4) {
-                        let cos_h = max(dot(delta / len, n_view), 0.0);
+                    let d_over_r = len / max(g.radius_world, 1e-6);
+                    if (len > 1e-4 && d_over_r < 1.0) {
+                        let sample_dir = delta / len;
+                        // Mirror y so the same logic applies to the −slice_dir side.
+                        let sx = dot(sample_dir, view_dir);
+                        let sy = -dot(sample_dir, slice_dir);
+                        let theta = atan2(sy, sx);
+
+                        let falloff = 1.0 - pow(d_over_r, FALLOFF_POW);
                         let c_n = vec2u(clamp(uv_n * dim, vec2f(0.0), dim - vec2f(1.0)));
                         let sig_n = pixel_std(c_n);
                         let neighbor_conf = 1.0 - smoothstep(0.0, g.radius_world * 0.5, sig_n);
-                        max_neg = max(max_neg, cos_h * neighbor_conf);
+                        let w = clamp(falloff * neighbor_conf, 0.0, 1.0);
+
+                        if (theta < h2) {
+                            h2 = mix(h2, theta, w);
+                        }
                     }
                 }
             }
         }
-        sum_occl = sum_occl + max_pos + max_neg;
+
+        // Clamp horizons to the visible cone (visibility half-spaces around the
+        // projected normal): h1 - n ∈ [-π/2, π/2], h2 + n ∈ [-π/2, π/2].
+        h1 = clamp(h1, n - HALF_PI, n + HALF_PI);
+        h2 = clamp(h2, -HALF_PI - n, HALF_PI - n);
+
+        // Per-slice visibility (closed-form GTAO integral) ∈ [-1, +1].
+        //   +1 = no occluders, -1 = fully occluded.
+        let v_slice = 0.5 * (sin(h1 - n) + sin(h2 + n));
+        sum_visibility = sum_visibility + v_slice;
     }
 
-    let occl = sum_occl / (f32(NUM_DIRS) * 2.0);
-    let ao = 1.0 - clamp(occl, 0.0, 1.0);
-
-    // Center-pixel AO fade: same idea applied to the originating pixel.
-    let sig_c = pixel_std(coords);
-    let conf_center = 1.0 - smoothstep(0.0, g.radius_world * 0.5, sig_c);
+    let v_avg = sum_visibility / f32(NUM_DIRS);
+    // Map signed visibility ∈ [-1, +1] → AO factor ∈ [0, 1].
+    let ao = clamp(0.5 * (v_avg + 1.0), 0.0, 1.0);
     return vec4f(ao);
 }
