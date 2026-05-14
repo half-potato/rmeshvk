@@ -177,22 +177,13 @@ fn select_cubemap_face(dir: vec3f) -> u32 {
     }
 }
 
-/// Evaluate transmittance T(world_pos) by fitting the α-weighted light-side
-/// termination distribution as Exp(λ=1/σ_l) anchored at z₀ = μ_l − σ_l (mean
-/// and variance of this exponential match the stored moments). Closed-form CDF:
-///   T(z) = (1 − α_total) + α_total · exp(−(z − z₀)/σ_l),  z ≥ z₀
-///   T(z) = 1,                                              z < z₀
-/// Symmetric with the view-side exponential model used for quadrature; replaces
-/// the distribution-free Chebyshev/Cantelli bound with the actual exponential
-/// transmittance. The (1 − α_total) floor is built in naturally.
-///
-/// Receiver-side bias: a lit surface sits inside its own absorber distribution
-/// (μ_l ≈ surface depth, σ_l ≈ surface thickness), so without bias z ≈ μ_l and
-/// decay → e⁻¹ even when no occluders precede the receiver. Shift z toward the
-/// light by σ_l so the receiver lands at z₀ and reads T = 1. Not modulated by
-/// NdotL: the Lambertian factor is already applied by the caller, so doing it
-/// here too produces an NdotL² falloff that's visible in volumetric regions
-/// where the field gradient is a poor surface-normal proxy.
+/// Evaluate transmittance T(world_pos) via the Cantelli (one-sided Chebyshev)
+/// bound on the α-weighted light-side termination distribution:
+///   P(z_terminate ≥ z) ≤ σ²/(σ² + (z − μ)²),   for z > μ
+///   T(z)               = 1,                     for z ≤ μ
+/// The receiver-side bias is implicit: any receiver at or before the mean of
+/// the absorber distribution reads as fully lit. The (1 − α_total) floor
+/// clamps shadow strength for partially-translucent occluders.
 fn evaluate_transmittance(world_pos: vec3f, li: u32) -> f32 {
     let sm = shadow_meta[li];
 
@@ -212,18 +203,16 @@ fn evaluate_transmittance(world_pos: vec3f, li: u32) -> f32 {
 
     let inv_alpha = 1.0 / shadow_alpha;
     let mean = c0.r * inv_alpha;        // E[z]
-    let mean_sq = c1.r * inv_alpha;     // E[z²]
 
     let z = (clip.w - sm.near) / (sm.far - sm.near);
+    if z <= mean { return 1.0; }
 
-    let variance = max(mean_sq - mean * mean, 3e-5);
-    let sigma = sqrt(variance);
-    let z0 = mean - sigma;
+    let variance = max(c1.r - c0.r * c0.r, 3e-5) / shadow_alpha;
+    let d = z - mean;
+    let p_max = variance / (variance + d * d);
 
-    let z_biased = z - sigma;
-    if z_biased <= z0 { return 1.0; }
-    let decay = exp(-(z_biased - z0) / sigma);
-    return (1.0 - shadow_alpha) + shadow_alpha * decay;
+    let T_total = 1.0 - shadow_alpha;
+    return max(p_max, T_total);
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +289,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     // when the far sample lands in empty space.
     // Only meaningful when slot 3 has thick-tet coverage; otherwise fall back to
     // single-sample at world_pos (which came from hw_depth).
-    let z_var = max(depth_raw.b - depth_raw.r * depth_raw.r, 0.0);
+    let z_var = max(depth_raw.b - depth_raw.r * depth_raw.r, 0.0) / depth_alpha;
     // Clamp σ_v to a fraction of z_expected. At silhouette edges σ_v inflates
     // because the alpha-weighted depth distribution captures the volume's
     // thinness at the edge (not real depth spread), which would otherwise push
@@ -308,7 +297,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     // the volume — where the DSM returns T ≈ 1 and the 0.146-weighted sample
     // brightens the edge. Interior pixels have σ_v ≪ z_expected so the clamp
     // is inactive there.
-    let z_sigma = min(sqrt(z_var), 0.0 * z_expected);
+    let z_sigma = min(sqrt(z_var), z_expected);
 
     let near = uniforms.near_plane;
     let far  = uniforms.far_plane;

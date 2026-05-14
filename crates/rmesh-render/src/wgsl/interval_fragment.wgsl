@@ -146,7 +146,7 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     // therefore tracks "thick tets only" — its α lags color's α at pixels
     // covered by thin haze, and consumers (pixel_std, the deferred shader's
     // depth normalization) must divide by depth_raw.a, NOT color's alpha.
-    if (alpha > 0.1) {
+    if (alpha > 0.002) {
         let phi_val = phi(od);
         let w0 = phi_val - alpha_t;   // weight for back (z_b)
         let w1 = 1.0 - phi_val;       // weight for front (z_f)
