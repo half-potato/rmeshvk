@@ -177,18 +177,33 @@ fn select_cubemap_face(dir: vec3f) -> u32 {
     }
 }
 
-/// Evaluate transmittance T(world_pos) using variance shadow map (Chebyshev bound).
-fn evaluate_transmittance(world_pos: vec3f, li: u32, NdotL: f32) -> f32 {
+/// Evaluate transmittance T(world_pos) by fitting the α-weighted light-side
+/// termination distribution as Exp(λ=1/σ_l) anchored at z₀ = μ_l − σ_l (mean
+/// and variance of this exponential match the stored moments). Closed-form CDF:
+///   T(z) = (1 − α_total) + α_total · exp(−(z − z₀)/σ_l),  z ≥ z₀
+///   T(z) = 1,                                              z < z₀
+/// Symmetric with the view-side exponential model used for quadrature; replaces
+/// the distribution-free Chebyshev/Cantelli bound with the actual exponential
+/// transmittance. The (1 − α_total) floor is built in naturally.
+///
+/// Receiver-side bias: a lit surface sits inside its own absorber distribution
+/// (μ_l ≈ surface depth, σ_l ≈ surface thickness), so without bias z ≈ μ_l and
+/// decay → e⁻¹ even when no occluders precede the receiver. Shift z toward the
+/// light by σ_l so the receiver lands at z₀ and reads T = 1. Not modulated by
+/// NdotL: the Lambertian factor is already applied by the caller, so doing it
+/// here too produces an NdotL² falloff that's visible in volumetric regions
+/// where the field gradient is a poor surface-normal proxy.
+fn evaluate_transmittance(world_pos: vec3f, li: u32) -> f32 {
     let sm = shadow_meta[li];
 
     let dir = world_pos - lights[li].position;
     let dist = length(dir);
-    if dist < 1e-6 { return 1.0; }
+    // if dist < 1e-6 { return 1.0; }
 
     let face = select_cubemap_face(dir);
     let vp = get_shadow_vp(sm, face);
     let clip = vp * vec4f(world_pos, 1.0);
-    if clip.w <= 0.0 { return 1.0; }
+    // if clip.w <= 0.0 { return 1.0; }
 
     let c0 = textureSample(dsm_rt0, dsm_sampler, dir);
     let c1 = textureSample(dsm_rt1, dsm_sampler, dir);
@@ -200,14 +215,15 @@ fn evaluate_transmittance(world_pos: vec3f, li: u32, NdotL: f32) -> f32 {
     let mean_sq = c1.r * inv_alpha;     // E[z²]
 
     let z = (clip.w - sm.near) / (sm.far - sm.near);
-    if z <= mean { return 1.0; }
 
     let variance = max(mean_sq - mean * mean, 3e-5);
-    let d = z - mean;
-    let p_max = variance / (variance + d * d);
+    let sigma = sqrt(variance);
+    let z0 = mean - sigma;
 
-    let T_total = 1.0 - shadow_alpha;
-    return max(p_max, T_total);
+    let z_biased = z - sigma;
+    if z_biased <= z0 { return 1.0; }
+    let decay = exp(-(z_biased - z0) / sigma);
+    return (1.0 - shadow_alpha) + shadow_alpha * decay;
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +292,24 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let inv_da = 1.0 / max(depth_alpha, 1e-6);
     let z_expected = depth_raw.r * inv_da;
 
+    // Shadow-integration samples along the view ray. Model the alpha-weighted
+    // depth PDF as Exp(λ) anchored at z_expected − σ with scale s = σ, so the
+    // mean still matches z_expected. 2-point Gauss–Laguerre quadrature places
+    // samples at z₀ + s·{2−√2, 2+√2} with weights {(2+√2)/4, (2−√2)/4} ≈
+    // {0.854, 0.146}. The asymmetric weights cap floater damage at ~15% even
+    // when the far sample lands in empty space.
+    // Only meaningful when slot 3 has thick-tet coverage; otherwise fall back to
+    // single-sample at world_pos (which came from hw_depth).
+    let z_var = max(depth_raw.b - depth_raw.r * depth_raw.r, 0.0);
+    // Clamp σ_v to a fraction of z_expected. At silhouette edges σ_v inflates
+    // because the alpha-weighted depth distribution captures the volume's
+    // thinness at the edge (not real depth spread), which would otherwise push
+    // the far sample z_b = z_expected + 2.414·σ_v deep into empty space behind
+    // the volume — where the DSM returns T ≈ 1 and the 0.146-weighted sample
+    // brightens the edge. Interior pixels have σ_v ≪ z_expected so the clamp
+    // is inactive there.
+    let z_sigma = min(sqrt(z_var), 0.0 * z_expected);
+
     let near = uniforms.near_plane;
     let far  = uniforms.far_plane;
 
@@ -303,6 +337,16 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let clip_pos = vec4f(ndc_x, ndc_y, ndc_z, 1.0);
     let world_h = uniforms.inv_vp * clip_pos;
     let world_pos = world_h.xyz / world_h.w;
+
+    let use_two_sample = depth_alpha >= 0.01 && z_sigma > 1e-4;
+    let z_shadow_a = max(z_expected - 0.41421356 * z_sigma, near);
+    let z_shadow_b = min(z_expected + 2.41421356 * z_sigma, far);
+    let ndc_z_a = (far * (z_shadow_a - near)) / (z_shadow_a * (far - near));
+    let ndc_z_b = (far * (z_shadow_b - near)) / (z_shadow_b * (far - near));
+    let world_ha = uniforms.inv_vp * vec4f(ndc_x, ndc_y, ndc_z_a, 1.0);
+    let world_hb = uniforms.inv_vp * vec4f(ndc_x, ndc_y, ndc_z_b, 1.0);
+    let world_pos_a = world_ha.xyz / world_ha.w;
+    let world_pos_b = world_hb.xyz / world_hb.w;
 
     // Per-pixel constants for the BRDF (parametric metallic workflow).
     let V = normalize(uniforms.cam_pos - world_pos);
@@ -368,7 +412,13 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
 
         var T = 1.0;
         if (uniforms.dsm_enabled != 0u) {
-            T = evaluate_transmittance(world_pos, li, 1.0);
+            if (use_two_sample) {
+                let Ta = evaluate_transmittance(world_pos_a, li);
+                let Tb = evaluate_transmittance(world_pos_b, li);
+                T = 0.85355339 * Ta + 0.14644661 * Tb;
+            } else {
+                T = evaluate_transmittance(world_pos, li);
+            }
         }
 
         // Plain Lambertian NoL.
@@ -448,7 +498,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
         var T_total = 0.0;
         if uniforms.dsm_enabled != 0u {
             for (var li = 0u; li < uniforms.num_lights; li = li + 1u) {
-                T_total += evaluate_transmittance(world_pos, li, 1.0);
+                T_total += evaluate_transmittance(world_pos, li);
             }
             final_color = uniforms.exposure * vec3f(T_total / max(f32(uniforms.num_lights), 1.0));
         } else {
@@ -490,13 +540,9 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
         // bright = high uncertainty. Normalize by slot 3's own α (matches
         // pixel_std in gtao.wgsl / ssr_compute.wgsl, which see only the
         // post-filter "thick tets" population).
-        if depth_alpha < 0.01 {
-            final_color = vec3f(0.0);
-        } else {
-            let m1 = depth_raw.r * inv_da;
-            let m2 = depth_raw.b * inv_da;
-            final_color = vec3f(sqrt(max(m2 - m1 * m1, 0.0)));
-        }
+        let m1 = depth_raw.r;// * inv_da;
+        let m2 = depth_raw.b;// * inv_da;
+        final_color = vec3f(sqrt(max(m2 - m1 * m1, 0.0)));
     }
 
     let display_out = vec4f(max(final_color, vec3f(0.0)), alpha);

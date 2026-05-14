@@ -91,7 +91,7 @@ impl Camera {
             pitch.cos(),
         );
 
-        self.orbit_target += sensitivity * (-dx * right + dy * up);
+        self.orbit_target += sensitivity * (dx * right - dy * up);
     }
 }
 

@@ -132,28 +132,38 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     // Slot 3: expected termination depth + E[z²] (for std). .g is unused
     // (formerly retro * alpha; left at 0). .b holds the second-moment
     // contribution, composited via the same premul-alpha blend as .r.
-    // Approximation: per-segment treats the termination as a 2-point
-    // distribution at {z_f w.p. w1/α, z_b w.p. w0/α}, so the segment's
-    // E[z²]·α = w0·z_b² + w1·z_f². Conservatively upper-bounds the exact
-    // within-segment variance (fine for the std-based AO fade).
+    //
+    // Exact within-segment α·E[z²] for the exponential termination distribution
+    // on [z_f, z_b] (PDF f(z) = σ_eff · exp(−σ_eff(z−z_f))):
+    //   α·E[z²] = w0·z_b² + w1·z_f² − L² · correction(od)
+    // where correction(od) = w0 + α_t − 2·w0/od ≥ 0 measures how much the
+    // 2-point upper bound at the extremes overshoots the true exponential.
+    // For small od the direct form has catastrophic cancellation; Taylor:
+    //   correction(od) ≈ od/6 − od²/12 + od³/40
     //
     // Thin-tet filter: emit (0,0,0,0) when fragment α is below threshold so
     // premul-alpha blending becomes a pass-through (dst·(1-0) = dst). Slot 3
     // therefore tracks "thick tets only" — its α lags color's α at pixels
     // covered by thin haze, and consumers (pixel_std, the deferred shader's
     // depth normalization) must divide by depth_raw.a, NOT color's alpha.
-    // Reason: thin tets add noise to the second moment that gets amplified
-    // when their depth diverges from the consensus, ballooning the variance.
-    const THIN_ALPHA_THRESHOLD: f32 = 0.05;
-    if (alpha < THIN_ALPHA_THRESHOLD) {
-        out.expected_depth = vec4f(0.0, 0.0, 0.0, 0.0);
-    } else {
+    if (alpha > 0.1) {
         let phi_val = phi(od);
         let w0 = phi_val - alpha_t;   // weight for back (z_b)
         let w1 = 1.0 - phi_val;       // weight for front (z_f)
-        let depth_premul  = w0 * z_b + w1 * z_f;
-        let depth2_premul = w0 * z_b * z_b + w1 * z_f * z_f;
+        let depth_premul = w0 * z_b + w1 * z_f;
+
+        var correction: f32;
+        if (abs(od) < 0.02) {
+            correction = od * ((1.0/6.0) - od * ((1.0/12.0) - od * (1.0/40.0)));
+        } else {
+            correction = w0 + alpha_t - 2.0 * w0 / od;
+        }
+        let L = z_b - z_f;
+        let depth2_premul = w0 * z_b * z_b + w1 * z_f * z_f - L * L * correction;
+
         out.expected_depth = vec4f(depth_premul, 0.0, depth2_premul, alpha);
+    } else {
+        out.expected_depth = vec4f(0.0, 0.0, 0.0, 0.0);
     }
 
     return out;
