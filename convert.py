@@ -319,55 +319,13 @@ def write_tagged_section(buffer, tag, data, dtype_code):
     _align4(buffer)
 
 
-def write_mlp_section(buffer, tag, state_dict, layer_prefix):
-    """Write MLP weights as a tagged section.
-
-    Binary format:
-      num_layers: u32
-      per layer:
-        in_dim: u32
-        out_dim: u32
-        has_bias: u8
-        weights: f16[out_dim * in_dim]  (row-major)
-        bias: f16[out_dim]  (if has_bias)
-    """
-    import torch
-    weight_keys = sorted(
-        [k for k in state_dict if k.endswith('.weight') and layer_prefix in k],
-        key=lambda k: int(k.split(layer_prefix + '.')[1].split('.')[0])
-    )
-
-    layer_data = BytesIO()
-    layer_data.write(np.array([len(weight_keys)], dtype=np.uint32).tobytes())
-
-    for wk in weight_keys:
-        w = state_dict[wk].float().cpu().numpy()  # [out_dim, in_dim]
-        bk = wk.replace('.weight', '.bias')
-        has_bias = bk in state_dict
-        out_dim, in_dim = w.shape
-
-        layer_data.write(np.array([in_dim], dtype=np.uint32).tobytes())
-        layer_data.write(np.array([out_dim], dtype=np.uint32).tobytes())
-        layer_data.write(np.array([1 if has_bias else 0], dtype=np.uint8).tobytes())
-        layer_data.write(w.astype(np.float16).tobytes())
-        if has_bias:
-            b = state_dict[bk].float().cpu().numpy()
-            layer_data.write(b.astype(np.float16).tobytes())
-
-    raw = layer_data.getvalue()
-    # Write as a tagged section with shape = [byte_count]
-    tag_bytes = tag.encode('ascii')[:16].ljust(16, b'\x00')
-    buffer.write(tag_bytes)
-    buffer.write(np.array([0], dtype=np.uint32).tobytes())   # dtype=f16 (nominal)
-    buffer.write(np.array([1], dtype=np.uint32).tobytes())   # shape_rank=1
-    buffer.write(np.array([len(raw)], dtype=np.uint32).tobytes())  # shape dim
-    buffer.write(np.array([len(raw)], dtype=np.uint32).tobytes())  # data_bytes
-    buffer.write(raw)
-    _align4(buffer)
-
-
 def process_pbr_to_rmesh(ply_file_path, pbr_dir, starting_cam, out_deg):
-    """Process PLY + PBR checkpoint into extended .rmesh with tagged sections."""
+    """Process PLY + parametric PBR checkpoint into extended .rmesh.
+
+    Bakes per-tet (metallic, f0_dielectric) by running the ``material_head``
+    MLP on env_feature, so the viewer only needs the analytical
+    GGX+Smith+Schlick evaluator (no MLPs).
+    """
     import torch
 
     # Base rmesh buffer (uncompressed)
@@ -380,23 +338,26 @@ def process_pbr_to_rmesh(ply_file_path, pbr_dir, starting_cam, out_deg):
 
     pbr_dir = Path(pbr_dir)
 
-    # Load checkpoint data
-    ckpt = torch.load(pbr_dir / "ckpt.pth", map_location='cpu', weights_only=False)
-    ref_sd = torch.load(pbr_dir / "ref_renderer.pt", map_location='cpu', weights_only=False)
-    brdf_sd = {k.removeprefix("brdf_model."): v for k, v in ref_sd.items() if k.startswith("brdf_model.")}
-
-    # Load model for material baking and vertex normal computation
+    # Load model + parametric ref_renderer
     import sys
     sys.path.insert(1, os.path.join(os.path.dirname(__file__), 'radiance_meshes'))
     from radiance_meshes.models.ingp_color import Model
-    from renderer.ref_renderer import activate_aux
+    from renderer.ref_renderer import activate_aux, RefRenderer
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = Model.load_ckpt(pbr_dir, device)
+
+    ref_sd = torch.load(pbr_dir / "ref_renderer.pt", map_location=device, weights_only=False)
+    assert any(k.startswith('material_head.') for k in ref_sd), (
+        "ref_renderer.pt has no material_head; expected a parametric-BRDF checkpoint."
+    )
+    ref_renderer = RefRenderer().to(device)
+    ref_renderer.load_state_dict(ref_sd)
+    ref_renderer.eval()
 
     # Per-tet material channels — load from .npy if available, otherwise bake
     if (pbr_dir / "roughness.npy").exists():
         roughness = np.load(pbr_dir / "roughness.npy")[~tet_mask]
-        env_feature = np.load(pbr_dir / "env_feature.npy")[~tet_mask]
+        env_feature_np = np.load(pbr_dir / "env_feature.npy")[~tet_mask]
         albedo = np.load(pbr_dir / "albedo.npy")[~tet_mask]
     else:
         print("  Baking material channels from checkpoint...")
@@ -407,8 +368,15 @@ def process_pbr_to_rmesh(ply_file_path, pbr_dir, starting_cam, out_deg):
             _, cell_values = model.get_cell_values(dummy_cam)
             activated = activate_aux(cell_values)
             roughness = activated[:, 7].cpu().numpy()[~tet_mask]
-            env_feature = activated[:, 8:12].cpu().numpy()[~tet_mask]
+            env_feature_np = activated[:, 8:12].cpu().numpy()[~tet_mask]
             albedo = activated[:, 12:15].cpu().numpy()[~tet_mask]
+
+    # Decode env_feature → (metallic, f0_dielectric) via the trained head.
+    with torch.no_grad():
+        env_feature_t = torch.from_numpy(env_feature_np).float().to(device)
+        metallic_t, f0_dielectric_t = ref_renderer.decode_materials(env_feature_t)
+        metallic = metallic_t.squeeze(-1).cpu().numpy()
+        f0_dielectric = f0_dielectric_t.squeeze(-1).cpu().numpy()
 
     # Full vertex normals: geometric (density-weighted tet face normals) + learned offsets
     with torch.no_grad():
@@ -417,36 +385,27 @@ def process_pbr_to_rmesh(ply_file_path, pbr_dir, starting_cam, out_deg):
         vn = vn_full.float().cpu().numpy()
     del model
 
-    # Count sections: roughness, env_feature, albedo, vertex_normals, brdf_mlp, retro_head, tone_curve
-    num_sections = 7
+    # Sections: roughness, albedo, vertex_normals, metallic, f0_dielectric, tone_curve
+    num_sections = 6
     buffer.write(np.array([num_sections], dtype=np.uint32).tobytes())
 
-    # Material sections (f16)
     write_tagged_section(buffer, "roughness", roughness, 0)
-    write_tagged_section(buffer, "env_feature", env_feature, 0)
     write_tagged_section(buffer, "albedo", albedo, 0)
     write_tagged_section(buffer, "vertex_normals", vn, 0)
-
-    # BRDF MLP weights
-    write_mlp_section(buffer, "brdf_mlp", brdf_sd, "mlp")
-
-    # Retro head: weight [1, 4] + bias [1] → combined f16 array [5]
-    retro_w = ref_sd['retro_head.weight'].float().cpu().numpy().flatten()  # [4]
-    retro_b = ref_sd['retro_head.bias'].float().cpu().numpy().flatten()    # [1]
-    retro_combined = np.concatenate([retro_w, retro_b])
-    write_tagged_section(buffer, "retro_head", retro_combined, 0)
+    write_tagged_section(buffer, "metallic", metallic, 0)
+    write_tagged_section(buffer, "f0_dielectric", f0_dielectric, 0)
 
     # Monotonic spline tone curve: [y_knots..., slope, intercept, intercept_bias]
     # Viewer reconstructs knots_x = linspace(0, 1, n_knots) where n_knots = len - 3
     spline_sd = {k.removeprefix("spatial_spline."): v for k, v in ref_sd.items()
                  if k.startswith("spatial_spline.")}
-    log_dy = spline_sd['log_dy'].float()
+    log_dy = spline_sd['log_dy'].float().cpu()
     dy = torch.nn.functional.softplus(log_dy)
     y_cumsum = torch.cumsum(dy, dim=0)
     y_knots = torch.cat([torch.zeros(1), y_cumsum])
     y_knots = (y_knots / y_knots[-1:].clamp(min=1e-6)).numpy()
-    slope = spline_sd['slope'].float().numpy().flatten()
-    intercept = spline_sd['intercept'].float().numpy().flatten()
+    slope = spline_sd['slope'].float().cpu().numpy().flatten()
+    intercept = spline_sd['intercept'].float().cpu().numpy().flatten()
     intercept_bias = np.array([spline_sd['intercept_bias'].item()])
     tone_curve = np.concatenate([y_knots, slope, intercept, intercept_bias])
     write_tagged_section(buffer, "tone_curve", tone_curve, 0)
